@@ -3,6 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import express from 'express';
 import { config } from './config/index.js';
+import { pool } from './db/pool.js';
 import { logger } from './lib/logger.js';
 
 // Read name/version from package.json at runtime rather than hardcoding
@@ -53,11 +54,18 @@ const server = app.listen(config.PORT, () => {
 function shutdown(signal: NodeJS.Signals): void {
   logger.info({ signal }, 'Received shutdown signal, closing server gracefully');
 
-  server.close((err) => {
+  server.close(async (err) => {
     if (err) {
       logger.error({ err }, 'Error while closing server');
       process.exit(1);
     }
+
+    // The pool closes only after the HTTP server has finished draining
+    // in-flight requests, not before or concurrently — those requests may
+    // still be awaiting a DB query, and closing the pool first would break
+    // them mid-request instead of letting them complete cleanly.
+    await pool.end();
+
     logger.info('Server closed, exiting');
     process.exit(0);
   });
