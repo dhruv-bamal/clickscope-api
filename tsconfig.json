@@ -1,0 +1,38 @@
+{
+  "compilerOptions": {
+    /* Language & module system.
+       NodeNext mirrors exactly how Node's native ESM loader resolves imports,
+       which is what makes `node dist/server.js` work without a bundler.
+       The trade-off: relative imports in .ts source must use explicit .js
+       extensions (see Notes.md, "TypeScript build pipeline"). */
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    /* Output */
+    "outDir": "dist",
+    "rootDir": "src",
+    "sourceMap": true,
+    "declaration": false,
+
+    /* Strictness — catch bugs at compile time instead of runtime */
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": true,
+
+    /* Interop & correctness */
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "verbatimModuleSyntax": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "tests", "worker"]
+}

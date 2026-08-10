@@ -1,0 +1,65 @@
+# Local development infrastructure only. This is NOT used in production —
+# the deployed API connects to managed Postgres/Redis instances via
+# DATABASE_URL / REDIS_URL. This file exists so any contributor can run
+# `docker compose up -d` and have a working database + cache in seconds,
+# without installing Postgres or Redis natively.
+
+services:
+  # --- PostgreSQL -----------------------------------------------------
+  # Primary datastore for the API (users, links, click events, etc. in
+  # later phases). Version 16 is pinned so every developer's schema
+  # behavior matches CI and production exactly.
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      # Defaults let `docker compose up` work with zero setup; override
+      # via a root .env file (docker compose auto-loads it) for anything
+      # that needs to differ from the app's own DATABASE_URL.
+      POSTGRES_USER: ${POSTGRES_USER:-clickscope}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-clickscope}
+      POSTGRES_DB: ${POSTGRES_DB:-clickscope}
+    ports:
+      # HOST:CONTAINER — change the host side if 5432 is already taken
+      # on your machine; the container always listens on 5432.
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      # Named volume: data survives `docker compose down` (but not
+      # `docker compose down -v`). Without this, every container
+      # recreation wipes the database.
+      - clickscope_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      # Confirms Postgres is actually ready to accept queries, not just
+      # that the process has started — the two are not the same thing
+      # during initial cluster setup.
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-clickscope}']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # --- Redis -----------------------------------------------------------
+  # Used for caching (Phase 2+) and as the BullMQ job queue broker for
+  # the future worker process. Version 7 matches what BullMQ expects.
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    volumes:
+      # Named volume: persists Redis's append-only/RDB snapshot data
+      # across container restarts so queued jobs aren't lost on restart.
+      - clickscope_redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  # Declaring named volumes here (rather than bind mounts) lets Docker
+  # manage storage location and lifecycle — portable across machines,
+  # and not accidentally deleted by cleaning the project directory.
+  clickscope_postgres_data:
+  clickscope_redis_data:
