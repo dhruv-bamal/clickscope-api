@@ -1,30 +1,9 @@
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import express from 'express';
+import { app } from './app.js';
 import { config } from './config/index.js';
 import { pool } from './db/pool.js';
 import { logger } from './lib/logger.js';
-
-// Read name/version from package.json at runtime rather than hardcoding
-// them, so the liveness endpoint can never drift out of sync with the
-// package that's actually deployed. Resolved relative to this file (not
-// process.cwd()) so it works identically whether run via `tsx
-// src/server.ts` in dev or `node dist/server.js` in production.
-const currentDir = path.dirname(fileURLToPath(import.meta.url));
-const { name: serviceName, version: serviceVersion } = JSON.parse(
-  readFileSync(path.join(currentDir, '..', 'package.json'), 'utf-8'),
-) as { name: string; version: string };
-
-const app = express();
-
-// Liveness check ONLY — proves the process is running and able to
-// respond to HTTP. This is intentionally not the real health endpoint;
-// Phase 3 adds one that also checks DB/Redis connectivity. For now this
-// gives infra something to point a basic uptime probe at.
-app.get('/', (_req, res) => {
-  res.json({ name: serviceName, version: serviceVersion });
-});
+import { redis } from './lib/redis.js';
+import { serviceName } from './lib/serviceInfo.js';
 
 const server = app.listen(config.PORT, () => {
   logger.info(
@@ -60,11 +39,12 @@ function shutdown(signal: NodeJS.Signals): void {
       process.exit(1);
     }
 
-    // The pool closes only after the HTTP server has finished draining
+    // Both close only after the HTTP server has finished draining
     // in-flight requests, not before or concurrently — those requests may
-    // still be awaiting a DB query, and closing the pool first would break
-    // them mid-request instead of letting them complete cleanly.
-    await pool.end();
+    // still be awaiting a DB query or a Redis command, and closing either
+    // first would break them mid-request instead of letting them
+    // complete cleanly.
+    await Promise.all([pool.end(), redis.quit()]);
 
     logger.info('Server closed, exiting');
     process.exit(0);

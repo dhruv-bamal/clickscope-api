@@ -1803,3 +1803,859 @@ temporarily removes tables other tests depend on, file-level parallelism
 is disabled — a reminder that "run tests in parallel by default" is a
 unit-test assumption, not a safe default for integration tests sharing one
 real database.
+
+---
+
+## Phase 3: API Foundation
+
+### Operational vs programmer errors, and why AppError is factories, not a class hierarchy
+
+**What it is.** A two-way split for anything that goes wrong while
+handling a request. An _operational_ error is one the code deliberately
+recognized and threw — bad input, a missing resource, a conflicting
+write — where the status, message, and shape are all safe to hand back
+to a client as-is. A _programmer_ error is everything else: a bug, an
+unhandled edge case, a raw driver exception — something nobody
+anticipated, whose real message might contain a stack trace, a SQL
+fragment, or an internal file path, and therefore must never reach a
+client verbatim.
+
+**Why it exists in this project.** CLAUDE.md is explicit: "Errors thrown
+as AppError; the error middleware formats responses." Without a single
+recognizable error type, the error middleware would have no reliable way
+to tell "a route deliberately rejected this request" apart from "a route
+crashed" — and conflating the two either leaks internal detail through
+an error that was actually a bug, or shows a client a generic "Internal
+Server Error" for what should have been a specific, actionable 404.
+
+**How it works mechanically.** `src/lib/errors.ts` exports one
+`AppError extends Error` class (`statusCode`, `code: ErrorCode`,
+`isOperational = true` on every instance, `details: unknown = null`)
+plus seven factory functions — `badRequest`, `unauthorized`,
+`forbidden`, `notFound`, `conflict`, `tooManyRequests`, `internal` — each
+just calling `new AppError(...)` with the right status and code baked
+in. The operational/programmer boundary is `instanceof AppError`, tested
+once, in the error middleware (`src/middleware/errorHandler.ts`):
+anything that passes that check is operational and safe to show as-is;
+anything that doesn't is a programmer error and gets sanitized in
+production. One class plus factories, not a subclass per status code
+(`BadRequestError`, `UnauthorizedError`, ...), because a seven-class
+hierarchy would only ever differ in the three values already passed as
+constructor arguments — it's boilerplate, not a meaningful type
+distinction. It also matches this codebase's existing style:
+`EnvValidationError` (`src/config/env.ts`) is a single flat class, and
+`parseEnv` is a plain function, not part of a class taxonomy.
+
+`details` is declared as a non-optional field defaulting to `null`
+(`details: unknown = null`), not `details?: unknown`. tsconfig's
+`exactOptionalPropertyTypes` forbids assigning `undefined` into a key
+typed `T | undefined` unless the key is entirely omitted — the same
+constraint already worked around in `src/lib/logger.ts` and
+`src/db/pool.ts` by building objects conditionally. Making `details`
+required with a default sidesteps that class of friction entirely rather
+than repeating the conditional-key dance a third time.
+
+**Where it lives in the codebase.** `src/lib/errors.ts` (the class and
+factories); `src/middleware/errorHandler.ts` (the `instanceof AppError`
+check); every future route/service throws these instead of a bare
+`Error` or `throw 'string'`.
+
+**Common pitfalls.**
+
+- Throwing a bare `Error` for something that's actually an expected,
+  operational case (e.g. `throw new Error('not found')`) — it reaches
+  the error middleware as a programmer error, gets sanitized to a
+  generic 500 in production, and the client never learns it was
+  actually a 404.
+- Marking `isOperational` as a mutable, per-call flag instead of a
+  constant on the class — the whole point is that _every_ `AppError`,
+  including one built via `internal()`, is operational (it was
+  deliberately thrown); making it a settable field just invites some
+  call site to get it wrong.
+- Putting business logic in a subclass constructor (e.g. formatting a
+  message differently per error type) — the factories keep that
+  formatting at the call site, where the actual context is, instead of
+  scattered across N constructors.
+
+**Production considerations.** Because `AppError.message` is always
+shown to the client (only non-`AppError` messages get sanitized), the
+discipline this requires going forward is: never put anything
+client-unsafe into an `AppError`'s message — no SQL fragments, no
+internal IDs the client shouldn't correlate, no stack-trace-adjacent
+detail. That detail belongs in the `details` field only when it's
+genuinely meant for the client (e.g. per-field validation errors), or in
+the server-side log call in `errorHandler.ts`, never in the message
+itself if there's any doubt.
+
+**Interview answer.** I distinguish operational errors — expected,
+deliberately-thrown failures like bad input or a missing resource —
+from programmer errors, which are bugs or unanticipated exceptions,
+using a single `instanceof AppError` check in the error middleware.
+Every `AppError` is safe to show a client as-is; anything else gets
+sanitized to a generic message in production and logged in full detail
+server-side. I use one `AppError` class plus factory functions for the
+common cases rather than a subclass per error type, since a class
+hierarchy here would just be seven constructors differing only in the
+values already passed as arguments — more boilerplate for the same
+information.
+
+---
+
+### The error middleware's 4-argument signature and registration order
+
+**What it is.** Express identifies error-handling middleware purely by
+counting a function's declared parameters: exactly four —
+`(err, req, res, next)` — marks it as an error handler; any other arity
+is treated as regular middleware. Registration order then decides
+which errors actually reach it.
+
+**Why it exists in this project.** CLAUDE.md requires a single
+centralized error handler that formats every response consistently. That
+only works if Express reliably routes every thrown/forwarded error to
+this one function — which depends on getting both the signature and the
+position right, neither of which produces a helpful error if wrong.
+
+**How it works mechanically.** At startup, Express inspects
+`fn.length` for each middleware function passed to `app.use()`. `fn.length`
+is a normal JavaScript runtime property equal to the number of
+parameters declared before the first one with a default value or rest
+syntax — TypeScript's type annotations don't change it, since types are
+erased at compile time; only the actual parameter count in the compiled
+JS matters. `createErrorHandler` in `src/middleware/errorHandler.ts`
+returns a function with exactly four declared parameters
+`(err, req, res, _next)` for this reason — `_next` is never called
+inside the function body (the handler ends the response itself via
+`res.json`), but it can't be removed, because doing so drops the arity
+to three and Express silently stops treating it as an error handler at
+all: no warning, no error, the app just falls through to Express's own
+default HTML error page instead of this app's JSON shape.
+
+Registration order matters independently of arity. Express matches
+middleware top-to-bottom in registration order and only diverts into
+error-handling middleware once something calls `next(err)` (or an async
+handler's returned promise rejects — see the next section) — it never
+retroactively looks backward for an error handler registered earlier.
+Concretely, in `src/app.ts`, the error handler is the very last thing
+registered, strictly after every route and after `notFoundHandler`: if
+it were registered before a route, Express simply hasn't reached that
+registration yet when the route's error occurs, so the error has nowhere
+defined to go.
+
+**Where it lives in the codebase.** `createErrorHandler` in
+`src/middleware/errorHandler.ts`; registered last in `src/app.ts`, after
+the root/health routers and after `notFoundHandler`.
+
+**Common pitfalls.**
+
+- Removing an unused `next` parameter from an error handler "for
+  cleanliness" — silently downgrades it to regular middleware. Symptom:
+  errors start rendering as Express's default HTML error page instead of
+  the app's JSON shape, with no warning anywhere in the logs.
+- Registering the error handler before a route or before
+  `notFoundHandler` — errors from anything registered after it never
+  reach it. Symptom: unmatched routes or route errors produce Express's
+  default response instead of the expected JSON shape, but only for
+  routes registered after the misplaced handler, which is a confusing,
+  partial failure to debug.
+- Registering more than one 4-arg error handler — the first one in
+  registration order runs and, if it doesn't call `next(err)` itself
+  (this app's doesn't), consumes the error; any later error handlers
+  never run.
+
+**Production considerations.** A common mistake at scale is adding a
+second, feature-specific error handler for one route group instead of
+teaching the one centralized handler about a new error shape — this
+fragments the "every endpoint returns errors in one consistent shape"
+contract CLAUDE.md asks for. If a future error type needs special
+handling, it should extend `AppError`'s vocabulary (a new `ErrorCode`,
+or a new factory), not spawn a second error-handling middleware.
+
+**Interview answer.** Express recognizes error-handling middleware by
+counting its declared parameters — exactly four, `(err, req, res, next)`
+— rather than by any explicit registration API. That's a runtime
+JavaScript property (`Function.prototype.length`), so even an unused
+`next` parameter can't be dropped without silently losing error-handler
+status. Registration order matters separately: Express matches
+middleware top-to-bottom and only diverts into an error handler once
+something calls `next(err)`, so the error handler has to be registered
+strictly after every route it's meant to protect, or those routes'
+errors have nowhere to go.
+
+---
+
+### Express 5's automatic async error propagation
+
+**What it is.** When a route or middleware handler returns a Promise
+(i.e. it's an `async` function), Express 5 automatically attaches a
+`.catch()` to it that forwards any rejection into `next(err)` — the same
+path a synchronous `throw` has always used. No manual try/catch or
+wrapper library required for the error to reach the error middleware.
+
+**Why it exists in this project.** Every route handler written from
+Phase 3 onward is expected to be `async` and to just `throw` an
+`AppError` on failure — CLAUDE.md's "Errors thrown as AppError" pattern
+only stays this simple if that throw is guaranteed to reach the error
+middleware without extra boilerplate at every call site.
+
+**How it works mechanically.** In Express 4, an `async` handler that
+threw produced an unhandled promise rejection Express never saw — the
+request would hang with no response ever sent, unless the handler
+manually did `try { ... } catch (err) { next(err) }`, or was wrapped in
+a helper like `express-async-handler`. Express 5 changed the internal
+route-dispatch code to check whether a handler's return value is a
+Promise, and if so, calls `.then(undefined, next)` on it (functionally
+equivalent to `.catch(next)`) — so a rejected promise now flows into the
+exact same `next(err)` path a synchronous throw always used, with zero
+code change required at the call site.
+
+`tests/middleware/asyncErrors.test.ts` proves this directly rather than
+asserting it from documentation: it builds a small Express app with an
+`async` route handler that `throw`s, with genuinely no try/catch and no
+wrapper anywhere, and asserts the response is the error middleware's
+properly formatted JSON — which is only possible if the rejection
+actually reached it.
+
+**Where it lives in the codebase.** No dedicated file — this is Express
+5's own dispatch behavior. Every `async` route handler across the
+codebase (present and future) relies on it implicitly; the proof lives
+in `tests/middleware/asyncErrors.test.ts`.
+
+**Common pitfalls.**
+
+- Wrapping every async handler in a manual `try/catch { next(err) }` or
+  an `asyncHandler` utility out of Express-4 habit — harmless but dead
+  weight on Express 5; worth knowing it's no longer necessary so it
+  doesn't get reintroduced as unnecessary boilerplate on every route.
+- Assuming this covers _every_ way an async handler can fail — it only
+  catches the promise the handler itself returns. An error thrown
+  asynchronously from inside a detached callback that isn't awaited
+  (e.g. a stray `setTimeout` or a fire-and-forget `.then()` inside the
+  handler) still becomes an unhandled rejection Express never sees,
+  exactly like Express 4.
+- Relying on this in code that must also run under Express 4 (a shared
+  library, for instance) — this is an Express-5-specific dispatch
+  change, not a JavaScript language guarantee; Express-4-targeted code
+  still needs the manual `next(err)` pattern.
+
+**Production considerations.** This removes an entire class of
+production incident that Express-4-era codebases hit constantly:
+requests silently hanging until a load balancer's timeout kills the
+connection, with nothing useful in the logs because the rejection was
+never caught anywhere. Express 5 turns that failure mode into a normal,
+logged, correctly-shaped error response instead.
+
+**Interview answer.** In Express 4, an async route handler that threw
+produced an unhandled promise rejection Express never saw — the request
+would hang forever unless the handler manually caught the error and
+called `next(err)`, which is why wrapper libraries like
+`express-async-handler` existed. Express 5 changed route dispatch to
+detect when a handler returns a Promise and automatically forward any
+rejection into `next(err)`, the same path a synchronous throw always
+used. Practically, this means every route handler in this codebase can
+just be `async` and `throw` an `AppError` directly, with no try/catch or
+wrapper boilerplate — and I proved this behavior with a test rather than
+assuming it, since it's easy to get backwards for a codebase that used
+to run on Express 4.
+
+---
+
+### Correlation IDs and request-scoped structured logging
+
+**What it is.** A unique ID generated (or inherited) per incoming
+request, attached to the request object, echoed back in a response
+header, and stamped onto every log line that request produces — so every
+line belonging to one request can be found and grouped, even in a busy,
+concurrent log stream.
+
+**Why it exists in this project.** Structured logging alone (Phase 1)
+tells you _what_ happened; it doesn't tell you which log lines belong
+together. In production, log lines from many concurrent requests
+interleave in the aggregate stream. Without a shared ID stamped on every
+line one request produces, reconstructing "everything that happened for
+this one failing request" means grepping by approximate timestamp and
+hoping nothing else happened in that window.
+
+**How it works mechanically.** `src/middleware/requestContext.ts`,
+registered first in `src/app.ts`, reads an inbound `X-Request-Id` header
+(accepted, but capped at 200 characters — see pitfalls) or generates a
+fresh one via `crypto.randomUUID()` (a Node builtin, no new dependency).
+It assigns `req.id`, creates `req.log = logger.child({ requestId: id })`
+— Pino's `child()` returns a logger that automatically includes
+`requestId` in every subsequent call without it being re-passed each
+time — and sets the `X-Request-Id` response header so a client (or an
+upstream gateway) can correlate its own logs against this service's. It
+logs "Request started" immediately, and logs "Request completed" (with
+method, path, status, duration) on the response's `finish` event, which
+fires exactly once the response has actually been fully sent —
+including responses written later by the error handler — so completion
+is logged exactly once regardless of whether the request succeeded or
+errored.
+
+**Where it lives in the codebase.** `src/middleware/requestContext.ts`;
+the `id`/`log` fields on `Request` are declared in
+`src/types/express.d.ts`; every downstream handler and the error handler
+(`src/middleware/errorHandler.ts`) use `req.log` instead of the bare
+`logger` singleton so their lines carry the same ID.
+
+**Common pitfalls.**
+
+- Accepting an inbound `X-Request-Id` with no bound on its length or
+  content — it's attacker-controlled input flowing directly into
+  structured logs otherwise; this codebase caps it at 200 characters as
+  a cheap defense against log-injection/log-bloat via an oversized
+  header value.
+- Logging completion inside a `try/finally` around `next()` instead of
+  on `res.on('finish', ...)` — `next()` returning doesn't mean the
+  response has actually been sent yet (a downstream handler might still
+  be awaiting a DB call), so a `finally` block would log "completed"
+  before the response is truly finished, and would run even if a later
+  handler kept the request open indefinitely.
+- Using the bare `logger` singleton instead of `req.log` inside a route
+  handler — works, but produces a log line with no `requestId`, breaking
+  the exact correlation this middleware exists to provide.
+
+**Production considerations.** Accepting (not just generating) an
+inbound `X-Request-Id` is what makes correlation work _across_ service
+boundaries, not just within this one process — an API gateway, load
+balancer, or the frontend itself can set the header, and it stays stable
+end-to-end. When a user reports "it broke," the `requestId` returned in
+every error response body (see the error middleware) is exactly what
+they can hand to support to jump straight to the right log lines,
+instead of reconstructing a timeline from timestamps.
+
+**Interview answer.** I attach a UUID to every request — accepting an
+inbound `X-Request-Id` if one's already set upstream, generating a fresh
+one with `crypto.randomUUID()` otherwise — and use it to create a
+Pino child logger (`logger.child({ requestId })`) attached to the
+request object, so every log line produced while handling that request
+automatically carries the same ID without it being re-passed manually
+at each call site. The ID is echoed back in a response header and
+included in every error response body, so correlating "this one user's
+failing request" across a stream of interleaved, concurrent log output
+is a single grep instead of a timestamp guessing game.
+
+---
+
+### Boundary validation with Zod, and why validated data lives on req.validated
+
+**What it is.** Middleware that runs a Zod schema against
+`req.body`, `req.query`, or `req.params` before a route handler ever
+runs, rejecting the request with a 400 and field-level detail if it
+fails, and making the parsed (typed, defaulted, coerced) result
+available to the handler if it succeeds.
+
+**Why it exists in this project.** CLAUDE.md requires "All input
+validated with Zod at the route boundary" — not inside services. A
+service function should be callable from anywhere: a route, a future
+BullMQ worker job, a test, a seed script — none of which necessarily
+have HTTP-request-shaped input to validate against. If Zod validation
+lived inside a service instead, every caller would need to construct
+request-shaped input just to satisfy a schema that only makes sense for
+HTTP, even a worker job that never touched HTTP at all. Validating at
+the boundary means services can trust plain, already-valid argument
+types unconditionally.
+
+**How it works mechanically.** `src/middleware/validate.ts` exports
+`validateBody`, `validateQuery`, `validateParams`, each a thin wrapper
+around one internal `makeValidator(schema, target)`. It calls
+`schema.safeParse(req[target])` — `safeParse`, not `parse`, so a failure
+is a normal return value, not a thrown exception the middleware would
+have to catch. On failure, it maps every Zod issue into
+`{ field, message }` and forwards `badRequest('Validation failed', details)`
+into the centralized error middleware, rather than writing a one-off
+response — so validation failures get the exact same JSON error shape
+every other error does. On success, it writes the parsed value onto
+`req.validated[target]` (declared in `src/types/express.d.ts`) — **not**
+back onto `req.body`/`req.query`/`req.params` directly. That's a
+constraint, not a style choice: Express 5's `req.query` is a getter-only
+accessor with no setter (`node_modules/express/lib/request.js`), and
+`req.query = {...}` throws a `TypeError` under this project's ESM/strict
+execution — confirmed directly, not assumed. `req.body`/`req.params`
+happen to still be plain writable properties, but using one mechanism
+(`req.validated`) for all three avoids an arbitrary asymmetry between
+them that would need to be remembered and explained per-target.
+
+**Where it lives in the codebase.** `src/middleware/validate.ts`;
+`req.validated`'s type is declared in `src/types/express.d.ts`;
+`tests/middleware/validate.test.ts` exercises all three targets,
+including proving query validation specifically works despite the
+getter constraint.
+
+**Common pitfalls.**
+
+- Using `schema.parse()` instead of `safeParse()` inside the middleware
+  — `parse` throws on failure, and while Express 5 would still forward
+  that throw to the error middleware (it's a synchronous throw, always
+  forwarded), the resulting error would be Zod's raw `ZodError`, not a
+  `badRequest(...)` with field-level detail — losing the specific,
+  client-useful shape this middleware exists to produce.
+- Returning Zod's raw `issue.path`/`issue.code` structure to the client
+  — it's an internal representation (arrays of path segments, Zod-
+  specific issue codes) not designed as an API contract; mapping to
+  `{ field, message }` is deliberate, not incidental.
+- Trying to mutate `req.query` directly out of Express-4 habit — throws
+  immediately in this codebase's ESM/strict execution, not a silent
+  no-op (which is what happens under CommonJS/sloppy mode, making this
+  an easy trap if tested under the wrong module system).
+
+**Production considerations.** Every future feature route (auth, links,
+redirects) is expected to compose `validateBody`/`validateQuery`/
+`validateParams` in its route definition — e.g.
+`router.post('/links', validateBody(createLinkSchema), handler)` — and
+read `req.validated.body` inside the handler, narrowed with
+`z.infer<typeof createLinkSchema>`. Keeping this middleware generic
+(schema-in, target-out) rather than route-specific means every future
+route gets the same 400 shape and the same field-level detail for free.
+
+**Interview answer.** I validate `body`/`query`/`params` at the route
+boundary with reusable Zod middleware, because a service function should
+be callable from anywhere — a route, a worker job, a test — without
+needing HTTP-shaped input to satisfy a validator that only makes sense
+for HTTP requests. On failure it returns a 400 with field-level detail
+mapped from Zod's issues, not a raw Zod error dump. On success, it
+writes the parsed value onto a separate `req.validated` object rather
+than mutating `req.body`/`req.query` in place — partly for consistency,
+but also because Express 5's `req.query` is actually a getter-only
+property with no setter, so reassigning it directly throws.
+
+---
+
+### helmet and CORS: what each actually protects against
+
+**What it is.** Two unrelated pieces of browser-facing security
+middleware bundled together here only because they're both registered
+early in the middleware chain: `helmet` sets a battery of security-
+related response headers; `cors` controls which cross-origin JavaScript
+is allowed to read this API's responses.
+
+**Why it exists in this project.** This is a REST API consumed by a
+separate Next.js frontend running on a different origin — cross-origin
+requests are the normal case here, not an edge case, so CORS has to be
+configured deliberately rather than left at a default. Response headers
+that harden against common browser-side attack classes (clickjacking,
+MIME-sniffing, protocol downgrade) cost nothing to add and have no
+reason not to be on by default.
+
+**How it works mechanically.** `helmet()` (`src/middleware/security.ts`)
+applies its default header set to every response — concretely:
+`Strict-Transport-Security` forces the browser to always use HTTPS for
+this origin afterward, blocking SSL-stripping downgrade attacks;
+`X-Content-Type-Options: nosniff` stops the browser from MIME-sniffing a
+response into executing as something other than its declared
+`Content-Type`; the default `Content-Security-Policy` restricts which
+origins scripts/styles may load from, shrinking XSS blast radius;
+`X-Frame-Options`/the `frame-ancestors` CSP directive blocks this page
+from being embedded in another site's `<iframe>`, mitigating
+clickjacking; `Referrer-Policy` limits how much of this API's URLs leak
+to third parties via the `Referer` header.
+
+`cors({ origin: config.CORS_ORIGIN })` handles the `Access-Control-*`
+header exchange, including the browser-issued preflight `OPTIONS`
+request that precedes many cross-origin calls — correctly reflecting
+the request's origin only if it's in the allowed list, and setting
+`Vary: Origin` so shared caches don't serve one origin's CORS headers to
+another. `config.CORS_ORIGIN` (`src/config/env.ts`) is a required,
+comma-separated-then-array-parsed list of explicit origins, validated at
+startup to reject `*` via a Zod `.refine()` — so a wildcard fails fast
+with the same `EnvValidationError` path any other invalid env var uses,
+rather than silently shipping something permissive. It's parsed as an
+array specifically so more than one legitimate frontend origin (a
+production URL and a deployed preview URL, for instance) can be
+allowlisted simultaneously without a code change — just a comma-
+separated env value.
+
+Critically: CORS is a **browser-enforced** restriction on which
+origins' JavaScript may _read_ a cross-origin response. It does nothing
+to stop a non-browser client — `curl`, a server-to-server call, Postman
+— from calling this API directly; the request still executes
+server-side regardless of any CORS header. It is not an authentication
+or authorization mechanism, and never should be treated as one.
+
+**Where it lives in the codebase.** `src/middleware/security.ts`
+(`securityHeaders`, `corsMiddleware`); `CORS_ORIGIN` in
+`src/config/env.ts`, `.env`/`.env.example`/`.env.test`; registered in
+`src/app.ts` right after `requestContext`, before body parsing and
+routes.
+
+**Common pitfalls.**
+
+- Setting `Access-Control-Allow-Origin: *` "to make CORS errors go
+  away" during development and shipping it — it tells every website's
+  JavaScript, from any origin, that it may read this API's responses in
+  a victim user's browser session. If this API ever adds cookie-based
+  auth, a wildcard origin combined with `credentials: true` is
+  specifically forbidden by the CORS spec (browsers refuse that
+  combination outright) — but even without credentials, a wildcard
+  removes origin allowlisting entirely for an API with a known, fixed
+  set of legitimate frontends.
+- Mistaking a passing CORS-configured request for "this request is
+  authenticated" — CORS controls whether a _browser_ lets JavaScript
+  read the response; it says nothing about who or what sent the
+  request.
+- Forgetting the preflight `OPTIONS` request when hand-rolling CORS
+  headers instead of using the `cors` package — a surprisingly common
+  source of "works with curl, fails from the browser" bugs, which is
+  the concrete reason `cors` was added as a dependency instead of
+  setting headers by hand.
+
+**Production considerations.** As auth is added in a later phase, the
+decision on cookie- vs bearer-token-based sessions directly determines
+whether `corsMiddleware`'s `credentials` option needs to flip to `true`
+— deliberately left at its default (`false`) for now, since turning it
+on prematurely would widen the security surface before there's any
+mechanism to explain why. `CORS_ORIGIN` being a list (not a single
+string) is what lets a preview-deployment origin be added alongside
+production without touching code — just the env var.
+
+**Interview answer.** Helmet sets a set of response headers that harden
+against common browser-side attacks with no functional cost — HSTS
+against downgrade attacks, `nosniff` against MIME-sniffing XSS, a
+restrictive CSP, frame-ancestors against clickjacking. CORS is
+different: it's a browser-enforced rule about which origins' JavaScript
+may read this API's responses, configured here from an explicit,
+required, non-wildcard list of allowed origins. The key thing I make
+sure not to conflate: CORS doesn't stop a non-browser client from
+calling the API directly — the request executes either way — so it's a
+browser-safety mechanism, not an authentication boundary, and a
+wildcard origin is dangerous specifically because it removes that
+safety for every site on the internet at once.
+
+---
+
+### Health checks: liveness vs readiness, and why 503 not 200-with-a-status-field
+
+**What it is.** Two different questions an orchestrator needs answered
+about a running instance, each requiring a different HTTP endpoint and a
+different recovery action when the answer is "no": liveness ("is this
+process alive at all?") and readiness ("can this instance currently
+serve real traffic?").
+
+**Why it exists in this project.** `GET /` (liveness, unchanged from
+Phase 1, now under `src/routes/root.ts`) and `GET /health` (readiness,
+new this phase) answer genuinely different questions, and conflating
+them causes a specific, well-known production failure mode: if
+dependency checks were wired into the liveness endpoint, a transient
+Postgres blip would make liveness fail, and an orchestrator's correct
+response to failed liveness is to kill and restart the container —
+producing a restart-crash-loop over an external outage that restarting
+the process can't fix.
+
+**How it works mechanically.** `GET /` (`src/routes/root.ts`) does zero
+dependency checks — it just proves the process can respond to HTTP at
+all, which is exactly what a liveness probe should verify: if it fails,
+the process itself is presumed broken, and killing/restarting it is the
+right move. `GET /health` (`src/routes/health.ts`) calls
+`getHealthReport()` (`src/services/health.ts`), which runs
+`checkDatabaseHealth()` (`src/db/health.ts`, existing) and
+`checkRedisHealth()` (new, `src/lib/redis.ts`) concurrently via
+`Promise.all`, timing each with `process.hrtime.bigint()`. Both
+underlying checks already catch their own errors internally and return
+a plain `boolean` — so `getHealthReport` has nothing that can reject,
+satisfying "a health check that must never throw" structurally, not by
+convention. The route returns `200` when every dependency is `ok`, `503`
+when any is not — status code, not a `status` field the client would
+have to parse — specifically because a standard orchestrator health
+check keys off the HTTP status alone; requiring it to also parse a JSON
+body to know the instance is unhealthy is an unnecessary, easy-to-get-
+wrong extra step for infrastructure that's checking thousands of
+instances a minute. The response body still names each dependency's
+individual status and latency, for a human debugging a `degraded`
+result — just not as the sole signal.
+
+**Where it lives in the codebase.** `src/routes/root.ts` (liveness),
+`src/routes/health.ts` + `src/services/health.ts` (readiness),
+`src/db/health.ts` + `src/lib/redis.ts` (the two individual dependency
+checks).
+
+**Common pitfalls.**
+
+- Wiring dependency checks into the liveness endpoint instead of a
+  separate readiness endpoint — causes the restart-crash-loop failure
+  mode described above; this is the single most important reason the two
+  are kept as genuinely separate routes rather than one endpoint with a
+  query parameter.
+- Returning `200` with `{ status: 'error' }` in the body instead of a
+  real `503` — technically informative to a human reading the JSON, but
+  invisible to any infrastructure that only checks the HTTP status code,
+  which is the overwhelming majority of health-check consumers (load
+  balancers, container orchestrators, uptime monitors).
+- Letting a health check itself throw on a downstream failure — turns a
+  single dependency outage into the health endpoint _also_ being down,
+  which is strictly worse than an accurate `503`, since it can look like
+  the whole service crashed rather than one specific dependency being
+  unreachable.
+
+**Production considerations.** `getHealthReport`'s "never throws"
+property depends entirely on `checkDatabaseHealth`/`checkRedisHealth`
+each continuing to catch internally — if either check is ever rewritten
+to let an error propagate, `getHealthReport`'s `Promise.all` would
+reject, and the route (being `async`, per the previous section on
+Express 5) would still produce a response rather than hanging — but a
+generic sanitized 500 via the error middleware, not the specific,
+per-dependency `503` this endpoint is designed to return. This is
+exercised directly in `tests/routes/health.test.ts` by deliberately
+breaking the contract and confirming Express 5's automatic forwarding
+is a working backstop, not just a hope.
+
+That same test file also has a smaller, deliberate asymmetry worth
+calling out: `checkDatabaseHealth` is mocked (via `vi.mock`) so both the
+`ok` and `error` branches are producible on demand — a currently-healthy
+local Postgres can't be made to fail on command — while
+`checkRedisHealth` is left unmocked and hits the real local Redis
+container. Mocking both would be more internally consistent, but it
+would mean nothing in the test suite ever proves the real `ioredis`
+client actually connects and speaks the protocol correctly end-to-end;
+keeping one dependency real, even at the cost of the asymmetry, is worth
+that assurance. The direct consequence: this test currently assumes a
+live local Redis (via `docker-compose up -d`), exactly the same
+assumption `tests/db/*.test.ts` already make about Postgres. Whichever
+CI environment eventually runs this suite (a future phase's concern)
+will need a Redis service container provisioned alongside the Postgres
+one it already needs — not a new category of CI requirement, just an
+additional instance of one that already exists.
+
+**Interview answer.** Liveness answers "is the process running at all,"
+and the correct response to failure is to kill and restart the
+container. Readiness answers "can this instance serve real traffic
+right now," and the correct response to failure is to stop routing
+traffic to it without restarting — restarting won't fix an external
+database outage, so conflating the two causes a restart-crash-loop on
+every transient dependency blip. I implement `/health` as the readiness
+check — parallel Postgres and Redis pings, each already catching its own
+errors so the endpoint itself can never throw — and return a real `503`
+status rather than `200` with an error field in the body, because
+standard health-check infrastructure keys off the HTTP status alone.
+
+---
+
+### The app.ts / server.ts split, and testing an Express app with supertest
+
+**What it is.** Splitting "build the Express app and register its
+middleware" (`src/app.ts`, exports `app`, never calls `.listen()`) from
+"start listening on a port, handle graceful shutdown"
+(`src/server.ts`, imports `app`, is the only place that calls
+`app.listen()`).
+
+**Why it exists in this project.** Before this phase, `server.ts` built
+`app` and called `.listen()` in the same file, with `app` never
+exported. That made the app fundamentally untestable at the HTTP level:
+importing that file to test a route would also open a real port and
+initialize the real DB pool as unavoidable side effects. Splitting the
+two means a test can import `src/app.ts` alone and get a fully
+configured Express app with none of those side effects.
+
+**How it works mechanically.** `src/app.ts` builds `app = express()`,
+registers every middleware and route in order, and exports `app` — that's
+the entire file's job, nothing calls `.listen()`. `src/server.ts` imports
+that `app`, calls `app.listen(config.PORT, ...)`, and owns the existing
+graceful-shutdown logic (SIGTERM/SIGINT → `server.close()` →
+`Promise.all([pool.end(), redis.quit()])` → exit), unchanged in
+structure from Phase 1 aside from also closing the new Redis client
+alongside the existing Postgres pool. In every test file under
+`tests/middleware/` and `tests/routes/`, `supertest(app)` (or an
+ad-hoc `express()` app built inline, for tests that want to isolate one
+middleware) wraps the exported Express app and issues real HTTP-shaped
+requests against it internally per call, without either binding a real,
+fixed TCP port or requiring any test-specific coordination between test
+files that both want port 3000.
+
+**Where it lives in the codebase.** `src/app.ts` (composition root);
+`src/server.ts` (listen + shutdown only); every file under
+`tests/middleware/` and `tests/routes/` uses `supertest`.
+
+**Common pitfalls.**
+
+- Calling `app.listen()` inside `app.ts` "for convenience" — reintroduces
+  exactly the untestable coupling this split exists to remove; any test
+  importing `app.ts` would open a real port as a side effect again.
+- Importing `src/app.ts` in a test file that needs a specific
+  `NODE_ENV`/config value (like `tests/routes/health.test.ts` needing
+  `.env.test`'s values) via a plain top-level `import` — `src/config/
+index.ts` reads `process.env` at module-evaluation time, and ES module
+  imports are always fully evaluated before any of the importing file's
+  own top-level statements run, regardless of where the import appears
+  textually in the file. A `process.loadEnvFile('.env.test')` call
+  written above a static `import { app } from '../../src/app.js'` still
+  loses the race — the fix is a **dynamic** `import()` inside
+  `beforeAll`, deferring evaluation until after the env is loaded (see
+  `tests/routes/health.test.ts`).
+- Forgetting that `tests/globalSetup.ts` runs once, before test files
+  are loaded, in a way that doesn't reliably propagate its own
+  `process.loadEnvFile` call into each test file's process/worker — this
+  codebase's existing convention (`tests/db/constraints.test.ts`,
+  followed here in `tests/routes/health.test.ts`) is for every test file
+  that needs `.env.test`'s values to call `process.loadEnvFile('.env.test')`
+  itself, redundantly, rather than relying on global setup alone.
+
+**Production considerations.** This split has no runtime behavior
+difference in production — `npm start` still runs `server.ts`, which
+still calls `app.listen()` exactly once. The entire benefit is
+testability; there's no tradeoff to weigh against it.
+
+**Interview answer.** I split the Express app's construction from
+starting the server: `app.ts` builds and exports the configured `app`
+without ever calling `.listen()`, and `server.ts` is the only file that
+imports `app` and starts listening, alongside the existing graceful-
+shutdown logic. That split is what makes the app testable at the HTTP
+level with `supertest` — tests import `app.ts` directly and get a fully
+wired Express app with no real port opened and no server lifecycle to
+manage, since supertest handles request/response internally against the
+app object rather than needing a real, bound socket.
+
+---
+
+### The path-to-regexp v8 wildcard change, and the catch-all 404 pattern
+
+**What it is.** Express 5 bundles `path-to-regexp@8`, which dropped
+support for a bare `'*'` as a route pattern — the classic Express-4
+catch-all idiom, `app.use('*', notFoundHandler)`, now throws at
+route-registration time instead of matching every path.
+
+**Why it exists in this project.** A catch-all 404 handler is required
+scope for this phase (registered after every real route, before the
+error handler), and the obvious, most-documented way to write one — the
+Express-4-era `app.use('*', ...)` — actively breaks the app on this
+Express version. This was verified directly against the installed
+version rather than assumed from older tutorials or training data.
+
+**How it works mechanically.** Confirmed by running it:
+`app.use('*', (req, res) => res.end())` throws `Missing parameter name
+at index 1: *` immediately, at the `app.use()` call itself, because
+`path-to-regexp@8` (Express 5's bundled router-pattern parser) no longer
+treats a bare `*` as "match anything" — the syntax it does support for
+wildcards changed. The fix used in `src/middleware/notFoundHandler.ts`
+is to register it with **no path argument at all**:
+`app.use(notFoundHandler)`. A path-less `app.use()` was never tied to
+`path-to-regexp`'s pattern syntax in the first place — it matches every
+method and path unconditionally, with no route-pattern parsing
+involved, which is both the fix for this specific version and a more
+version-agnostic way to express "match everything" than depending on
+whatever wildcard syntax path-to-regexp happens to support at any given
+Express major version.
+
+**Where it lives in the codebase.**
+`src/middleware/notFoundHandler.ts` (the handler itself);
+`app.use(notFoundHandler)` in `src/app.ts`, registered after every route
+and before the error handler.
+
+**Common pitfalls.**
+
+- Copying `app.use('*', ...)` from older Express-4 documentation,
+  tutorials, or Stack Overflow answers without testing against the
+  actual installed Express version — throws immediately at startup on
+  Express 5 with `path-to-regexp@8`, not a subtle runtime bug but a hard
+  crash the moment that line registers.
+- Assuming `app.get('/*', ...)` (rather than `app.use`) is a safe
+  alternative — it has the same underlying `path-to-regexp` wildcard-
+  syntax dependency and the same failure mode; the actual fix is
+  avoiding a path argument entirely for a true catch-all, not finding a
+  different wildcard string that happens to still parse.
+- Not verifying a "well-known" library behavior against the actual
+  installed version when it materially changes a design — this specific
+  fact was confirmed by literally running `app.use('*', fn)` against the
+  installed `node_modules/express`, rather than trusted from general
+  Express knowledge, precisely because Express 5's dependency bump was
+  exactly the kind of change generic knowledge can be stale about.
+
+**Production considerations.** None beyond the registration-time crash
+itself — since it throws immediately at app construction, this fails
+loudly and immediately in any environment (dev, CI, or prod) the moment
+the offending line is registered, rather than manifesting as a subtle
+runtime bug. That's the best-case version of "this is broken" — it's
+impossible to miss.
+
+**Interview answer.** Express 5 bundles a newer major version of
+`path-to-regexp`, its internal route-pattern parser, which dropped
+support for a bare `'*'` wildcard — the classic Express-4 catch-all
+pattern `app.use('*', handler)` now throws at registration time instead
+of matching every route. I write the catch-all with no path argument at
+all — `app.use(handler)` — which was never tied to path-to-regexp's
+pattern syntax in the first place and matches everything unconditionally,
+which is both the fix for this Express version and more resilient to
+whatever wildcard syntax future versions support or drop.
+
+---
+
+### ioredis: lazy vs eager connection, and mirroring pg.Pool's laziness
+
+**What it is.** Whether a database/cache client opens its network
+connection the moment it's constructed (eager) or defers it until the
+first real command is issued (lazy) — a configuration choice, not a
+fixed property of the library.
+
+**Why it exists in this project.** `src/lib/redis.ts` is imported
+transitively by `src/app.ts` (via the health route), and `src/app.ts` is
+imported by every test file in `tests/middleware/` and `tests/routes/`
+— including ones that have nothing to do with Redis at all. If
+constructing the Redis client opened a real connection immediately, just
+importing `app.ts` for an unrelated middleware test would trigger a real
+network connection as an invisible side effect.
+
+**How it works mechanically.** `ioredis` connects eagerly **by
+default** — the moment `new Redis(url)` runs, it opens a real TCP
+socket. That's different from `pg.Pool` (`src/db/pool.ts`), which is
+lazy by default: constructing a `Pool` allocates no connections until
+the first `.query()` call. `src/lib/redis.ts` passes
+`lazyConnect: true` explicitly to make `ioredis` behave the same way
+`pg.Pool` already does — the connection only opens on the first actual
+command, which in practice is `checkRedisHealth`'s `PING`. Without that
+flag, the two dependency clients in this codebase would have
+inconsistent behavior for no functional reason, and every module that
+happens to import `redis.ts` — directly or transitively — would carry
+an invisible eager-connection side effect the equivalent Postgres import
+doesn't have.
+
+Separately, `maxRetriesPerRequest: 1` bounds how many times one
+in-flight command (the health-check ping) is retried while the
+connection is down before its promise rejects — this is what makes
+`checkRedisHealth()` fail fast instead of riding out `ioredis`'s
+default, considerably longer retry budget. This is a genuinely different
+knob from `retryStrategy` (left at its default), which governs
+background _reconnection_ attempts after a connection drops — that's
+allowed to keep retrying indefinitely in the background, since it
+doesn't block anything; `maxRetriesPerRequest` is specifically about how
+long one caller waits for one command's result.
+
+**Where it lives in the codebase.** `src/lib/redis.ts` — the `redis`
+client and `checkRedisHealth()`; `src/db/pool.ts` for the analogous
+(already-lazy-by-default) Postgres pattern this mirrors.
+
+**Common pitfalls.**
+
+- Constructing `new Redis(url)` without `lazyConnect: true` in a module
+  that might be imported for reasons unrelated to Redis (as `app.ts` is,
+  by many test files) — turns "import this file" into "open a real
+  network connection," which is surprising, slows down unrelated tests,
+  and can make a test suite depend on Redis being reachable even for
+  tests that never touch it.
+- Confusing `retryStrategy` and `maxRetriesPerRequest` — tuning the
+  wrong one when trying to make a health check fail faster (adjusting
+  `retryStrategy`, which governs reconnection, does nothing to bound how
+  long an individual command waits).
+- Assuming `lazyConnect` means "never connects automatically" — it only
+  defers the _first_ connection to the first command; once that command
+  runs, the client behaves exactly like an eagerly-connected one for
+  every subsequent command, including staying connected in the
+  background.
+
+**Production considerations.** BullMQ — this repository's future
+`worker/` process — requires `ioredis` specifically as its Redis client
+(not the other major Node Redis library, `node-redis`), which is why
+`ioredis` was chosen here for connection-only health checking rather
+than a different, perhaps simpler, client: it's the one client this
+codebase will need again regardless, so introducing it now means the
+worker phase reuses this exact client rather than adding a second Redis
+library to the dependency tree later.
+
+**Interview answer.** `ioredis` connects eagerly by default — opening a
+real socket the moment the client is constructed — which is the
+opposite of `pg.Pool`'s default laziness in this same codebase. Since
+the Redis client module gets imported transitively by many things that
+have nothing to do with Redis (any test that imports the app), I pass
+`lazyConnect: true` so constructing the client is side-effect-free and
+the actual connection only opens on the first real command, matching how
+the Postgres pool already behaves. Separately, I bound
+`maxRetriesPerRequest` to `1` so a health-check ping fails fast instead
+of riding out the client's default retry budget when Redis is down —
+distinct from `retryStrategy`, which governs unrelated background
+reconnection and is left at its default.

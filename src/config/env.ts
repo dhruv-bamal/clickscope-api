@@ -29,6 +29,32 @@ export const envSchema = z.object({
     .url('REDIS_URL must be a valid connection string, e.g. redis://localhost:6379'),
 
   LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal']).default('info'),
+
+  // Comma-separated list of origins allowed to make cross-origin requests
+  // (e.g. the Next.js frontend in dev, plus a deployed preview URL).
+  // Required with no default, and explicitly forbidden from being "*" —
+  // an API with a known, fixed set of frontends should never allow every
+  // origin on the internet to read its responses in a browser.
+  CORS_ORIGIN: z
+    .string({
+      required_error: 'CORS_ORIGIN is required, e.g. http://localhost:5173',
+    })
+    .transform((value) =>
+      value
+        .split(',')
+        .map((origin) => origin.trim())
+        .filter((origin) => origin.length > 0),
+    )
+    .pipe(
+      z
+        .array(
+          z.string().url('Each CORS_ORIGIN entry must be a valid URL, e.g. http://localhost:5173'),
+        )
+        .min(1, 'CORS_ORIGIN must list at least one origin')
+        .refine((origins) => !origins.includes('*'), {
+          message: 'CORS_ORIGIN must not be a wildcard ("*") — list explicit allowed origin(s)',
+        }),
+    ),
 });
 
 export type Config = z.infer<typeof envSchema>;
