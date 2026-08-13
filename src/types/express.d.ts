@@ -29,6 +29,14 @@ declare global {
         query?: unknown;
         params?: unknown;
       };
+      /**
+       * Populated by src/middleware/auth.ts on a successfully verified
+       * request — the JWT's `sub` claim, nothing more. Route handlers that
+       * need the full user row fetch it themselves (see authService's
+       * getUserById); this middleware deliberately doesn't do that lookup
+       * on every request.
+       */
+      userId?: string;
     }
   }
 }

@@ -2659,3 +2659,889 @@ the Postgres pool already behaves. Separately, I bound
 of riding out the client's default retry budget when Redis is down —
 distinct from `retryStrategy`, which governs unrelated background
 reconnection and is left at its default.
+
+## Phase 4: Authentication
+
+### New dependencies: bcryptjs and jsonwebtoken
+
+**What it is.** Two runtime dependencies added in this phase: `bcryptjs`
+(password hashing) and `jsonwebtoken` (signing/verifying JWTs), plus
+`@types/jsonwebtoken` as a dev dependency since `jsonwebtoken` ships no
+bundled types (`bcryptjs` does, so no separate types package was needed
+for it).
+
+**Why it exists in this project.** Neither password hashing nor JWT
+handling has a reasonable hand-rolled implementation — both are exactly
+the kind of security-critical, easy-to-get-subtly-wrong code where using
+a widely-audited library is the responsible choice, not a shortcut.
+
+**How it works mechanically / the alternatives.**
+
+- `bcryptjs` was chosen over `bcrypt` (the more common choice, native
+  bindings via `node-gyp`). `bcrypt` is faster since it runs compiled C++
+  rather than pure JS, but that speed comes with a native compile step
+  that can fail across platforms, Docker base images, or CI runners
+  without the right build toolchain present. `bcryptjs` is a drop-in-
+  compatible pure-JS reimplementation of the same algorithm — same hash
+  format, same API shape (`hash`/`compare`/`hashSync`/`compareSync`) —
+  trading some raw speed for zero native-build risk. For this project's
+  scale, that's the right trade: nothing here is hashing at a volume
+  where the speed difference matters, but a broken Docker build over a
+  native dependency is a real, recurring annoyance.
+- `jsonwebtoken` was chosen over `jose` (a more modern, ESM-native
+  library with broader algorithm and JWK support). `jose` is the better
+  choice for anything doing asymmetric signing, key rotation via JWKS, or
+  needing non-Node runtimes (edge functions, browsers). This project only
+  needs the simplest case — sign and verify with one shared secret,
+  HS256 — which is exactly `jsonwebtoken`'s core use case and where its
+  simpler, more widely-known API is a better fit than `jose`'s larger
+  surface area.
+
+**Where it lives in the codebase.** `src/services/passwordService.ts`
+(`bcryptjs`), `src/services/tokenService.ts` (`jsonwebtoken`).
+
+**Common pitfalls.**
+
+- Reaching for `bcrypt` by default out of familiarity without weighing
+  the native-build risk against the actual performance need.
+- Assuming `jsonwebtoken`'s types match runtime behavior exactly —
+  `@types/jsonwebtoken`'s `expiresIn` type is a template-literal union
+  narrower than plain `string`, which doesn't accept a Zod-validated
+  config string without a cast (see the JWT structure section below).
+
+**Production considerations.** If this project ever needed asymmetric
+signing (e.g. a separate service verifying tokens without holding the
+signing secret) or JWK-based key rotation, `jose` would become the
+better choice and this would be worth revisiting — the two libraries
+aren't a "correct vs incorrect" choice, just scoped to different needs.
+
+**Interview answer.** I chose `bcryptjs` over `bcrypt` to avoid a native
+compile step that can break across platforms and CI, accepting a modest
+speed cost for a project that isn't hashing at meaningful volume. I chose
+`jsonwebtoken` over `jose` because this project only needs simple
+shared-secret HS256 sign/verify, where `jsonwebtoken`'s smaller, more
+familiar API is a better fit than `jose`'s broader but heavier surface
+aimed at asymmetric keys and JWK rotation.
+
+---
+
+### Hashing vs. encryption for passwords
+
+**What it is.** Encryption is reversible: given the right key, ciphertext
+converts back to the original plaintext. Hashing is (by design)
+one-way: a hash function maps input to a fixed-size output with no
+inverse operation — there's no key that turns a bcrypt hash back into
+the original password.
+
+**Why it exists in this project.** `users.password_hash` stores a hash,
+never an encrypted password, because the application itself never needs
+to recover a user's original password — only to check whether a
+candidate string matches. If passwords were merely encrypted, anyone who
+obtained both the ciphertext and the encryption key (a database breach
+plus, say, an app-config leak) could recover every plaintext password
+directly. Hashing removes that risk structurally: there is no key to
+steal that would undo it.
+
+**How it works mechanically.** `passwordService.hashPassword` calls
+`bcrypt.hash(plain, cost)`, which never stores `plain` anywhere — only
+the one-way hash. Verifying a login re-hashes the candidate password
+(using the salt embedded in the stored hash, see the Salt section below)
+and compares the two hash outputs, never decrypting anything.
+
+**Where it lives in the codebase.** `src/services/passwordService.ts`;
+the `password_hash` column in `migrations/20260810111606772_create-users-table.ts`.
+
+**Common pitfalls.**
+
+- Calling a hashed password "encrypted" in code comments or docs — the
+  distinction matters because it implies a recovery path that doesn't
+  exist and shouldn't be designed for.
+- Building a "forgot password" flow that tries to recover and email the
+  original password — structurally impossible with hashing, and a
+  correct password-reset flow (invalidate + let the user set a new one)
+  doesn't need it anyway.
+
+**Production considerations.** None beyond what's already true here —
+this is a settled, non-controversial practice; the interesting decisions
+are downstream of it (which hash function, what cost factor — see next).
+
+**Interview answer.** Encryption is reversible with the right key;
+hashing isn't reversible at all. Passwords are hashed, not encrypted,
+because the app never needs the original password back — only to check
+whether a login attempt matches — and removing the possibility of
+recovery means a database breach alone (without some separate encryption
+key) can't hand an attacker plaintext passwords.
+
+---
+
+### Why bcrypt over SHA-256: the attacker-economics argument
+
+**What it is.** SHA-256 is a general-purpose cryptographic hash function,
+designed to be as fast as possible. bcrypt is a password-hashing
+function specifically, designed to be deliberately, tunably slow.
+
+**Why it exists in this project.** Fast isn't a virtue for a password
+hash — it's the opposite. `passwordService.ts` uses bcrypt (via
+`bcryptjs`), not `crypto.createHash('sha256')`, specifically because
+SHA-256's speed is a liability against offline brute-force.
+
+**How it works mechanically.** If an attacker steals a database of
+password hashes, they no longer need the live application at all — they
+can brute-force guesses locally, as fast as their hardware allows, with
+no rate limiting or network latency in the way. Modern GPUs compute
+billions of SHA-256 hashes per second, so a stolen SHA-256 hash of even
+a fairly strong password can often be brute-forced in a practical amount
+of time. bcrypt is deliberately expensive per hash — driven by its cost
+factor (next section) — so the same GPU that computes billions of
+SHA-256 hashes per second might compute only a few hundred or thousand
+bcrypt hashes per second at a reasonable cost. That difference compounds
+across an entire stolen database: cracking is an economics problem
+(attacker time and hardware cost per guess), and bcrypt raises the cost
+per guess by many orders of magnitude compared to a general-purpose hash.
+
+**Where it lives in the codebase.** `src/services/passwordService.ts`.
+
+**Common pitfalls.**
+
+- Using any general-purpose hash (SHA-256, SHA-512, MD5) for passwords —
+  they're built to be fast, which is exactly wrong here.
+- Assuming "cryptographically secure hash" alone is sufficient — SHA-256
+  is cryptographically secure (collision-resistant, etc.) but that's a
+  different property from being slow enough to resist brute-forcing.
+
+**Production considerations.** bcrypt has a 72-byte input limit (longer
+passwords are silently truncated by some implementations) and no
+built-in memory-hardness, which is why newer algorithms like Argon2 are
+sometimes preferred for new systems. bcrypt remains a reasonable,
+well-audited, widely-supported choice and is what this project uses; a
+future migration to Argon2 would be a reasonable evolution, not a
+correction of a mistake.
+
+**Interview answer.** A general-purpose hash like SHA-256 is designed to
+be fast, which is exactly the wrong property for password storage: if a
+database of hashes is ever stolen, an attacker brute-forces offline with
+no rate limiting, and a fast hash lets them try billions of guesses per
+second. bcrypt is deliberately slow and tunably so via its cost factor,
+which raises the cost of each guess by orders of magnitude and makes
+brute-forcing a stolen hash database economically impractical rather
+than just theoretically hard.
+
+---
+
+### The bcrypt cost factor: what it trades off, and why it's a DoS surface
+
+**What it is.** bcrypt's cost factor (also called "work factor" or
+"rounds") controls how many times its internal key-derivation step
+repeats. It's not linear — each increment of the cost factor roughly
+**doubles** the time a single hash or comparison takes.
+
+**Why it exists in this project.** `BCRYPT_COST` (`src/config/env.ts`,
+default `12`) is a configuration value, not a hardcoded constant,
+specifically so it can be tuned per environment without a code change:
+production uses `12` (a reasonable 2024+ default, ~200-300ms per hash on
+typical hardware), while `.env.test` overrides it to `4` so the test
+suite — which hashes and compares passwords repeatedly across signup,
+login, and the dummy-hash timing mitigation — stays fast.
+
+**How it works mechanically.** Every signup calls `hashPassword`
+(~200-300ms at cost 12); every login calls `verifyPassword` against a
+real hash, or — on a failed lookup — `verifyAgainstDummyHash`, which
+still costs the same ~200-300ms (see the Timing Attacks section below
+for why that's deliberate). That means **every** `POST /api/auth/login`
+request, successful or not, does a fixed, non-trivial amount of CPU
+work. A specific number of concurrent requests to `/login` can
+meaningfully load the server's CPU in a way most other endpoints in this
+codebase can't — this makes the login endpoint a plausible
+denial-of-service surface distinct from a general traffic flood, and is
+part of why the cost factor is a genuine security/operability trade,
+not just a "bigger number is more secure" knob.
+
+**Where it lives in the codebase.** `BCRYPT_COST` in
+`src/config/env.ts`; consumed in `src/services/passwordService.ts`.
+
+**Common pitfalls.**
+
+- Treating cost as a linear scale — going from 10 to 12 isn't "20% more
+  work," it's roughly 4x the work, because each increment doubles the
+  previous one.
+- Setting production cost too high without load-testing the login
+  endpoint under concurrency, and being surprised when a moderate spike
+  in login attempts (legitimate or a credential-stuffing attempt) causes
+  real CPU pressure.
+- Forgetting to raise the cost over time — hardware gets faster every
+  year, so a cost that was expensive-enough in 2020 is measurably
+  cheaper to brute-force today at the same setting.
+
+**Production considerations.** Cost should be re-evaluated periodically
+against current hardware (this is an industry-standard practice, not
+specific to this project) and against real login-endpoint latency
+budgets/load. A production system under real credential-stuffing attack
+traffic would likely need rate limiting on `/login` in front of this
+cost, not instead of it — see the OWASP-style rate-limiting middleware
+this codebase doesn't have yet (see CLAUDE.md's architecture note on
+`src/middleware/` for rate limiting as a future responsibility).
+
+**Interview answer.** bcrypt's cost factor is exponential, not linear —
+each increment roughly doubles hashing time — which is what makes it
+tunable against ever-faster brute-forcing hardware over time. But that
+same cost is paid on every legitimate hash or comparison too, including
+every login attempt, which turns the login endpoint into a real CPU-load
+surface: a burst of login requests, even without any brute-forcing
+intent, does meaningfully more server-side work than most other
+endpoints. Choosing a cost factor is a genuine trade between
+brute-force resistance and legitimate-traffic capacity, not a
+"maximize it" decision.
+
+---
+
+### Salt: what it defeats, where bcrypt stores it, and why compare() works anyway
+
+**What it is.** A salt is random data mixed into a password before
+hashing, unique per hash. It's not secret — it's stored alongside (in
+bcrypt's case, embedded within) the hash itself.
+
+**Why it exists in this project.** Without a salt, two users with the
+same password would produce the identical hash, and an attacker could
+precompute a lookup table of hash → common-password pairs once (a
+"rainbow table") and check every stolen hash against it instantly,
+regardless of bcrypt's per-hash cost. A salt defeats precomputation:
+since every hash is salted differently, there's no single table that
+covers even two users with the same password, let alone an entire
+database — the attacker is forced back to brute-forcing each hash
+individually, which is exactly what the cost factor is designed to make
+expensive.
+
+**How it works mechanically.** `bcrypt.hash(plain, cost)` generates a
+fresh random salt internally on every call and encodes it directly into
+the returned string, in a fixed format:
+`$2b$<cost>$<22-char-salt><31-char-hash>` — one string, no separate salt
+column needed anywhere in the schema (confirmed by the test in
+`tests/services/passwordService.test.ts` asserting two hashes of the
+identical password differ). `bcrypt.compare(plain, storedHash)` works
+despite that randomness because it doesn't need the salt supplied
+separately — it parses the salt back out of `storedHash`'s own prefix,
+re-hashes the candidate `plain` password using that exact salt and cost,
+and compares the two resulting hash strings for equality. The salt was
+never secret; its only job is uniqueness, not confidentiality.
+
+**Where it lives in the codebase.**
+`src/services/passwordService.ts` — `hashPassword`/`verifyPassword`; no
+separate salt column exists in `users` (see
+`migrations/20260810111606772_create-users-table.ts`) because it isn't
+needed.
+
+**Common pitfalls.**
+
+- Trying to add a separate `salt` column "to be safe" — bcrypt hashes
+  already carry their own salt; a second one is redundant and easy to
+  wire up inconsistently with the embedded one.
+- Confusing "salt" with "secret" — a salt is stored in the clear
+  alongside the hash and provides no protection if reused predictably;
+  its value is exclusively in being unique per hash, not in being
+  hidden.
+
+**Production considerations.** None beyond what's already correct here
+— bcrypt's salt handling is a solved, standard part of the algorithm;
+nothing about it needs custom implementation or configuration in this
+codebase.
+
+**Interview answer.** A salt is random per-hash data that defeats
+precomputed rainbow-table attacks by ensuring no two hashes of the same
+password ever match, forcing an attacker to brute-force each one
+individually. bcrypt generates a fresh salt on every hash call and
+embeds it directly in the returned hash string, so there's no separate
+salt column to manage — `compare()` works despite the randomness because
+it re-extracts the salt from the stored hash's own prefix before
+re-hashing the candidate password with it.
+
+---
+
+### JWT structure: three parts, base64 not encryption, and what's safe to include
+
+**What it is.** A JSON Web Token is three base64url-encoded segments
+joined by dots: `header.payload.signature` — e.g.
+`eyJhbGc...​.eyJzdWI...​.SflKxwRJ...`. The header names the signing
+algorithm; the payload carries claims (in this project, just `sub`,
+`iat`, `exp`); the signature is a cryptographic MAC over the first two
+segments.
+
+**Why it exists in this project.** `src/services/tokenService.ts` issues
+one of these per successful signup/login as the client's proof of
+identity for subsequent requests, without the server needing to store
+any session state (see the Stateless Auth section below).
+
+**How it works mechanically.** Base64url is an _encoding_, not
+_encryption_ — reversible by anyone, with no key required. Pasting any
+JWT into a decoder (e.g. jwt.io) reveals its full header and payload
+instantly. This project's payload is deliberately minimal — `signToken`
+passes `{}` as the payload object and lets `jwt.sign`'s `subject` option
+populate `sub` — because anything placed in a JWT payload should be
+treated as world-readable: never a password, never anything sensitive,
+only an opaque identifier plus timing claims (`iat`, `exp`). Only the
+signature segment resists forgery (see the next section) — the payload
+itself has zero confidentiality.
+
+**Where it lives in the codebase.** `src/services/tokenService.ts` —
+`signToken`; `TokenPayload` documents the exact claim shape this project
+uses.
+
+**Common pitfalls.**
+
+- Assuming a JWT's contents are hidden because they look like an opaque
+  token — they're one base64 decode away from being fully readable
+  plaintext.
+- Stuffing a JWT payload with sensitive or frequently-changing data
+  (roles, email, feature flags) — anything in the payload is both
+  publicly readable and frozen at issue time (stale until the token
+  expires and is reissued), neither of which is true of a live database
+  row.
+
+**Production considerations.** If this project later needs to carry more
+claims (e.g. a role for authorization), the same "public, frozen at
+issue time" caveat applies to whatever gets added — a decision to make
+deliberately, not by default.
+
+**Interview answer.** A JWT is three base64url segments —
+header, payload, signature — and base64 is just an encoding, not
+encryption, so the payload is fully readable by anyone who has the
+token, with no secret required to decode it. This project's payload only
+ever carries a user id (`sub`) plus standard timing claims, on the
+principle that nothing placed in a JWT payload should be treated as
+confidential.
+
+---
+
+### Signature verification mechanics: how tampering is detected
+
+**What it is.** The mechanism that makes a JWT's _signature_ — as
+opposed to its payload — resistant to forgery: an HMAC-SHA256
+computation over the header and payload, using a secret only the server
+knows.
+
+**Why it exists in this project.** Without this, a client could hand-edit
+a token's base64-decoded payload (e.g. change `sub` to someone else's
+user id) and hand it right back — the payload alone has no built-in
+integrity check.
+
+**How it works mechanically.** `jwt.sign` computes
+`HMAC-SHA256(header + "." + payload, JWT_SECRET)` and appends the result
+as the third segment. `jwt.verify` (in
+`src/services/tokenService.ts`'s `verifyToken`) recomputes that exact
+same HMAC over the token's own header and payload segments, using the
+server's `JWT_SECRET`, and compares it to the signature segment the
+token actually carries. Because HMAC-SHA256 is a cryptographic hash
+function, changing even a single bit anywhere in the header or payload
+produces a completely different HMAC output — there's no way to predict
+what edit would produce a signature that still matches, short of
+knowing the secret and recomputing it correctly. This is exactly what
+`tests/services/tokenService.test.ts`'s tampered-payload test exercises:
+editing the decoded payload and reassembling the token with the
+_original_ signature produces a signature mismatch, and `verifyToken`
+returns `{ ok: false, reason: 'invalid' }`.
+
+**Where it lives in the codebase.** `src/services/tokenService.ts` —
+`verifyToken`; `JWT_SECRET` in `src/config/env.ts` (required, minimum 32
+characters, no default — see below for what a weak/leaked secret allows).
+
+**Common pitfalls.**
+
+- Assuming `jwt.verify` inspects the payload's _content_ for anything
+  suspicious — it doesn't; it only checks whether the signature matches
+  what the header+payload should produce given the secret. A tampered
+  payload with a _coincidentally_ still-valid-looking shape is rejected
+  purely because its signature no longer matches, not because the
+  content itself was scrutinized.
+- Not specifying/restricting the signing algorithm — `jsonwebtoken`
+  defaults `jwt.sign` to HS256 here, which is what `verifyToken` expects;
+  a known JWT vulnerability class involves an attacker resubmitting a
+  token with `alg: none` or switching HS256/RS256 in ways a lax verifier
+  accepts. This project's usage is the simple, single-secret, single-
+  algorithm case, which sidesteps that class of bug rather than needing
+  to defend against it explicitly.
+
+**Production considerations.** A leaked `JWT_SECRET` breaks this
+guarantee entirely — see the next section for exactly what that allows
+an attacker to do, and why the env var has no default.
+
+**Interview answer.** `jwt.verify` recomputes the HMAC-SHA256 signature
+over the token's header and payload using the server's secret, and
+compares it against the signature segment the token carries — it never
+inspects payload content directly. Because a cryptographic hash changes
+completely from even a single-bit input change, any edit to the payload
+after signing produces a signature that no longer matches, which is how
+tampering is detected — not by validating the payload's shape, but by
+the recomputed signature simply not matching anymore.
+
+---
+
+### Stateless auth: the revocation problem, and the three standard mitigations
+
+**What it is.** "Stateless" here means the server verifies a token's
+validity purely by recomputing its signature — no database lookup, no
+server-side session store consulted on every request. The tradeoff: once
+issued, a token is valid until it expires, and the server has no
+built-in way to invalidate it early.
+
+**Why it exists in this project.** `requireAuth`
+(`src/middleware/auth.ts`) is deliberately a pure function of the
+token — no DB query on the happy path — which is what makes every
+authenticated request cheap. That statelessness is also exactly what
+creates the revocation gap this section is about.
+
+**How it works mechanically — the revocation problem.** If a user's
+account is compromised, their password is changed, or they explicitly
+log out, any JWT already issued to them remains fully valid — signature
+still matches, `exp` hasn't passed — until it naturally expires. There's
+no "delete this session" operation possible against a stateless token by
+design, because there's no server-side session record to delete.
+
+**The three standard mitigations (industry-standard patterns — none
+implemented in this project yet, deliberately, as this phase's scope is
+just signup/login/verify):**
+
+1. **Short expiry.** Bound the damage window by keeping token lifetime
+   short. This project uses `JWT_EXPIRES_IN=7d`, a usability-leaning
+   choice appropriate for a low-stakes personal-project auth flow — a
+   production system handling anything sensitive would likely use
+   something much shorter (minutes to hours), paired with mitigation 3.
+2. **A denylist (blocklist).** Store revoked-but-not-yet-expired token
+   identifiers (or user-ids-as-of-a-timestamp) somewhere fast to check —
+   typically Redis, which this project already has wired up for a future
+   phase — and check it on each request. This reintroduces a lookup, but
+   a cheap one (a Redis existence check), not a full session store.
+3. **Refresh-token rotation.** Issue a short-lived access token (minutes)
+   alongside a longer-lived, revocable refresh token, stored server-side.
+   The access token stays fast and stateless for normal requests; the
+   refresh token is the one place revocation actually happens, and it's
+   checked far less often (only when the access token expires).
+
+**Where it lives in the codebase.** `src/middleware/auth.ts` (stateless
+verification); `JWT_EXPIRES_IN` in `src/config/env.ts`. None of the
+three mitigations are implemented — this is a documented gap, not an
+oversight.
+
+**Common pitfalls.**
+
+- Believing a JWT can be "logged out" server-side with no additional
+  infrastructure — without one of the three mitigations above, deleting
+  a token client-side (e.g. clearing localStorage) prevents that _one_
+  client from using it again, but the token itself is still cryptograph-
+  ically valid if captured or replayed elsewhere.
+- Choosing an very long expiry "for convenience" without weighing that
+  it directly sets the ceiling on how long a compromised token stays
+  dangerous.
+
+**Production considerations.** A real production system handling
+sensitive data would very likely need at minimum a short access-token
+expiry plus refresh-token rotation (mitigations 1 + 3) — this project's
+7-day, no-revocation setup is an explicit, documented simplification for
+its current phase, flagged here specifically so it isn't mistaken for a
+production-ready default later.
+
+**Interview answer.** Stateless JWT auth means the server verifies
+tokens purely by signature, with no session lookup — which is fast, but
+means there's no way to revoke a token early once issued; it stays valid
+until it expires no matter what happens to the account afterward. The
+three standard mitigations are keeping expiry short to bound the damage
+window, maintaining a denylist of revoked tokens checked against a fast
+store like Redis, or splitting into a short-lived stateless access token
+plus a longer-lived, revocable refresh token. This project currently
+uses a 7-day token with none of those mitigations, which is a
+deliberate, documented simplification for its current scope rather than
+a production-ready choice.
+
+---
+
+### Bearer token transport: the Authorization header convention
+
+**What it is.** The `Authorization: Bearer <token>` HTTP header is the
+standard convention (RFC 6750) for a client to present a token proving
+its identity on each request — "bearer" meaning whoever holds
+(bears) the token is treated as authorized, no further proof needed.
+
+**Why it exists in this project.** `requireAuth` reads exactly this
+header and requires the exact `"Bearer "` prefix — matching how every
+HTTP client, browser devtools, and API testing tool (curl, Postman,
+etc.) already expects to send a token, rather than inventing a
+project-specific header or convention.
+
+**How it works mechanically.** `req.header('authorization')` reads the
+raw header value; `requireAuth` checks it starts with the literal
+7-character string `"Bearer "` (case-sensitive, matching the RFC's
+convention), then treats everything after that prefix as the token
+itself, which gets handed to `verifyToken`.
+
+**Where it lives in the codebase.** `src/middleware/auth.ts`.
+
+**Common pitfalls.**
+
+- Forgetting the header check is case-sensitive on the scheme name — a
+  client sending `bearer <token>` (lowercase) fails the `startsWith`
+  check and gets a 401, correctly per the header convention but
+  potentially surprising if a client library doesn't follow it exactly.
+- Logging the raw `Authorization` header for debugging — this is exactly
+  what `requireAuth`'s failure-path logging deliberately avoids: the
+  token itself is never included in any `req.log` call, only the fact
+  that a request failed and why (missing/invalid/expired).
+
+**Production considerations.** None beyond what's already correct —
+this is a settled HTTP convention, not a project-specific design
+decision.
+
+**Interview answer.** `Authorization: Bearer <token>` is the standard
+RFC 6750 convention for presenting a token — "bearer" means the holder
+of the token is trusted without further proof, which is exactly the
+model a stateless JWT fits. The middleware requires the exact `"Bearer "`
+prefix and treats everything after it as the token to verify, matching
+what every standard HTTP client already expects to send.
+
+---
+
+### localStorage vs. httpOnly cookies: the XSS/CSRF tradeoff
+
+**What it is.** Two places a client could store the JWT this API issues:
+JavaScript-accessible browser storage (`localStorage`), or an `httpOnly`
+cookie the browser attaches automatically and JavaScript can't read.
+
+**Why it exists in this project (as a deliberate decision, not an
+oversight).** This API returns the token directly in the JSON response
+body (`{ user, token }`) rather than setting a cookie itself — that
+choice implicitly hands storage responsibility to whatever frontend
+consumes this API (the separate Next.js frontend mentioned in
+CLAUDE.md), and is worth documenting explicitly rather than leaving
+implicit.
+
+**How it works mechanically — the tradeoff.**
+
+- **`localStorage`** — Any JavaScript running on the page can read it,
+  including injected JavaScript from a successful XSS attack. If an
+  attacker gets any script to execute on the frontend (e.g. via an
+  unescaped user-generated field rendered somewhere), they can read the
+  token directly and exfiltrate it. It's immune to CSRF, though — a
+  malicious third-party site can't read another origin's `localStorage`,
+  and requests still require the frontend's own JS to explicitly attach
+  the token to each request.
+- **`httpOnly` cookie** — JavaScript literally cannot read it (the
+  `httpOnly` flag exists for exactly this), so a successful XSS attack
+  can't exfiltrate the token directly (though it can often still make
+  authenticated requests _through_ the victim's browser while the page
+  is open, which is a narrower blast radius than stealing the token
+  outright). But cookies are attached to requests automatically by the
+  browser, for _any_ site, which is what opens up CSRF — a malicious
+  site can trigger a request to this API and the browser will attach the
+  cookie, unless CSRF protection (e.g. a `SameSite` cookie attribute
+  plus a CSRF token) is separately implemented.
+
+**Where it lives in the codebase.** `src/routes/auth.ts` — the token is
+returned in the JSON body on both signup and login, not set as a cookie
+by this API.
+
+**Common pitfalls.**
+
+- Treating this as a solved, "cookies are just better" or "localStorage
+  is just better" question — it's a genuine tradeoff between two attack
+  classes (XSS vs. CSRF), not a strictly-dominant choice either way.
+- Choosing `httpOnly` cookies without also implementing CSRF protection
+  — that combination is worse than either mitigation alone, since it
+  closes the XSS-exfiltration vector while leaving CSRF fully open.
+
+**Production considerations.** If XSS risk is the primary concern for
+this project's frontend (e.g. it renders significant user-generated
+content), `httpOnly` cookies plus explicit CSRF protection would be the
+stronger production posture. `localStorage` is a reasonable, simpler
+choice for a project where the frontend is fully controlled, first-party
+code with limited XSS surface — which is the assumption this phase makes
+implicitly by returning the token in the response body. This is a
+decision worth revisiting explicitly if the frontend's threat model
+changes.
+
+**Interview answer.** Storing a JWT in `localStorage` makes it readable
+by any JavaScript on the page, so it's vulnerable to token theft via
+XSS but immune to CSRF, since cookies aren't involved. An `httpOnly`
+cookie can't be read by JavaScript at all, closing that XSS-exfiltration
+path, but the browser attaches cookies to requests automatically for any
+origin, which opens up CSRF unless mitigated separately with something
+like `SameSite` plus a CSRF token. This API returns the token in the
+JSON response body rather than setting a cookie itself, implicitly
+choosing the `localStorage`-style model and leaving cookie-based storage
+(and its CSRF-mitigation requirements) as the frontend's decision.
+
+---
+
+### User enumeration and why login errors are deliberately vague
+
+**What it is.** User enumeration is an attack where a service's
+different responses to "this email doesn't exist" versus "this email
+exists but the password was wrong" let an attacker build a list of valid
+registered emails, without ever guessing a correct password.
+
+**Why it exists in this project.** `authService.login` throws the exact
+same `AppError` — same status code (401), same literal message
+(`'Invalid email or password'`) — whether the email doesn't exist at all
+or exists with a non-matching password. `tests/services/authService.test.ts`
+and `tests/routes/auth.test.ts` both assert this with `.toBe()` string
+equality specifically to prevent a future edit from accidentally letting
+the two messages drift apart.
+
+**How it works mechanically.** Both failure branches inside `login`
+converge on one `throw unauthorized(INVALID_CREDENTIALS_MESSAGE)` call
+site's message (the constant is reused, not two separately-written
+string literals that could diverge over time). A response body alone
+gives an attacker no signal about which of the two cases occurred. (The
+_timing_ of the response is a separate channel this same code path also
+has to close — see the next section.)
+
+**Where it lives in the codebase.** `src/services/authService.ts` —
+`login`, `INVALID_CREDENTIALS_MESSAGE`.
+
+**Common pitfalls.**
+
+- Writing genuinely helpful-sounding but distinct error messages
+  ("No account found with that email" vs. "Incorrect password") — this
+  is the single most common enumeration bug, usually introduced with
+  good UX intentions.
+- Fixing the _message_ but leaving a _status code_ or _response shape_
+  difference between the two branches (e.g. 404 for no-such-user, 401
+  for wrong-password) — enumeration only requires _some_ distinguishable
+  signal, not specifically the message text.
+- Fixing the response but not the _timing_ — see next section.
+
+**Production considerations.** Signup's 409 ("email already exists") is
+a deliberate, different kind of disclosure that this project accepts:
+knowing whether an email is _registered_ (via signup's conflict
+response) is considered acceptable here, while knowing whether a
+_login attempt_ against that email succeeded partially (right email,
+wrong password) is not. That's a judgment call, not a universal rule —
+some systems also obscure signup conflicts (e.g. "if this email isn't
+already registered, we've sent a confirmation" regardless of whether it
+is) for stricter enumeration resistance, at the cost of a worse signup
+UX (a user can't get instant feedback that they should log in instead).
+
+**Interview answer.** User enumeration is when an attacker learns which
+emails have accounts just by observing how a login endpoint responds
+differently to "no such user" versus "wrong password." This project's
+login always returns the identical status code and message string for
+both cases — verified by tests that check exact string equality between
+the two failure paths — so a response body alone never leaks which
+scenario occurred.
+
+---
+
+### Timing attacks on login, and the dummy-hash mitigation
+
+**What it is.** Even with identical error _messages_, two code paths can
+still take measurably different amounts of _time_ to respond — and an
+attacker measuring response latency precisely enough can use that timing
+difference as its own side-channel, independent of what the response
+body says.
+
+**Why it exists in this project.** Without a mitigation, `login`'s
+"no such user" branch would return almost immediately (one fast indexed
+`SELECT`, no row found), while its "wrong password" branch would take
+the ~200-300ms a real bcrypt comparison costs (at `BCRYPT_COST=12`).
+That gap is large and consistent enough to distinguish the two cases by
+timing alone, even though the response bodies are byte-for-byte
+identical — reopening the exact user-enumeration problem the previous
+section closed via the response body.
+
+**How it works mechanically.** `passwordService.ts` precomputes
+`DUMMY_PASSWORD_HASH` once, at module load, by hashing an arbitrary
+fixed string at the live `config.BCRYPT_COST`. `login`'s "no such user
+or OAuth-only account" branch calls `verifyAgainstDummyHash(password)`
+— discarding the boolean result entirely — purely to force one bcrypt
+comparison of matching cost before throwing the 401. That makes both
+branches of `login` perform exactly one bcrypt `compare()` call at the
+same cost factor, so their timing profiles converge. Using
+`config.BCRYPT_COST` for the dummy hash (rather than a hardcoded cost)
+matters specifically because a bcrypt hash string embeds its own cost
+factor, and `compare()`'s runtime is dominated by that embedded cost —
+a dummy hash baked at a stale or different cost would still leak a
+smaller, but measurable, timing gap against real per-user hashes.
+
+**Where it lives in the codebase.** `DUMMY_PASSWORD_HASH` and
+`verifyAgainstDummyHash` in `src/services/passwordService.ts`; consumed
+in `authService.login`'s no-such-user/no-password-hash branch.
+
+**Common pitfalls.**
+
+- Skipping the dummy comparison as an "optimization" for the common
+  case (nonexistent email) — that's precisely the branch that needs the
+  extra work, not the one that can skip it.
+- Baking the dummy hash at a fixed cost independent of
+  `config.BCRYPT_COST` — reintroduces a smaller version of the same
+  timing gap if the two costs ever diverge (e.g. after a future
+  production cost-factor bump that forgets to update a hardcoded dummy).
+- Believing this mitigation is exact — see below.
+
+**Production considerations — does this fully close the attack?** Not
+perfectly. It equalizes the _dominant_ cost (one bcrypt comparison at
+matching cost) between the two branches, which is by far the largest
+contributor to the timing gap and closes the attack for realistic,
+network-latency-bounded measurement. It does **not** account for smaller
+differences — e.g. the "no such user" path still runs one `SELECT`
+before hitting the dummy-hash branch, and the "wrong password" path runs
+a structurally similar `SELECT` before its real comparison, so those
+are actually symmetric here — but a sufficiently patient, low-noise
+attacker with many samples (statistical timing analysis, typically
+requiring local network access or extreme measurement precision) could
+in principle still detect a much smaller residual signal. This
+mitigation defeats the attack under realistic conditions (a remote
+attacker over normal internet latency); it is a mitigation, not a
+mathematical proof of zero timing leakage.
+
+**Interview answer.** Even with identical error messages, "no such
+user" and "wrong password" naturally take different amounts of time —
+one skips the expensive bcrypt comparison entirely, the other pays for
+it — and that timing gap is its own side-channel for user enumeration.
+The mitigation is to always perform one bcrypt comparison of matching
+cost regardless of which branch is taken: this project precomputes a
+dummy hash at the live cost factor and compares against it (discarding
+the result) on the no-such-user path, so both branches' timing profiles
+converge. It closes the attack under realistic network conditions but
+isn't a mathematical guarantee against a very patient, high-precision
+statistical attacker.
+
+---
+
+### Why password_hash must never be selected or returned casually
+
+**What it is.** A deliberate, structural discipline in
+`src/services/authService.ts`: `password_hash` is never included in a
+`SELECT *`, never present in the `AuthUser` shape returned to routes,
+and only ever selected in the one function (`login`) that actually needs
+it, into a query-local type that isn't reused anywhere else.
+
+**Why it exists in this project.** A single accidental
+`res.json(user)` where `user` came from a `SELECT *`-style query would
+leak every user's bcrypt hash straight into an API response — and unlike
+most bugs, this one wouldn't necessarily be obvious in casual testing
+(the response would still "look right" — a JSON object with an extra
+field most people wouldn't immediately flag as a live secret).
+
+**How it works mechanically.** Three independent layers each make this
+mistake harder, not just one:
+
+1. **Explicit column lists everywhere.** Every query in
+   `authService.ts` names its columns (`SELECT id, email, email_verified,
+created_at, updated_at [, password_hash]`) — never `SELECT *`. A
+   future column added to `users` doesn't silently start flowing through
+   existing queries.
+2. **The `AuthUser` TypeScript interface has no `password_hash` field at
+   all.** `login`'s one query that _does_ select `password_hash` reads
+   it into a separate, query-local row type
+   (`UserRow & { password_hash: string | null }`), and `toAuthUser()`
+   only ever reads the five named safe fields off of it. There's no
+   field for a future typo (`user.password_hash`) to accidentally
+   reference — the type itself doesn't have one.
+3. **Route-level tests assert the negative.**
+   `tests/routes/auth.test.ts`'s `assertNoPasswordHash` helper
+   stringifies every response body from every auth endpoint and asserts
+   it contains neither the string `password_hash` (any casing) nor a
+   bcrypt hash prefix (`$2a$`/`$2b$`) — a test that would fail loudly if
+   a future change to any of the three routes ever leaked it, even
+   through an unexpected path this phase didn't anticipate.
+
+**Where it lives in the codebase.** `src/services/authService.ts`
+(`AuthUser`, `UserRow`, `toAuthUser`, every query); `tests/routes/auth.test.ts`
+(`assertNoPasswordHash`).
+
+**Common pitfalls.**
+
+- `SELECT *` "for convenience" during development, meaning to narrow it
+  later — the column list should be correct from the first query, not a
+  cleanup task.
+- A shared row type reused across both a hash-needing function (`login`)
+  and hash-excluding functions (`signup`, `getUserById`) — this
+  invites exactly the kind of accidental field access the separate
+  query-local type in `login` avoids.
+- Testing only the "happy path" shape of a response (e.g. asserting
+  `user.email` is correct) without also asserting what's _absent_ — a
+  positive-only test suite can pass indefinitely while quietly leaking
+  an extra field.
+
+**Production considerations.** None beyond continuing this same
+discipline as the schema and query surface grow — the pattern (explicit
+columns, a type that structurally excludes sensitive fields, and a test
+that asserts the negative) generalizes to any other sensitive column a
+future phase might add.
+
+**Interview answer.** `password_hash` is kept out of API responses
+through three independent layers rather than one: every query in
+`authService.ts` uses an explicit column list instead of `SELECT *`, the
+`AuthUser` type returned to routes structurally has no field for it at
+all so a typo can't reference one, and the route tests assert the
+negative — stringifying every auth response and checking it never
+contains the string `password_hash` or a bcrypt hash prefix. Layering
+independent protections matters because any single one of them could be
+accidentally bypassed by a future change; having all three means a leak
+requires breaking every layer at once, and the test layer specifically
+catches leaks through paths this phase didn't anticipate.
+
+---
+
+### Why expired and invalid tokens produce an identical client message
+
+**What it is.** `requireAuth` and `tokenService.verifyToken` distinguish
+`expired` from `invalid` internally (`VerifyTokenResult`'s discriminated
+union), but `requireAuth` always sends the client the same 401 message —
+`'Invalid or expired token'` — regardless of which one occurred. The
+distinction is logged server-side (`req.log.warn({ reason }, ...)`) and
+never exposed in the response.
+
+**Why it exists in this project.** If a client could reliably tell
+"expired" apart from "invalid" from the response alone, that's a real
+information leak: "expired" specifically confirms the token was
+**structurally valid and correctly signed with the real `JWT_SECRET` at
+some point** — i.e., it was a genuine token issued by this server for a
+real user, just stale. "Invalid" covers everything else — wrong secret,
+tampered payload, pure garbage input, a token forged with a guessed
+secret that happened to be wrong. An attacker holding a captured or
+intercepted token (from, say, a browser history, an old log line, a lost
+device) who could distinguish the two would learn whether that token was
+ever a genuine, live credential worth further effort (replay attempts,
+social-engineering a session refresh, etc.) versus outright worthless —
+a reconnaissance signal this project denies entirely by collapsing both
+outcomes to one message.
+
+**How it works mechanically.** `verifyToken` catches
+`jwt.TokenExpiredError` specifically and returns `{ ok: false, reason:
+'expired' }`; every other failure (`JsonWebTokenError`, a malformed
+token, a signature that doesn't match) returns `{ ok: false, reason:
+'invalid' }`. `requireAuth` branches on `result.ok` but, on failure,
+calls the exact same `unauthorized('Invalid or expired token')` for
+both reasons — the `reason` value is only ever passed to
+`req.log.warn`, never to the response.
+
+**Where it lives in the codebase.** `src/services/tokenService.ts`
+(`VerifyTokenResult`, the `reason` distinction); `src/middleware/auth.ts`
+(`requireAuth`, where the distinction stops before reaching the client).
+
+**Common pitfalls.**
+
+- Returning a more "helpful" client-facing message for expiry
+  specifically (e.g. "Your session has expired, please log in again")
+  — well-intentioned UX, but it's exactly the enumeration-style leak
+  this section describes; a generic client-side "please log in again"
+  prompt can be shown for _either_ reason without the server's response
+  needing to say which one it was.
+- Logging the token itself alongside the `reason` "for debugging" —
+  `requireAuth`'s logging deliberately includes `reason` and the request
+  ID, never the token, matching the same discipline as the
+  Authorization-header section above.
+
+**Production considerations.** None beyond maintaining this same
+discipline if additional token-rejection reasons are ever added (e.g. a
+future denylist check) — any new reason should default to the same
+generic client message unless there's a specific, considered argument
+for exposing it.
+
+**Interview answer.** Internally, `verifyToken` distinguishes an expired
+token from an invalid one, but the client always gets the identical
+"Invalid or expired token" message either way — the distinction is only
+ever logged server-side. The reason is that "expired" specifically
+confirms a token was genuinely issued and correctly signed at some
+point, while "invalid" covers everything else including outright
+forgeries; letting a client tell those apart would hand an attacker
+holding a stolen or old token a way to know whether it was ever a real,
+live credential worth pursuing further, which is exactly the kind of
+signal a 401 response shouldn't provide.

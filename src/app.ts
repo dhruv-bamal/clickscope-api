@@ -4,6 +4,7 @@ import { createErrorHandler } from './middleware/errorHandler.js';
 import { notFoundHandler } from './middleware/notFoundHandler.js';
 import { requestContext } from './middleware/requestContext.js';
 import { corsMiddleware, securityHeaders } from './middleware/security.js';
+import { authRouter } from './routes/auth.js';
 import { healthRouter } from './routes/health.js';
 import { rootRouter } from './routes/root.js';
 
@@ -50,6 +51,11 @@ app.use(express.json());
 //    security, before the catch-all.
 app.use(rootRouter);
 app.use(healthRouter);
+// Prefix-mounted, not flat like the two routers above — those each have a
+// single route, so a full path costs nothing; authRouter has three routes
+// today and future feature routers (link CRUD, etc.) will have more, so
+// declaring paths relative to a mount prefix here is what scales.
+app.use('/api/auth', authRouter);
 
 // 6. Catch-all 404, after every real route (so it only fires for
 //    genuinely unmatched paths) and before the error handler (so an

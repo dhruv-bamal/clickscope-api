@@ -55,6 +55,32 @@ export const envSchema = z.object({
           message: 'CORS_ORIGIN must not be a wildcard ("*") — list explicit allowed origin(s)',
         }),
     ),
+
+  // Signs and verifies JWTs (HS256 — symmetric). Required with no default:
+  // a leaked or guessable secret lets an attacker mint a valid token for
+  // any user id, so falling back to a built-in default would be a
+  // vulnerability, not a convenience. 32 chars is a floor, not a target —
+  // generate with e.g. `openssl rand -base64 48`.
+  JWT_SECRET: z
+    .string({
+      required_error: 'JWT_SECRET is required, e.g. a random string of 32+ characters',
+    })
+    .min(32, 'JWT_SECRET must be at least 32 characters'),
+
+  // How long an issued token stays valid before the client must sign in
+  // again. Passed straight through to jsonwebtoken's expiresIn option,
+  // which parses its own duration strings — no extra validation needed
+  // here beyond "is a string."
+  JWT_EXPIRES_IN: z.string().default('7d'),
+
+  // bcrypt's work factor: each increment doubles hashing time. 12 is a
+  // reasonable 2024+ default (~200-300ms/hash on typical hardware).
+  // Lowered in .env.test so the test suite (which hashes/compares many
+  // times) stays fast without touching the production-realistic default.
+  BCRYPT_COST: z.coerce
+    .number({ invalid_type_error: 'BCRYPT_COST must be a number' })
+    .int('BCRYPT_COST must be an integer')
+    .default(12),
 });
 
 export type Config = z.infer<typeof envSchema>;
