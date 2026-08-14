@@ -1,6 +1,6 @@
 import { DatabaseError } from 'pg';
 import { query } from '../db/pool.js';
-import { conflict, unauthorized } from '../lib/errors.js';
+import { badRequest, conflict, unauthorized } from '../lib/errors.js';
 import { hashPassword, verifyAgainstDummyHash, verifyPassword } from './passwordService.js';
 import { signToken } from './tokenService.js';
 
@@ -125,6 +125,111 @@ export async function login(
   const passwordMatches = await verifyPassword(password, row.password_hash);
   if (!passwordMatches) {
     throw unauthorized(INVALID_CREDENTIALS_MESSAGE);
+  }
+
+  const user = toAuthUser(row);
+  return { user, token: signToken(user.id) };
+}
+
+/**
+ * Finds an existing OAuth user or creates one. Looked up by
+ * (oauth_provider, oauth_id) FIRST — never by email — because the
+ * provider's subject id is the stable identity key; a user's email can
+ * change on Google's side (or be reused by someone else after being
+ * freed), but their `sub` claim never does. Keying on email instead would
+ * mean a user who changes their Google email either gets treated as a
+ * brand-new signup (losing their account) or, worse, silently merges into
+ * whatever account currently holds that email.
+ *
+ * If no OAuth match exists, the email is checked against existing
+ * accounts: a match there is necessarily a *password* account (an OAuth
+ * match would already have returned above), so this deliberately does
+ * NOT auto-link — it throws 409 rather than attaching a Google identity
+ * to somebody else's password account. See Notes.md Phase 5 for the
+ * account-takeover reasoning this policy exists to prevent.
+ *
+ * New rows get password_hash omitted (stays NULL) and oauth_provider/
+ * oauth_id set — satisfying users_password_xor_oauth_check by
+ * construction, the same way signup satisfies it by omitting the oauth
+ * columns.
+ *
+ * Requires emailVerified === true, checked before anything else runs
+ * (including the returning-user lookup). Without this, an attacker could
+ * sign in with a Google account whose email Google itself hasn't
+ * verified — e.g. an address added but never confirmed — and either
+ * squat on someone else's email (permanently blocking the real owner
+ * from ever signing up with it, since the unique index on lower(email)
+ * would then see it as taken) or, on a later login, have their own
+ * genuine account collide with that squatted row. Rejecting unverified
+ * emails outright closes this before any row is read or written.
+ */
+export async function findOrCreateOAuthUser(
+  provider: string,
+  oauthId: string,
+  email: string,
+  emailVerified: boolean,
+): Promise<{ user: AuthUser; token: string }> {
+  if (!emailVerified) {
+    throw badRequest('Google account email is not verified');
+  }
+
+  const existingOAuth = await query<UserRow>(
+    `SELECT id, email, email_verified, created_at, updated_at
+     FROM users
+     WHERE oauth_provider = $1 AND oauth_id = $2`,
+    [provider, oauthId],
+  );
+  const oauthRow = existingOAuth.rows[0];
+  if (oauthRow) {
+    const user = toAuthUser(oauthRow);
+    return { user, token: signToken(user.id) };
+  }
+
+  const existingPassword = await query<{ id: string }>(
+    'SELECT id FROM users WHERE lower(email) = lower($1)',
+    [email],
+  );
+  if (existingPassword.rows[0]) {
+    throw conflict('An account with this email already exists — sign in with your password');
+  }
+
+  let row: UserRow;
+  try {
+    const result = await query<UserRow>(
+      `INSERT INTO users (email, oauth_provider, oauth_id, email_verified)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, email, email_verified, created_at, updated_at`,
+      [email, provider, oauthId, emailVerified],
+    );
+    const inserted = result.rows[0];
+    if (!inserted) {
+      throw new Error('Insert returned no row');
+    }
+    row = inserted;
+  } catch (err) {
+    if (err instanceof DatabaseError && err.code === UNIQUE_VIOLATION) {
+      // Two concurrent logins for the SAME Google account racing here are
+      // the same legitimate action happening twice (e.g. a double-clicked
+      // "Sign in with Google" button) — not a real conflict, unlike
+      // signup's race, where two concurrent signups for one email really
+      // are competing for it. Re-fetch and return the winner's row rather
+      // than converting to a 409.
+      const retry = await query<UserRow>(
+        `SELECT id, email, email_verified, created_at, updated_at
+         FROM users
+         WHERE oauth_provider = $1 AND oauth_id = $2`,
+        [provider, oauthId],
+      );
+      const retryRow = retry.rows[0];
+      if (retryRow) {
+        const user = toAuthUser(retryRow);
+        return { user, token: signToken(user.id) };
+      }
+      // The race was on the email-lowercase index instead (a password
+      // signup won concurrently) — a genuine conflict.
+      throw conflict('An account with this email already exists — sign in with your password');
+    }
+    throw err;
   }
 
   const user = toAuthUser(row);

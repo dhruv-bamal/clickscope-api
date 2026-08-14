@@ -81,6 +81,46 @@ export const envSchema = z.object({
     .number({ invalid_type_error: 'BCRYPT_COST must be a number' })
     .int('BCRYPT_COST must be an integer')
     .default(12),
+
+  // Google OAuth 2.0 client ID, from Google Cloud Console's "OAuth 2.0
+  // Client IDs" for this project. Public by design (it's embedded in the
+  // authorization URL the browser is redirected to) but still required
+  // with no default — an unset value would silently break every
+  // /api/auth/google request rather than fail fast at startup.
+  GOOGLE_CLIENT_ID: z
+    .string({
+      required_error:
+        'GOOGLE_CLIENT_ID is required, e.g. 123456789-abc.apps.googleusercontent.com',
+    })
+    .min(1, 'GOOGLE_CLIENT_ID must not be empty'),
+
+  // Paired secret for GOOGLE_CLIENT_ID. Authenticates this server (never
+  // the browser) to Google's token endpoint during code exchange. Required
+  // with no default for the same reason JWT_SECRET is: a leaked or
+  // missing value is a security/availability problem, not something to
+  // default around.
+  GOOGLE_CLIENT_SECRET: z
+    .string({
+      required_error: 'GOOGLE_CLIENT_SECRET is required — from Google Cloud Console',
+    })
+    .min(1, 'GOOGLE_CLIENT_SECRET must not be empty'),
+
+  // Must exactly match a redirect URI registered for this client in
+  // Google Cloud Console, or Google rejects the code exchange.
+  GOOGLE_REDIRECT_URI: z
+    .string({
+      required_error:
+        'GOOGLE_REDIRECT_URI is required, e.g. http://localhost:3000/api/auth/google/callback',
+    })
+    .url('GOOGLE_REDIRECT_URI must be a valid URL'),
+
+  // Where the OAuth callback redirects the browser after login (success,
+  // denial, or rejection), carrying the issued JWT as a query parameter.
+  // Required with no default: silently falling back to some built-in URL
+  // on a misconfigured deploy is worse than refusing to boot.
+  FRONTEND_URL: z
+    .string({ required_error: 'FRONTEND_URL is required, e.g. http://localhost:5173' })
+    .url('FRONTEND_URL must be a valid URL'),
 });
 
 export type Config = z.infer<typeof envSchema>;

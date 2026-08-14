@@ -5,6 +5,16 @@ import { parseEnv, EnvValidationError } from '../../src/config/env.js';
 // reused across every fixture below that needs "otherwise fully valid."
 const VALID_JWT_SECRET = 'test-jwt-secret-at-least-32-characters!';
 
+// The four OAuth vars are required with no default (see src/config/env.ts),
+// so every "otherwise fully valid" fixture below needs them too, even
+// though this file's actual assertions are about other fields entirely.
+const VALID_OAUTH_ENV = {
+  GOOGLE_CLIENT_ID: 'test-google-client-id',
+  GOOGLE_CLIENT_SECRET: 'test-google-client-secret',
+  GOOGLE_REDIRECT_URI: 'http://localhost:3000/api/auth/google/callback',
+  FRONTEND_URL: 'http://localhost:5173',
+};
+
 describe('parseEnv', () => {
   it('accepts a fully valid environment', () => {
     const config = parseEnv({
@@ -17,6 +27,7 @@ describe('parseEnv', () => {
       JWT_SECRET: VALID_JWT_SECRET,
       JWT_EXPIRES_IN: '1d',
       BCRYPT_COST: '10',
+      ...VALID_OAUTH_ENV,
     });
 
     expect(config).toEqual({
@@ -29,6 +40,7 @@ describe('parseEnv', () => {
       JWT_SECRET: VALID_JWT_SECRET,
       JWT_EXPIRES_IN: '1d',
       BCRYPT_COST: 10, // coerced from string to number
+      ...VALID_OAUTH_ENV,
     });
   });
 
@@ -38,6 +50,7 @@ describe('parseEnv', () => {
       REDIS_URL: 'redis://localhost:6379',
       CORS_ORIGIN: 'http://localhost:5173',
       JWT_SECRET: VALID_JWT_SECRET,
+      ...VALID_OAUTH_ENV,
     });
 
     expect(config.NODE_ENV).toBe('development');
@@ -119,6 +132,7 @@ describe('parseEnv', () => {
       DATABASE_URL: 'postgres://user:pass@localhost:5432/clickscope',
       REDIS_URL: 'redis://localhost:6379',
       CORS_ORIGIN: 'http://localhost:5173',
+      ...VALID_OAUTH_ENV,
     };
 
     it('rejects a configuration missing JWT_SECRET (no default — see src/config/env.ts)', () => {
@@ -141,6 +155,7 @@ describe('parseEnv', () => {
       DATABASE_URL: 'postgres://user:pass@localhost:5432/clickscope',
       REDIS_URL: 'redis://localhost:6379',
       JWT_SECRET: VALID_JWT_SECRET,
+      ...VALID_OAUTH_ENV,
     };
 
     it('rejects a configuration missing CORS_ORIGIN', () => {

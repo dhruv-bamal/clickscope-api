@@ -8,12 +8,15 @@ import { beforeAll, describe, expect, it } from 'vitest';
 let signup: typeof import('../../src/services/authService.js').signup;
 let login: typeof import('../../src/services/authService.js').login;
 let getUserById: typeof import('../../src/services/authService.js').getUserById;
+let findOrCreateOAuthUser: typeof import('../../src/services/authService.js').findOrCreateOAuthUser;
 let query: typeof import('../../src/db/pool.js').query;
 let AppError: typeof import('../../src/lib/errors.js').AppError;
 
 beforeAll(async () => {
   process.loadEnvFile('.env.test');
-  ({ signup, login, getUserById } = await import('../../src/services/authService.js'));
+  ({ signup, login, getUserById, findOrCreateOAuthUser } = await import(
+    '../../src/services/authService.js'
+  ));
   ({ query } = await import('../../src/db/pool.js'));
   ({ AppError } = await import('../../src/lib/errors.js'));
 });
@@ -26,6 +29,10 @@ beforeAll(async () => {
 // harmless within a single test run.
 function uniqueEmail(label: string): string {
   return `${label}-${Date.now()}-${Math.random().toString(36).slice(2)}@example.com`;
+}
+
+function uniqueOAuthId(label: string): string {
+  return `${label}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
 describe('authService.signup', () => {
@@ -124,5 +131,102 @@ describe('authService.getUserById', () => {
   it('returns null for a nonexistent id', async () => {
     const found = await getUserById('00000000-0000-0000-0000-000000000000');
     expect(found).toBeNull();
+  });
+});
+
+describe('authService.findOrCreateOAuthUser', () => {
+  it('creates a new OAuth user with password_hash NULL (XOR constraint satisfied)', async () => {
+    const email = uniqueEmail('oauth-create');
+    const oauthId = uniqueOAuthId('oauth-create');
+
+    const { user, token } = await findOrCreateOAuthUser('google', oauthId, email, true);
+
+    expect(user.email).toBe(email);
+    expect(typeof token).toBe('string');
+    expect(user).not.toHaveProperty('password_hash');
+    expect(user).not.toHaveProperty('passwordHash');
+
+    const stored = await query<{ password_hash: string | null; oauth_provider: string | null }>(
+      'SELECT password_hash, oauth_provider FROM users WHERE id = $1',
+      [user.id],
+    );
+    expect(stored.rows[0]?.password_hash).toBeNull();
+    expect(stored.rows[0]?.oauth_provider).toBe('google');
+  });
+
+  it('a returning user is found by (provider, oauth_id), not duplicated', async () => {
+    const email = uniqueEmail('oauth-return');
+    const oauthId = uniqueOAuthId('oauth-return');
+
+    const first = await findOrCreateOAuthUser('google', oauthId, email, true);
+    const second = await findOrCreateOAuthUser('google', oauthId, email, true);
+
+    expect(second.user.id).toBe(first.user.id);
+
+    const count = await query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM users WHERE oauth_provider = $1 AND oauth_id = $2',
+      ['google', oauthId],
+    );
+    expect(count.rows[0]?.count).toBe(1);
+  });
+
+  it('is looked up by (provider, oauth_id) even if the email changed since the first login', async () => {
+    const originalEmail = uniqueEmail('oauth-emailchange-orig');
+    const oauthId = uniqueOAuthId('oauth-emailchange');
+
+    const first = await findOrCreateOAuthUser('google', oauthId, originalEmail, true);
+
+    const newEmail = uniqueEmail('oauth-emailchange-new');
+    const second = await findOrCreateOAuthUser('google', oauthId, newEmail, true);
+
+    // Same user, found by the stable subject id — not a second account,
+    // and the row is not updated to the new email by this function (the
+    // point of this test is the identity match, not an email-sync policy).
+    expect(second.user.id).toBe(first.user.id);
+  });
+
+  it('rejects with 409 when the email matches an existing password account, and creates no row', async () => {
+    const email = uniqueEmail('oauth-conflict');
+    await signup(email, 'a-password');
+
+    const before = await query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM users WHERE lower(email) = lower($1)',
+      [email],
+    );
+    expect(before.rows[0]?.count).toBe(1);
+
+    await expect(
+      findOrCreateOAuthUser('google', uniqueOAuthId('oauth-conflict'), email, true),
+    ).rejects.toMatchObject({ statusCode: 409 });
+
+    const after = await query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM users WHERE lower(email) = lower($1)',
+      [email],
+    );
+    expect(after.rows[0]?.count).toBe(1);
+  });
+
+  it('thrown conflict errors are AppError instances', async () => {
+    const email = uniqueEmail('oauth-conflict-apperror');
+    await signup(email, 'a-password');
+
+    await expect(
+      findOrCreateOAuthUser('google', uniqueOAuthId('oauth-conflict-apperror'), email, true),
+    ).rejects.toBeInstanceOf(AppError);
+  });
+
+  it('rejects an unverified email with 400 before touching the database, creating no row', async () => {
+    const email = uniqueEmail('oauth-unverified');
+    const oauthId = uniqueOAuthId('oauth-unverified');
+
+    await expect(
+      findOrCreateOAuthUser('google', oauthId, email, false),
+    ).rejects.toMatchObject({ statusCode: 400 });
+
+    const count = await query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM users WHERE lower(email) = lower($1)',
+      [email],
+    );
+    expect(count.rows[0]?.count).toBe(0);
   });
 });

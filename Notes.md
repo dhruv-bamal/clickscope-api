@@ -3545,3 +3545,1063 @@ forgeries; letting a client tell those apart would hand an attacker
 holding a stolen or old token a way to know whether it was ever a real,
 live credential worth pursuing further, which is exactly the kind of
 signal a 401 response shouldn't provide.
+
+## Phase 5: Google OAuth
+
+### New dependencies: google-auth-library and nock
+
+**What it is.** One runtime dependency, `google-auth-library` (Google's
+own maintained Node client for OAuth 2.0/OpenID Connect), and one dev
+dependency, `nock` (intercepts outbound HTTP calls in tests). `nock`
+transitively adds nothing of note; `google-auth-library` pulls in
+`gaxios` (its HTTP client) and `gtoken` — expected, not a surprise to
+investigate later if they show up in `package-lock.json`.
+
+**Why it exists in this project.** Three specific calls are delegated to
+`google-auth-library`, and nothing else: `generateAuthUrl` (builds the
+consent-screen URL), `getToken` (exchanges a code for tokens — a plain
+server-to-server HTTP POST), and `verifyIdToken` (fetches Google's JWKS,
+verifies an RS256 signature, checks issuer/audience/expiry). The first
+two are thin enough that hand-rolling them with `fetch` would teach
+nothing extra — they're documented HTTP shapes, spelled out below.
+`verifyIdToken` is different: it's real cryptographic weight (key
+rotation, JWKS caching, signature verification), and getting it subtly
+wrong means accepting a forged identity — the same category of risk this
+project already declined to hand-roll for password hashing (`bcryptjs`)
+and JWT signing (`jsonwebtoken`) in Phase 4. `nock` exists because this
+phase introduces the project's first genuine external-network
+dependency in tests — there's no local "real Google" the way there's a
+real local Postgres/Redis for every other test.
+
+**How it works mechanically / the alternatives.** Two alternatives were
+considered and rejected. Raw `fetch` for all three calls: rejected for
+`verifyIdToken` specifically, since a correct implementation needs a
+JWKS client anyway (another dependency) plus careful handling of key
+rotation and multiple valid issuer strings — work that doesn't teach the
+OAuth flow, it teaches "how to verify RS256 JWTs against a rotating key
+set," a tangential skill. `openid-client`: rejected as more machinery
+than a single hardcoded provider needs — it's built for dynamic
+multi-provider OIDC discovery (`.well-known` fetching, configurable
+token-endpoint auth methods), and its authorization-URL builder is less
+explicit about what parameters go in than `google-auth-library`'s
+`generateAuthUrl({ scope, state })`, where every parameter is one this
+codebase passes by hand.
+
+**Where it lives in the codebase.** `src/services/oauthService.ts` owns
+the `OAuth2Client` instance and all three calls. `nock` is used only in
+`tests/services/oauthService.test.ts`, intercepting
+`https://oauth2.googleapis.com/token`.
+
+**Common pitfalls.**
+
+- Treating `google-auth-library` as a black box that "does OAuth" —
+  every parameter passed into `generateAuthUrl`/`getToken` is chosen
+  explicitly in `oauthService.ts`; only the JWKS-fetch/signature-verify
+  internals of `verifyIdToken` are actually opaque.
+- Mocking `verifyIdToken`'s return value in tests without also asserting
+  what it was *called with* — a stub returns the same canned payload no
+  matter its arguments, so a regression that dropped the `audience`
+  check would pass silently. See the testing subsection below.
+- Forgetting that `getToken`/`verifyIdToken` are genuine network calls —
+  calling them from an unmocked test hits real Google infrastructure,
+  which is slow, flaky in CI, and forbidden by this phase's constraints.
+
+**Production considerations.** `google-auth-library` is Google's own
+first-party client, actively maintained alongside their APIs — when
+Google rotates signing keys or changes an issuer string, this dependency
+gets updated to match, which a hand-rolled JWKS client would need
+someone here to notice and fix manually.
+
+**Interview answer.** I used Google's own client library for exactly
+three calls — building the auth URL, exchanging a code for tokens, and
+verifying the returned identity token — and hand-rolled everything else
+(state generation, the route logic, find-or-create). The one piece I
+didn't hand-roll, `verifyIdToken`, is the one with real cryptographic
+weight: JWKS fetching, key rotation, RS256 signature verification. That's
+the same category of decision as using `bcryptjs` for password hashing —
+not laziness, but recognizing that a subtly wrong hand-rolled
+implementation there means identity spoofing, not just a bug.
+
+---
+
+### The OAuth 2.0 authorization code flow, end to end
+
+**What it is.** A four-party handshake — browser, our API (the "client"
+in OAuth terms), Google's authorization server, and Google's resource/
+identity data — that lets a user prove their Google identity to our
+server without ever handing our server their Google password.
+
+**Why it exists in this project.** It's the mechanism behind `GET
+/api/auth/google` and `GET /api/auth/google/callback`, and it's the
+reason those two routes exist as a pair rather than one endpoint: the
+flow inherently has two legs, a redirect out to Google and a redirect
+back.
+
+**How it works mechanically.** Step by step, naming what each party
+knows at each point:
+
+1. Browser hits `GET /api/auth/google`. Our API generates a random
+   `state`, stores it in Redis, and redirects the browser to Google's
+   consent screen with `client_id`, `redirect_uri`, `scope`, `state`, and
+   `response_type=code` in the URL. *Our API knows:* the state it just
+   issued. *The browser knows:* nothing new yet, just a URL to follow.
+   *Google knows:* nothing yet — this is the first request it sees.
+2. Browser lands on Google's real consent screen, authenticates with
+   Google directly (our server is never involved in or shown the
+   password), and approves or denies.
+3. Google redirects the browser back to `GOOGLE_REDIRECT_URI` — i.e.
+   `GET /api/auth/google/callback` — with `code` and the same `state` it
+   was given (or `error` if denied). *The browser knows:* an
+   authorization code, but not what it's worth. *Google knows:* it just
+   authenticated this user and issued a short-lived code tied to that.
+4. Our API validates `state` (see the next subsection), then calls
+   Google's token endpoint **server-to-server** — the browser is not
+   involved in this exchange — sending `code` plus `GOOGLE_CLIENT_SECRET`
+   to prove it's really our registered server. Google responds with
+   tokens, including an `id_token` (a signed JWT asserting identity).
+   *Our API now knows:* a verified Google identity (sub, email,
+   email_verified). *Google knows:* it just handed identity/access
+   tokens to whoever holds the client secret.
+5. Our API verifies the `id_token`, finds or creates a local user, signs
+   **our own** JWT, and redirects the browser to `FRONTEND_URL?token=...`.
+   *The browser now knows:* our own session token — never Google's.
+
+**Where it lives in the codebase.** `src/routes/auth.ts` (`GET /google`,
+`GET /google/callback`); `src/services/oauthService.ts` (steps 4-5's
+Google calls); `src/lib/oauthState.ts` (the state used in steps 1 and 4);
+`src/services/authService.ts`'s `findOrCreateOAuthUser` (the user
+lookup in step 5).
+
+**Common pitfalls.**
+
+- Thinking of this as one request/response — it's fundamentally two
+  separate HTTP requests to our server (`/google` and `/google/callback`)
+  connected only by `state` and by Google's own redirect in between.
+- Forgetting the browser is a full participant that can be tampered
+  with — anyone can hand-craft a request to `/google/callback` with an
+  arbitrary `code`/`state`/`error`, which is exactly why state validation
+  and server-side code exchange matter (both covered below).
+
+**Production considerations.** Every step here assumes `GOOGLE_REDIRECT_URI`
+exactly matches what's registered in Google Cloud Console — a mismatch
+fails step 4's exchange with an opaque Google-side error, a common
+first-deploy gotcha when moving from `localhost` to a real domain.
+
+**Interview answer.** The authorization code flow is a two-leg redirect:
+the browser goes to Google carrying a `state` we generated, comes back
+carrying a `code` Google generated, and then our server — not the
+browser — exchanges that code for tokens directly with Google, using our
+client secret to prove who's asking. The browser only ever sees an
+opaque code and, at the very end, our own session token; it never sees
+Google's access token or our client secret.
+
+---
+
+### Why the browser gets a code, not a token; why the implicit flow is deprecated
+
+**What it is.** The authorization code flow hands the *browser* only a
+short-lived `code`, which is worthless without the client secret. The
+now-deprecated OAuth "implicit flow" instead put an access token
+directly in the redirect URL's fragment, for JavaScript to read.
+
+**Why it exists in this project.** `GET /api/auth/google/callback`
+receives a `code` and does the token exchange itself, server-side —
+this project never puts a Google access token or `id_token` in a URL the
+browser can read.
+
+**How it works mechanically.** A URL fragment (`#access_token=...`) is
+visible to browser extensions, gets logged by some proxies/analytics
+tools, lands in browser history, and — critically — is visible to any
+JavaScript running on the page, including malicious or compromised
+third-party scripts. A `code`, by contrast, is useless on its own: it
+must be paired with `GOOGLE_CLIENT_SECRET` (something only the server
+holds) to become a real token, and Google additionally makes each code
+single-use and short-lived. So even if a `code` leaks in a browser
+history or a referrer header, an attacker still can't redeem it without
+the secret, and it likely already expired.
+
+**Where it lives in the codebase.** The callback handler in
+`src/routes/auth.ts` only ever receives `code`/`state`/`error` as query
+parameters — never a token — and the actual exchange happens inside
+`exchangeCodeForIdentity` in `src/services/oauthService.ts`, which never
+returns Google's raw tokens to its caller (only a verified `GoogleIdentity`).
+
+**Common pitfalls.**
+
+- Building an SPA-style flow that puts any Google token in a URL,
+  `localStorage`, or anywhere JavaScript can read it — this project's
+  browser-facing surface is only ever our own JWT, at the very end of
+  the flow, via `?token=` on the `FRONTEND_URL` redirect.
+- Assuming "server-side" is automatically enough — the code exchange
+  being server-to-server is necessary but not sufficient; it's only safe
+  *because* it also requires the client secret, which the implicit flow
+  had no equivalent for.
+
+**Production considerations.** The implicit flow is formally deprecated
+in OAuth 2.0's current best-practice guidance (RFC 9700) specifically
+because there's no scenario left where it's safer than authorization
+code + PKCE (for public clients) or authorization code alone (for
+confidential clients like this server, which can hold a secret).
+
+**Interview answer.** The browser only ever gets a `code`, not a token,
+because a code is useless without the client secret — something only our
+server holds. That means even if a code leaks (browser history, a
+referrer header, a compromised extension), it can't be redeemed by
+anyone but us, and it's single-use and short-lived besides. The older
+implicit flow put the actual access token in the URL for JavaScript to
+read directly, which is why it's deprecated — anything in a URL fragment
+or that JavaScript can touch is far more exposed than a code that
+requires a secret to mean anything.
+
+---
+
+### The state parameter: the login-CSRF attack it prevents
+
+**What it is.** A cryptographically random, single-use, short-lived
+token (`generateState()` in `src/lib/oauthState.ts`) that our server
+generates before redirecting to Google, and requires back — unchanged —
+on the callback.
+
+**Why it exists in this project.** Without it, `GET
+/api/auth/google/callback?code=...` would accept *any* code sent to it,
+from anywhere. That's exploitable: an attacker can complete their own
+Google login, capture the `code` Google issues *them*, and trick a
+victim's browser into visiting `/api/auth/google/callback?code=<attacker's
+code>` (an `<img>` tag, a crafted link, anything that makes the victim's
+browser issue that GET). The victim's browser has no way to know this
+code doesn't belong to them — it's just a URL. Our server would exchange
+the attacker's code, find-or-create (or log into) the *attacker's*
+Google-linked account, and hand the *victim's* browser a valid session
+token for the attacker's account. The victim is now unknowingly logged
+in as the attacker — and anything the victim subsequently does (saving
+links, connecting data) happens inside the attacker's account, which the
+attacker controls and can review at their leisure. This is "login CSRF":
+forging not an action, but an entire authenticated session.
+
+**How it works mechanically.** `generateState()` produces 32 random
+bytes (`node:crypto`'s `randomBytes`, base64url-encoded) — far more
+entropy than needed to make guessing infeasible. `storeState()` records
+it in Redis with a 10-minute TTL before the redirect to Google happens.
+The callback's very first action, before even inspecting `error` or
+`code`, is `consumeState()` — validate-and-delete in one atomic Redis
+`GETDEL`. If the state doesn't exist (never issued, expired, or already
+used), the callback throws `400` immediately and touches nothing else.
+Because the attacker in the scenario above was never issued *our*
+`state` value for the victim's browser to carry, their forged callback
+URL either omits `state` or guesses at one — and guessing 32 random
+bytes is infeasible.
+
+**Where it lives in the codebase.** `src/lib/oauthState.ts`
+(`generateState`/`storeState`/`consumeState`); `src/routes/auth.ts`'s
+`/google` handler (generates+stores) and `/google/callback` handler
+(consumes, first thing).
+
+**Common pitfalls.**
+
+- Validating `state` *after* checking `error` or exchanging `code` —
+  this project deliberately checks state first, specifically so a forged
+  callback carrying `error=access_denied` and no valid state can't be
+  treated as a legitimate denial (see the "handling denied consent"
+  subsection).
+- Using a predictable or short state value — the login-CSRF attack only
+  fails because the attacker can't produce or guess a state we issued;
+  a weak state reopens the whole attack.
+- A get-then-delete implementation of "single-use" instead of an atomic
+  check-and-delete — two requests racing on the same state could both
+  read it as valid before either deletes it, reopening a narrow replay
+  window. `GETDEL` closes this by making the check and the delete one
+  Redis operation.
+
+**Production considerations.** The 10-minute TTL is a deliberate balance:
+long enough that a real user completing Google's consent screen (which
+can involve 2FA prompts, account picking, etc.) doesn't get a state
+expiring mid-flow, short enough that a leaked or intercepted callback
+URL stops being useful quickly.
+
+**Interview answer.** The state parameter defeats login CSRF — an
+attacker tricking a victim's browser into completing *the attacker's*
+OAuth login, which would otherwise log the victim into the attacker's
+account without either of them realizing it. It works because we
+generate a random, single-use, short-lived value before redirecting to
+Google, and refuse to process any callback that doesn't echo that exact
+value back — an attacker forging a callback URL has no way to produce or
+guess it. I made state validation atomic (Redis `GETDEL`) and the very
+first check in the callback, specifically so it can't be raced or
+bypassed by an attacker probing other paths through the handler first.
+
+---
+
+### Redis as an ephemeral state store, and why not a signed cookie or the database
+
+**What it is.** The choice of *where* to keep `state` between issuing it
+(`GET /google`) and checking it (`GET /google/callback`) — this project
+picked Redis over the two other obvious options.
+
+**Why it exists in this project.** `state` is exactly the kind of data
+Redis is for: short-lived (10-minute TTL, expressed natively as `EX`),
+write-once/read-once (`GETDEL`), and never needed again after the
+handshake completes — none of that fits `users`, a table for permanent
+records.
+
+**How it works mechanically / the alternatives.** A signed cookie set on
+`GET /google` and read back on the callback was the main alternative
+considered. It would work for the simple case, but ties the state's
+validity to *the same browser* completing the round trip, and Google's
+own redirect back to our callback is itself a cross-site navigation from
+the browser's perspective — some browsers' cookie `SameSite` defaults
+can drop cookies across exactly this kind of redirect chain, which would
+break the flow intermittently and unpredictably depending on browser/
+version. Storing `state` in the `users` table (or a dedicated Postgres
+table) was rejected because it's not user data at all — it exists for
+minutes, belongs to no user yet (the whole point is we don't know who
+this is until the callback resolves), and would need its own TTL/cleanup
+logic that Redis provides natively via `EX`.
+
+**Where it lives in the codebase.** `src/lib/oauthState.ts`, built
+directly on the existing shared `redis` client from `src/lib/redis.ts` —
+no new connection, no new library.
+
+**Common pitfalls.**
+
+- Reaching for a signed cookie by default because it "feels simpler" —
+  it reintroduces a cross-site cookie-delivery dependency that Redis
+  entirely sidesteps.
+- Forgetting to set a TTL at all if hand-rolling a similar pattern
+  elsewhere — an unbounded key is a slow leak and, worse, means a stolen
+  old `state` value stays exploitable indefinitely.
+
+**Production considerations.** This is the first ephemeral (not
+permanent-record) use of Redis in the codebase — `checkRedisHealth` was
+the only prior usage. If a future phase needs a similar short-lived
+token (email verification links, password-reset tokens), the same
+generate/store/consume shape in `oauthState.ts` is the pattern to reuse,
+not a new one-off table.
+
+**Interview answer.** I stored `state` in Redis rather than a signed
+cookie because the callback redirect is itself a cross-site navigation
+from the browser's perspective, and cookie `SameSite` defaults can drop
+cookies across exactly that kind of hop — a flow that would then break
+intermittently depending on the user's browser. Redis also gives TTL and
+atomic delete-on-read natively, which matches what `state` actually is:
+short-lived, write-once, read-once data that doesn't belong in a
+permanent table like `users`.
+
+---
+
+### OpenID Connect vs. plain OAuth 2.0: what the id_token adds
+
+**What it is.** OAuth 2.0 on its own is an *authorization* protocol — it
+answers "does this app have permission to act on the user's behalf /
+access this resource," via an access token. OpenID Connect (OIDC) is a
+thin identity layer on top of OAuth 2.0 that adds *authentication* —
+"who is this user" — via a new artifact, the `id_token`, a signed JWT.
+
+**Why it exists in this project.** This phase needs authentication (who
+is logging in), not authorization to act on a Google resource on the
+user's behalf (we never call the Gmail or Drive APIs). Requesting the
+`openid` scope is exactly what turns a plain OAuth request into an OIDC
+request and makes Google return an `id_token` at all — without it,
+Google's token response would only contain an access token, and this
+codebase would have no signed, verifiable claim about *who* just
+authenticated, only a token that's the wrong tool for identity (access
+tokens are opaque-by-design and meant for calling APIs, not for a
+relying party to parse and trust as identity).
+
+**How it works mechanically.** `GOOGLE_SCOPES = ['openid', 'email',
+'profile']` in `src/services/oauthService.ts` — `openid` triggers the
+`id_token` in Google's response at all; `email`/`profile` are what put
+`email`/`email_verified`/`name`/etc. claims inside that token. The
+`id_token` itself is a JWT — three base64url segments, signed by Google
+with RS256 — so unlike an opaque access token, it can be decoded and
+its signature independently verified by any party that knows Google's
+public keys, without calling back to Google for every check.
+
+**Where it lives in the codebase.** `GOOGLE_SCOPES` and
+`exchangeCodeForIdentity`'s use of `tokens.id_token` in
+`src/services/oauthService.ts`; the resulting `GoogleIdentity` shape
+(`googleId`, `email`, `emailVerified`) is what the rest of the app —
+`findOrCreateOAuthUser`, the callback route — actually consumes, never
+Google's access token.
+
+**Common pitfalls.**
+
+- Treating the OAuth *access token* as proof of identity — it isn't; it
+  proves the bearer has some permission Google granted, not who they
+  are. Only the `id_token` is meant to be parsed as an identity claim.
+- Forgetting the `openid` scope and being confused when Google's
+  response has no `id_token` at all — this is the single most common
+  first-integration mistake with Google OAuth.
+
+**Production considerations.** None of this app's scopes grant access to
+call any Google API on the user's behalf (no Gmail, Calendar, Drive) —
+if a future phase ever needs that, it would add a narrower scope for
+that specific API and would then need to actually store and refresh the
+resulting access/refresh tokens, which this phase deliberately never
+does.
+
+**Interview answer.** Plain OAuth 2.0 answers "is this app allowed to do
+X," via an access token that's opaque and meant for calling APIs. OpenID
+Connect adds an identity layer on top — the `id_token`, a signed JWT
+asserting who the user is — which is what this app actually needs, since
+it never calls any Google API on the user's behalf. Requesting the
+`openid` scope is what turns the request into an OIDC request and makes
+Google include that `id_token` at all.
+
+---
+
+### ID token verification: audience, issuer, expiry — what each check prevents
+
+**What it is.** Three checks `verifyIdToken` performs on the returned
+`id_token`, beyond the RS256 signature check itself: that `aud` (the
+token's intended recipient) matches our `GOOGLE_CLIENT_ID`, that `iss`
+(who signed it) is genuinely Google, and that `exp` (expiry) hasn't
+passed.
+
+**Why it exists in this project.** A signature check alone proves "some
+real Google-issued token," not "a token meant for *this application*" or
+"a token that's still current" — the other two checks close gaps a
+signature check leaves open.
+
+**How it works mechanically.**
+- **Audience (`aud`)** must equal `GOOGLE_CLIENT_ID`
+  (`exchangeCodeForIdentity` passes `audience: config.GOOGLE_CLIENT_ID`
+  explicitly). This prevents **token substitution**: Google issues
+  `id_token`s to many different registered applications; without an
+  audience check, a token legitimately issued to some *other*
+  application (which a malicious or compromised app could relay to us)
+  would pass a bare signature check just as well as one issued to us —
+  the signature only proves "Google signed this for *someone*," not
+  "for us."
+- **Issuer (`iss`)** must be one of Google's known issuer strings. This
+  prevents accepting a **correctly-signed token from the wrong
+  authority** — relevant in any system that might ever verify tokens
+  from more than one identity provider; checking the issuer is what
+  pins verification to "specifically Google," not "any signer whose key
+  we happen to trust."
+- **Expiry (`exp`)** must be in the future. This prevents **replaying an
+  old, once-valid token** — without it, a token captured from months ago
+  (a log line, a network capture) would still verify successfully today.
+
+**Where it lives in the codebase.** The `audience` argument to
+`client.verifyIdToken(...)` in `exchangeCodeForIdentity`
+(`src/services/oauthService.ts`) — the issuer and expiry checks happen
+inside `google-auth-library` itself and aren't separately coded here,
+which is the whole reason this phase trusts the library for this one
+call rather than hand-rolling it (see the dependencies subsection above).
+
+**Common pitfalls.**
+
+- Skipping the audience check (or passing the wrong value) — this is the
+  single most dangerous mistake here, since a missing audience check is
+  invisible in normal testing (a real token from *your own* app still
+  verifies fine) and only becomes exploitable if something ever presents
+  a token minted for a different client.
+- Assuming signature verification alone is "identity verification" — it
+  only proves authenticity of the signer, not that the token was meant
+  for this application or is still current.
+
+**Production considerations.** If this application is ever registered
+with more than one `GOOGLE_CLIENT_ID` (e.g. separate web and mobile
+clients sharing one backend), the audience check needs to accept an
+array of valid client IDs, not a single hardcoded one — `verifyIdToken`'s
+`audience` option already accepts an array for this reason.
+
+**Interview answer.** Signature verification alone only proves "Google
+genuinely signed this token for *someone*" — it doesn't prove the token
+was meant for *this* application, or that it's still current. The
+audience check closes the first gap: it prevents a token minted for a
+different Google-registered app from being accepted here. The issuer
+check pins verification to Google specifically, and the expiry check
+prevents replaying an old captured token. All three are necessary
+together; signature verification is necessary but not sufficient on its
+own.
+
+---
+
+### Why we issue our own JWT instead of using Google's tokens as our session
+
+**What it is.** After verifying the Google identity, the callback calls
+`signToken(user.id)` — the exact same `tokenService.ts` function
+`signup`/`login` already use — rather than forwarding Google's
+`access_token` or `id_token` to the browser as a session credential.
+
+**Why it exists in this project.** Google's tokens describe a
+relationship with *Google* (this access token can call Google's APIs;
+this id_token asserts a Google identity, valid until Google's own
+expiry). They say nothing about a *Click Scope* user id, and nothing
+downstream in this app (`requireAuth`, `GET /me`, any future link-CRUD
+route) should need to know or care whether a request came from a
+password login or a Google login — it should see one consistent kind of
+credential either way.
+
+**How it works mechanically.** `findOrCreateOAuthUser` returns `{ user,
+token }` with the exact same shape `signup`/`login` return; `token` here
+is `signToken(user.id)` — an HS256 JWT with only `sub`/`iat`/`exp`,
+signed with `JWT_SECRET`, identical in structure to a password-login
+token. `requireAuth` (`src/middleware/auth.ts`) verifies it exactly the
+same way regardless of how the user originally authenticated — it has no
+code path that even knows OAuth exists.
+
+**Where it lives in the codebase.** `findOrCreateOAuthUser` in
+`src/services/authService.ts`, reusing `signToken` from
+`src/services/tokenService.ts`; the callback route in
+`src/routes/auth.ts` redirects with `?token=` — this project's session
+token, never `tokens.id_token` or `tokens.access_token` from Google.
+
+**Common pitfalls.**
+
+- Forwarding Google's `id_token` to the frontend as if it were a session
+  token — it wasn't issued for that purpose, its expiry/lifetime is
+  controlled by Google (not tunable via this app's `JWT_EXPIRES_IN`), and
+  every route that checks it would need Google-specific verification
+  logic instead of the one `verifyToken` this app already has.
+- Storing Google's access/refresh tokens "just in case a future feature
+  needs them" — this phase never calls a Google API on the user's
+  behalf, so there's nothing to refresh or store; adding that machinery
+  speculatively is exactly the kind of scope creep this phase avoids.
+
+**Production considerations.** Because both auth paths converge on the
+same `signToken`/`verifyToken`, any future session-related change
+(rotation, shorter expiry, a revocation list) is written once and
+automatically covers both password and OAuth users — there's no second
+"OAuth session" system to keep in sync.
+
+**Interview answer.** Google's tokens describe a relationship with
+Google — an access token scoped to Google's APIs, an identity token
+whose validity Google controls. Neither maps to "is this a valid Click
+Scope session." So after verifying the Google identity, I sign our own
+JWT the exact same way `signup`/`login` already do, and nothing
+downstream — `requireAuth`, `GET /me` — has any idea whether a given
+token came from a password or a Google login. One session mechanism,
+regardless of how the user originally authenticated.
+
+---
+
+### The redirect handoff: why the JWT goes in the URL fragment, not a query string
+
+**What it is.** The callback's final redirect carries our JWT as
+`${FRONTEND_URL}#token=...` — a URL fragment — not
+`${FRONTEND_URL}?token=...`, a query string. This was a late correction:
+the first version of this phase used a query string, on the reasoning
+that it matched the `token` field name `signup`/`login` already return
+in their JSON bodies. That reasoning missed a real difference between
+the two cases — a JSON body isn't logged by intermediaries the way a
+request URL is — and a security review of the diff caught it.
+
+**Why it exists in this project.** A query string is part of the actual
+HTTP request line the browser sends. That means it can end up in: this
+server's own access logs, any reverse proxy or CDN sitting in front of
+it, and the `Referer` header of any *subsequent* outbound request the
+landing page makes (an analytics beacon, a font/CDN fetch, an ad
+script) — none of which should ever see a live bearer token for this
+app's session. A URL fragment (everything after `#`) is fundamentally
+different: it's a client-side-only construct. Browsers never include it
+in the request line sent to a server, so none of those log/Referer
+leakage paths apply to it at all.
+
+**How it works mechanically.** `res.redirect(\`${config.FRONTEND_URL}#token=${encodeURIComponent(token)}\`)`
+— from the server's perspective this looks almost identical to the
+query-string version, but the browser treats everything after `#`
+specially: it's available to client-side JavaScript via
+`window.location.hash`, but is stripped before the browser ever
+constructs the actual GET request line for that navigation (and for any
+same-origin requests the page subsequently makes, since fragments aren't
+part of what gets echoed into `Referer` either). The frontend (out of
+scope for this phase, but worth stating for whoever builds it) should
+read `window.location.hash` once, then immediately call
+`history.replaceState(null, '', window.location.pathname)` to scrub the
+token out of the visible URL and browser history entry — the fragment
+approach avoids *transmission* leakage, not persistence in history.
+
+**Where it lives in the codebase.** The final `res.redirect(...)` in the
+`/google/callback` handler, `src/routes/auth.ts`. The `?error=oauth_denied`
+redirect for denied consent, by contrast, deliberately stays a query
+string — it carries no secret, and query strings are the conventional,
+bookmarkable, log-safe place for a non-sensitive status indicator.
+
+**Common pitfalls.**
+
+- Reusing a JSON-response field name/shape as justification for a URL
+  parameter without re-checking the actual transmission path — a value
+  that's safe inside a JSON body (never logged verbatim by default, not
+  part of any URL) is not automatically safe as a URL query parameter,
+  which travels through a completely different set of intermediaries.
+- Treating the fragment switch as a complete fix — it closes the
+  server-side/log/Referer leakage path specifically, but the token still
+  lands in browser history once the frontend has read it, until the
+  frontend explicitly scrubs the URL with `history.replaceState`.
+
+**Production considerations.** Two more robust alternatives exist for
+when the frontend is actually built (out of this phase's scope, which is
+API-only, no frontend): setting the JWT as an `HttpOnly`, `Secure`,
+`SameSite=Lax` cookie directly in the redirect response (eliminates
+client-side JS exposure entirely, but requires the API and frontend to
+share a registrable domain or accept cross-site cookie complexity), or
+redirecting with a short-lived, single-use *exchange code* that the
+frontend immediately POSTs to a dedicated token-exchange endpoint
+(keeps the real JWT out of any URL at all, at the cost of one more
+endpoint and one more round trip). Both are meaningfully bigger design
+decisions — cookie domain/CORS implications, or new API surface — than
+this phase's fix, which only needed to close the log/Referer leakage
+path for now.
+
+**Interview answer.** I initially put the JWT in a query string,
+matching the field name `signup`/`login` already return in JSON — but a
+query string is part of the actual request line, so it ends up in
+server access logs, proxy/CDN logs, and potentially a `Referer` header
+if the landing page makes any outbound request afterward. A URL
+fragment never gets sent to a server at all — browsers strip it before
+constructing the request line — so moving the token there closes that
+specific leakage path. It's not a complete fix on its own: the token
+still sits in browser history until the frontend scrubs it with
+`history.replaceState`, and a cookie-based session or a one-time
+exchange-code endpoint would remove the URL-based transmission
+entirely — reasonable next steps once there's an actual frontend to
+build against.
+
+---
+
+### Account linking: the takeover vulnerability, the email_verified claim, and the rejection policy
+
+**What it is.** The policy decision in `findOrCreateOAuthUser`: if a
+Google login's email matches an *existing password account*, reject with
+409 rather than silently attaching the Google identity to that account
+("auto-linking").
+
+**Why it exists in this project.** Auto-linking by email is a real
+account-takeover vector. Consider: a victim signs up for Click Scope
+with `victim@example.com` and a password, but never verifies that email
+(if this app ever adds email verification) — or more simply, consider
+any system where email ownership isn't cryptographically tied to the
+account. An attacker who does not own `victim@example.com` can still
+often create a *Google* account using that same address as a recovery/
+contact email, or — more directly relevant here — if this app ever
+trusted an *unverified* email claim from any provider, an attacker could
+register anywhere with `victim@example.com` and get auto-linked into the
+victim's existing account, gaining full access to it. The
+`email_verified` claim in Google's `id_token` is what would make
+auto-linking *conditionally* safe: Google only sets it `true` after
+Google itself confirmed the user controls that mailbox (via Google's own
+signup/verification flow), so an auto-link gated strictly on
+`email_verified === true` is a meaningfully different, much safer claim
+than "an email string matches." This phase's policy is simpler still:
+reject the match entirely, regardless of `email_verified`, rather than
+build and reason carefully about a conditional auto-link now.
+
+**How it works mechanically.** In `findOrCreateOAuthUser`, the
+`(oauth_provider, oauth_id)` lookup runs *first*; if it misses, a second
+lookup by `lower(email)` checks for a password account. A hit there is
+necessarily a password account (an OAuth match would have already
+returned above), so it throws `conflict('An account with this email
+already exists — sign in with your password')` — a 409 — and creates no
+row. The `users_password_xor_oauth_check` constraint (Phase 2) is never
+touched or relaxed; this policy is enforced in application logic, one
+layer above a schema that was never asked to allow the ambiguous case in
+the first place.
+
+**Where it lives in the codebase.** `src/services/authService.ts`,
+`findOrCreateOAuthUser`'s second `SELECT`; the callback route in
+`src/routes/auth.ts` propagates the thrown `AppError` as a raw 409 JSON
+response (not a redirect — see the "handling denied consent" subsection
+below for the contrast).
+
+**Common pitfalls.**
+
+- Auto-linking on *any* email match without checking `email_verified` —
+  this is the exact takeover vector described above; even a
+  conditional auto-link needs that claim as its gate, and this phase
+  chose not to build the conditional version at all yet.
+- Silently merging accounts instead of rejecting — from the legitimate
+  password-account owner's perspective, a silent merge is
+  indistinguishable from an attacker successfully taking over their
+  account, even when it happens to be the "real" Google-owning user
+  triggering it. Rejecting with a clear message keeps that ambiguity out
+  of the system entirely.
+
+**Production considerations — the UX cost.** A real user who signed up
+with a password and later tries "Sign in with Google" using the same
+email hits a 409, not a seamless merge — they have to remember they
+already have a password account and use it instead. That's a genuine
+rough edge for a small fraction of returning users, traded deliberately
+for never having a linking bug be exploitable. The route currently
+surfaces this 409 as raw JSON rather than a `FRONTEND_URL?error=...`
+redirect (see the next subsection's contrast with denied-consent
+handling) — a real deployment would likely want to catch this
+specific `AppError` in the callback and redirect with an error indicator
+instead, giving the frontend something to render a helpful message from,
+rather than dropping the user on an API's bare JSON response mid-navigation.
+
+**Interview answer.** Auto-linking a new OAuth login to an existing
+account just because the email string matches is an account-takeover
+vector — an attacker who can get any provider to hand them a token
+claiming a victim's email would be silently merged into the victim's
+account. The `email_verified` claim is what makes a conditional version
+of auto-linking safe, because it means the *provider* already confirmed
+mailbox ownership, not just that a string matches. For this phase I
+chose to reject the match outright rather than build that conditional
+path — a password-account owner trying Google sign-in gets a clear 409
+telling them to use their password, at the cost of a rougher experience
+for that specific case, in exchange for not having to reason carefully
+about a linking feature's edge cases before it's actually needed.
+
+---
+
+### Rejecting unverified emails: closing the account-squatting gap
+
+**What it is.** `findOrCreateOAuthUser` throws `badRequest('Google
+account email is not verified')` if `emailVerified` is `false`, before
+running either of its two `SELECT`s or its `INSERT` — a check added
+after the initial implementation, once a security review pointed out the
+account-linking rejection policy above only covers *linking to an
+existing account*, not *creating a new one*.
+
+**Why it exists in this project.** The account-linking subsection above
+explains why `email_verified` is the gate that makes *linking* safe —
+but the same claim matters just as much for plain account *creation*,
+for a different reason: `users_email_lower_unique_idx` (Phase 2) makes
+email globally unique across every user, OAuth or password. If this
+function created an OAuth account for an email Google itself hasn't
+verified, an attacker could squat on someone else's real email address —
+say, one Google lets you add as an unverified contact/recovery address
+without proving ownership — and that row would then permanently occupy
+this app's unique-email slot for that address. The real owner, trying to
+sign up later with a password, would hit the same 409 "email already
+exists" this app uses for a legitimate duplicate — except there's no
+legitimate account to point them to, only an attacker's OAuth account
+they never created and can't access. Rejecting unverified emails outright
+means every row this app ever creates for an email address corresponds
+to someone Google itself has confirmed controls that mailbox.
+
+**How it works mechanically.** The check is the very first line inside
+`findOrCreateOAuthUser`, before even the `(oauth_provider, oauth_id)`
+lookup — so an unverified identity is rejected without a single query
+running, not just before the `INSERT`. This is stricter than "only check
+before creating a new row": it also means a *returning* OAuth user would
+be rejected on a login where Google's response reports `email_verified:
+false`, which in practice shouldn't happen for an account that was
+already created (creation itself now requires `true`), but keeps the
+invariant absolute rather than conditional on which branch of the
+function is about to run.
+
+**Where it lives in the codebase.** The `if (!emailVerified) throw
+badRequest(...)` guard at the top of `findOrCreateOAuthUser`,
+`src/services/authService.ts`. Covered by
+`tests/services/authService.test.ts` (asserts 400 and zero rows created)
+and `tests/routes/googleAuth.test.ts` (same assertion through the full
+HTTP callback).
+
+**Common pitfalls.**
+
+- Checking `email_verified` only at the account-*linking* branch (the
+  email-collision `SELECT`) and assuming that's sufficient — it isn't;
+  the squatting risk exists purely from *creating* a row, with no
+  existing account required for an attacker to cause harm.
+- Defaulting `emailVerified` to `true` anywhere upstream "to keep things
+  simple" — `oauthService.ts`'s `exchangeCodeForIdentity` already
+  defaults a missing claim to `false` (the safe direction), and this
+  check is what makes that default actually matter.
+
+**Production considerations.** This makes Google's `email_verified`
+claim a hard requirement for using this app via Google sign-in at all —
+a small number of real Google accounts may have an unverified primary
+email in unusual configurations (e.g. certain legacy or enterprise
+setups), and those users would see a 400 with no path forward via OAuth.
+That's an accepted tradeoff for this phase: correctness of the unique-
+email invariant over accommodating every possible Google account
+configuration.
+
+**Interview answer.** The account-linking rejection policy stops an
+attacker from attaching an unverified Google identity to someone else's
+*existing* password account, but that alone doesn't stop them from
+*creating* a brand-new account with someone else's unverified email —
+which would squat on this app's globally-unique email slot and lock the
+real owner out of ever signing up with their own address. So
+`findOrCreateOAuthUser` now rejects any Google identity with
+`email_verified: false` outright, before running a single query — every
+row this app creates corresponds to an email Google has actually
+confirmed the user controls.
+
+---
+
+### Find-or-create ordering: provider identity first, email second
+
+**What it is.** `findOrCreateOAuthUser` looks up
+`(oauth_provider, oauth_id)` before it ever looks at `email` — the order
+matters, not just the fact that both checks exist.
+
+**Why it exists in this project.** Google's `sub` claim (the OAuth
+subject id) is documented as stable and never reused — "a Google account
+can have multiple emails at different points in time, but the sub value
+is never changed" (per Google's own token payload docs). Email is not
+stable: a user can change the email address on their Google account at
+any time. If this app keyed OAuth users on email instead, a user who
+changes their Google email would look, on their next login, like a
+brand-new person — either creating a duplicate account (losing access to
+their links/history under the old identity) or, worse, silently landing
+on whatever *other* account currently holds that new email string,
+depending on how such a system were built. Keying on `(provider,
+oauth_id)` first sidesteps both failure modes: the *same* Google account
+is always recognized as the same Click Scope user, regardless of what
+email it currently reports.
+
+**How it works mechanically.** `SELECT ... WHERE oauth_provider = $1
+AND oauth_id = $2` runs first and, on a hit, returns immediately — the
+`email` argument for that call isn't even consulted once a
+provider-identity match is found (deliberately: this function doesn't
+sync the stored email to a changed Google email either, which is a
+separate policy decision left out of scope for this phase). Only on a
+miss does the function fall through to the email-collision check
+described in the account-linking subsection above.
+
+**Where it lives in the codebase.**
+`src/services/authService.ts`, `findOrCreateOAuthUser`'s first `SELECT`
+(the identity lookup) versus its second `SELECT` (the collision check).
+The `users_oauth_identity_unique` constraint
+(`UNIQUE(oauth_provider, oauth_id)`, Phase 2) is what makes this lookup
+meaningful as an identity key at the database level, not just in
+application logic.
+
+**Common pitfalls.**
+
+- Looking up by email first "because it's simpler" — this silently
+  reintroduces the email-instability bug this ordering exists to avoid,
+  even if both checks are eventually present.
+- Assuming `provider` alone is enough — `oauth_id` (Google's `sub`) is
+  only unique *within* a provider; the composite `(provider, oauth_id)`
+  is the actual identity key, which is why `users_oauth_identity_unique`
+  is a two-column constraint, not a unique index on `oauth_id` alone.
+
+**Production considerations.** If a second OAuth provider is ever added,
+this ordering pattern (provider-identity lookup first, email-collision
+check second, only on a miss) is the one to repeat — not a redesign.
+
+**Interview answer.** I look up OAuth users by `(provider, oauth_id)`
+before ever touching email, because Google's `sub` claim is guaranteed
+stable while email isn't — a user can change their Google email at any
+time. Keying on email first would mean a user who changes their email
+either gets treated as a new signup, losing their existing account, or
+in a worse design, lands on whatever account currently owns that new
+email string. The provider's subject id is the actual identity; email is
+just contact information that happens to also be useful for detecting a
+collision with a *different* signup method, which is a separate check
+run only when the identity lookup misses.
+
+---
+
+### How Phase 2's password_hash XOR constraint already accommodated OAuth users
+
+**What it is.** `findOrCreateOAuthUser` needed no migration — `users`
+already had `oauth_provider`, `oauth_id`, a nullable `password_hash`, the
+`users_oauth_identity_unique` constraint, and
+`users_password_xor_oauth_check`, all added in Phase 2, well before this
+phase's OAuth logic existed.
+
+**Why it exists in this project.** Phase 2's schema design anticipated
+exactly this: "a user must authenticate via exactly one method... never
+both, never neither" (Notes.md Phase 2). That XOR was written as a
+general rule about the shape of a valid row, not as a rule specific to
+password auth — so when this phase needed to add a second authentication
+method, the schema had already made room for it.
+
+**How it works mechanically.** `findOrCreateOAuthUser`'s `INSERT`
+statement lists `(email, oauth_provider, oauth_id, email_verified)` and
+never mentions `password_hash` — the column simply stays at its default
+(`NULL`) by omission, the same way `signup`'s `INSERT` lists
+`(email, password_hash)` and never mentions `oauth_provider`/`oauth_id`,
+leaving those `NULL`. Both inserts satisfy the XOR constraint by
+construction — neither function has to check or enforce the rule
+itself, because there's no code path in either one capable of setting
+both sets of columns at once.
+
+**Where it lives in the codebase.**
+`migrations/20260810111606772_create-users-table.ts` (unmodified by this
+phase — confirmed via `git diff migrations/`);
+`src/services/authService.ts`'s `signup` and `findOrCreateOAuthUser`,
+whose `INSERT` column lists are each other's complement.
+
+**Common pitfalls.**
+
+- Assuming a new authentication method always needs a schema change —
+  it doesn't, if (as here) the schema was already designed around "one
+  of several methods" rather than "the one method that currently
+  exists."
+- Writing an `INSERT` that explicitly sets `password_hash = NULL` for an
+  OAuth user instead of simply omitting the column — functionally
+  identical (the column defaults to `NULL` either way), but omission
+  makes the two `INSERT` statements' *shapes* visibly mirror the XOR
+  rule itself; explicitly writing `NULL` obscures that symmetry for a
+  future reader.
+
+**Production considerations.** If a third authentication method is ever
+added (a third-party SSO, a magic-link flow), the XOR constraint as
+written (`password_hash` vs. `oauth_provider`/`oauth_id` as two mutually
+exclusive branches) would need to become a genuine "exactly one of N"
+rule, or more likely be redesigned around a separate `auth_methods`
+table — two branches hardcoded into one `CHECK` doesn't generalize
+cleanly past two methods.
+
+**Interview answer.** This phase needed zero migrations, because Phase 2
+designed the `users` table around "exactly one authentication method,"
+not around password auth specifically — the OAuth columns, their unique
+constraint, and the XOR check were all already there. `signup` and
+`findOrCreateOAuthUser` satisfy that constraint by construction: each
+`INSERT` only ever mentions the columns for its own method and leaves
+the other method's columns at their `NULL` default, so there's no code
+path in either function that could even attempt to violate the rule.
+
+---
+
+### Handling denied consent and provider errors as expected outcomes, not server errors
+
+**What it is.** When a user clicks "Cancel" on Google's consent screen,
+Google redirects back with `?error=access_denied` (and no `code`) rather
+than failing to redirect at all. The callback handler checks for this
+*after* validating `state` but *before* attempting anything that assumes
+a `code` exists, and responds with a redirect, not a thrown `AppError`.
+
+**Why it exists in this project.** A user declining to sign in with
+Google is a completely normal, expected branch of this flow — not a bug,
+not an attack, not a reason to log a server error or return a 5xx/
+generic-4xx. Treating it as an error would be both semantically wrong
+(nothing failed; the user made a choice) and bad UX (a raw JSON error
+body instead of landing back on the app).
+
+**How it works mechanically.** The callback's query schema
+(`googleCallbackQuerySchema` in `src/routes/auth.ts`) makes `code` and
+`error` both optional — Google sends exactly one of them, never both.
+After `state` is validated (first, unconditionally — see the state
+parameter subsection for why this ordering matters even here), the
+handler checks `if (error)` and, if present, logs it at `warn` level
+(`req.log.warn({ error }, ...)`, never at `error` level — this isn't a
+server fault) and redirects to `FRONTEND_URL?error=oauth_denied` without
+touching `exchangeCodeForIdentity` or `findOrCreateOAuthUser` at all. A
+subsequent `if (!code)` catches the one remaining edge case — a
+callback with neither `error` nor `code`, which shouldn't happen from
+Google itself but is still handled explicitly (400) rather than left to
+crash on a `null` code further down.
+
+**Where it lives in the codebase.** The `if (error)` / `if (!code)`
+branches in the `/google/callback` handler, `src/routes/auth.ts`,
+positioned after `consumeState` and before `exchangeCodeForIdentity`.
+
+**Common pitfalls.**
+
+- Checking `error` before `state` — this project deliberately validates
+  `state` first, so a forged callback URL carrying
+  `error=access_denied` and no valid state is rejected with 400 rather
+  than being treated as "the real user politely declined."
+- Logging denied consent at `error` severity — it pollutes error
+  dashboards/alerting with an entirely normal, frequent user action;
+  `warn` (or even `info`) is the appropriate level.
+- Forgetting the "neither `error` nor `code`" case — an easy gap to miss
+  since it's not something Google itself produces, but defensive
+  handling here is cheap and avoids a confusing crash if it ever does
+  happen (a proxy stripping a query param, a malformed manual request).
+
+**Production considerations.** `?error=oauth_denied` on the frontend
+redirect is a generic indicator, not Google's raw `error` value passed
+through verbatim — deliberately: Google's error codes aren't meant for
+end-user display, and passing them through unfiltered would require the
+frontend to handle an open-ended, Google-controlled vocabulary instead
+of one stable value this API defines.
+
+**Interview answer.** A user declining Google's consent screen is a
+normal outcome, so the callback treats `?error=access_denied` as a
+redirect back to the frontend with an indicator, not a thrown error —
+logged at `warn`, not `error`, since nothing actually failed. The
+ordering matters: state is validated before `error` is ever inspected,
+so an attacker can't forge a callback claiming "denied" to sneak past
+without a valid state. And a callback with neither `code` nor `error` —
+not something Google itself sends, but reachable by a hand-crafted
+request — still gets an explicit 400 rather than falling through to a
+crash.
+
+---
+
+### Testing an external OAuth provider without hitting the real API
+
+**What it is.** The three-layer test strategy this phase uses instead of
+calling real Google endpoints: `nock` intercepts the one real outbound
+HTTP call (`getToken`'s POST to Google's token endpoint); `verifyIdToken`
+is stubbed directly with `vi.spyOn`, returning a canned `LoginTicket`;
+everything else (state lifecycle, the callback route's own logic,
+`findOrCreateOAuthUser`) runs against this project's real local
+Postgres/Redis, exactly like every other test in this codebase.
+
+**Why it exists in this project.** This is the first genuine external-
+network dependency in the test suite — every other test hits a real
+*local* instance of its dependency (Postgres, Redis), which this project
+can spin up in Docker Compose; there is no equivalent "real local
+Google." Hitting the actual Google API from tests would be slow, flaky
+in CI, and explicitly out of scope for this phase.
+
+**How it works mechanically.** `tests/services/oauthService.test.ts`
+uses `nock('https://oauth2.googleapis.com').post('/token').reply(...)`
+to fake Google's token response, and
+`vi.spyOn(OAuth2Client.prototype, 'verifyIdToken')` to fake the verified-
+identity result — constructed as a real `LoginTicket` instance (from
+`google-auth-library` itself) carrying a hand-built `TokenPayload`, not
+an ad hoc object shape. Critically, one test asserts
+`expect(spy).toHaveBeenCalledWith(expect.objectContaining({ idToken:
+'fake-id-token', audience: clientId }))` — because `verifyIdToken` is
+fully stubbed, every *other* test in the file would still pass even if
+the real code stopped passing the correct `audience`; the mock returns
+its canned payload regardless of what it's called with. That one
+assertion is what stands between "we call `verifyIdToken` correctly" and
+a silent regression. `tests/routes/googleAuth.test.ts` mocks only
+`exchangeCodeForIdentity` (via `vi.mock` with `importOriginal`, so
+`buildGoogleAuthUrl` — pure string-building, no network — still runs
+for real), letting the callback route's own logic (state validation,
+error handling, find-or-create, the redirect) be exercised end-to-end
+against real Redis and Postgres.
+
+**Where it lives in the codebase.**
+`tests/lib/oauthState.test.ts` (state lifecycle, real Redis);
+`tests/services/oauthService.test.ts` (nock + `vi.spyOn`, including the
+audience-assertion test); `tests/services/authService.test.ts`'s
+`findOrCreateOAuthUser` describe block (pure DB, no mocking);
+`tests/routes/googleAuth.test.ts` (supertest + `vi.mock`, real DB/Redis).
+
+**Common pitfalls.**
+
+- Mocking a verification call's *output* without ever asserting its
+  *input* — see the audience-assertion point above; this is the specific
+  gap flagged during this phase's planning, not a hypothetical.
+- Mocking more than necessary — `buildGoogleAuthUrl` is pure and
+  network-free, so mocking it too (rather than letting the `/google`
+  route test exercise the real thing) would hide a real bug in URL
+  construction behind a fake.
+- Assuming a green test suite here proves Google-side integration works
+  — it doesn't, and the next subsection is explicit about that gap.
+
+**Production considerations — the residual gap.** Signature verification
+*correctness itself* — does `verifyIdToken` actually reject a forged
+token, an expired one, one with the wrong audience — is trusted entirely
+to `google-auth-library`'s own test suite, not exercised by this
+project's. This project's tests only prove two things: that our code
+calls `verifyIdToken` with the right arguments, and that our code
+handles its output correctly. They cannot catch a bug *inside* the
+library. In a system where that residual risk mattered more — handling
+financial transactions, or a security-sensitive multi-tenant boundary —
+the right mitigation wouldn't be hand-rolling JWKS verification in-house
+just to make it testable; it would be adding a small number of
+integration tests that run against Google's *real* token endpoint in CI,
+using a real, low-privilege test Google Cloud OAuth client, kept on a
+separate, slower CI tier from the fast mocked unit suite — specifically
+to catch the case where a `google-auth-library` upgrade or a config
+change silently breaks real-world verification in a way no mock could
+reveal.
+
+**Interview answer.** I mock the one real network call (`nock` on
+Google's token endpoint) and stub `verifyIdToken`'s return value
+directly, rather than hitting the real Google API from tests. The
+important detail is that mocking `verifyIdToken`'s *output* alone leaves
+a blind spot — since the mock returns the same canned result regardless
+of input, a regression that broke the `audience` argument would pass
+silently — so I added a test asserting `verifyIdToken` is *called with*
+our `GOOGLE_CLIENT_ID`. Even so, this test suite can't prove Google's own
+signature-verification logic is correct — that's trusted to the
+library's own tests. If that residual risk mattered more, the fix
+wouldn't be hand-rolling JWKS verification to make it "testable" —
+it'd be a slower, separate CI tier of integration tests against Google's
+real endpoint with a disposable test OAuth client.
