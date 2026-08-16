@@ -6,6 +6,7 @@ import { requestContext } from './middleware/requestContext.js';
 import { corsMiddleware, securityHeaders } from './middleware/security.js';
 import { authRouter } from './routes/auth.js';
 import { healthRouter } from './routes/health.js';
+import { linksRouter } from './routes/links.js';
 import { rootRouter } from './routes/root.js';
 
 /**
@@ -56,6 +57,7 @@ app.use(healthRouter);
 // today and future feature routers (link CRUD, etc.) will have more, so
 // declaring paths relative to a mount prefix here is what scales.
 app.use('/api/auth', authRouter);
+app.use('/api/links', linksRouter);
 
 // 6. Catch-all 404, after every real route (so it only fires for
 //    genuinely unmatched paths) and before the error handler (so an

