@@ -2,6 +2,7 @@ import { DatabaseError } from 'pg';
 import { query } from '../db/pool.js';
 import { conflict, internal } from '../lib/errors.js';
 import { generateShortCode } from '../lib/shortCode.js';
+import { hashPassword } from './passwordService.js';
 
 /** Postgres error code for a unique-constraint violation. */
 const UNIQUE_VIOLATION = '23505';
@@ -9,9 +10,15 @@ const UNIQUE_VIOLATION = '23505';
 /** How many times createLink retries a freshly-generated code after a collision. */
 const MAX_GENERATION_ATTEMPTS = 5;
 
+// password_hash is deliberately never selected here — is_password_protected
+// is derived in SQL instead, so the raw hash never leaves Postgres on any
+// code path that can end up serialized into a client-facing response body.
+// See getLinkByShortCode below for the one function that legitimately
+// needs the raw hash (bcrypt comparison in the redirect route).
 const LINK_COLUMNS = `
   id, user_id, short_code, destination_url, expires_at, max_clicks,
-  click_count, is_active, created_at, updated_at
+  click_count, is_active, created_at, updated_at,
+  (password_hash IS NOT NULL) AS is_password_protected
 `;
 
 export interface Link {
@@ -23,6 +30,7 @@ export interface Link {
   maxClicks: number | null;
   clickCount: number;
   isActive: boolean;
+  isPasswordProtected: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -36,6 +44,7 @@ interface LinkRow {
   max_clicks: number | null;
   click_count: number;
   is_active: boolean;
+  is_password_protected: boolean;
   created_at: Date;
   updated_at: Date;
 }
@@ -50,6 +59,7 @@ function toLink(row: LinkRow): Link {
     maxClicks: row.max_clicks,
     clickCount: row.click_count,
     isActive: row.is_active,
+    isPasswordProtected: row.is_password_protected,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -60,6 +70,7 @@ export interface CreateLinkInput {
   customAlias?: string;
   expiresAt?: Date | null;
   maxClicks?: number | null;
+  password?: string;
 }
 
 /**
@@ -74,13 +85,21 @@ async function insertLink(
   userId: string,
   shortCode: string,
   input: CreateLinkInput,
+  passwordHash: string | null,
 ): Promise<LinkRow | null> {
   try {
     const result = await query<LinkRow>(
-      `INSERT INTO links (user_id, short_code, destination_url, expires_at, max_clicks)
-       VALUES ($1, $2, $3, $4, $5)
+      `INSERT INTO links (user_id, short_code, destination_url, password_hash, expires_at, max_clicks)
+       VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING ${LINK_COLUMNS}`,
-      [userId, shortCode, input.destinationUrl, input.expiresAt ?? null, input.maxClicks ?? null],
+      [
+        userId,
+        shortCode,
+        input.destinationUrl,
+        passwordHash,
+        input.expiresAt ?? null,
+        input.maxClicks ?? null,
+      ],
     );
     const inserted = result.rows[0];
     if (!inserted) {
@@ -115,6 +134,10 @@ async function insertLink(
  * length regression).
  */
 export async function createLink(userId: string, input: CreateLinkInput): Promise<Link> {
+  // Hashed once up front, not once per collision-retry attempt below — the
+  // password is the same on every retry, only the short code changes.
+  const passwordHash = input.password ? await hashPassword(input.password) : null;
+
   if (input.customAlias) {
     const existing = await query<{ id: string }>('SELECT id FROM links WHERE short_code = $1', [
       input.customAlias,
@@ -123,7 +146,7 @@ export async function createLink(userId: string, input: CreateLinkInput): Promis
       throw conflict('This alias is already taken');
     }
 
-    const row = await insertLink(userId, input.customAlias, input);
+    const row = await insertLink(userId, input.customAlias, input, passwordHash);
     if (!row) {
       throw conflict('This alias is already taken');
     }
@@ -131,7 +154,7 @@ export async function createLink(userId: string, input: CreateLinkInput): Promis
   }
 
   for (let attempt = 0; attempt < MAX_GENERATION_ATTEMPTS; attempt += 1) {
-    const row = await insertLink(userId, generateShortCode(), input);
+    const row = await insertLink(userId, generateShortCode(), input, passwordHash);
     if (row) {
       return toLink(row);
     }
@@ -194,6 +217,7 @@ export interface UpdateLinkInput {
   expiresAt?: Date | null;
   maxClicks?: number | null;
   isActive?: boolean;
+  password?: string | null;
 }
 
 /**
@@ -233,6 +257,14 @@ export async function updateLink(
     values.push(input.isActive);
     setClauses.push(`is_active = $${values.length}`);
   }
+  if (input.password !== undefined) {
+    // null clears protection; a string replaces the hash. Hashing happens
+    // here, not in the route, for the same reason createLink hashes in the
+    // service layer — routes stay thin, hashing is business logic.
+    const passwordHash = input.password === null ? null : await hashPassword(input.password);
+    values.push(passwordHash);
+    setClauses.push(`password_hash = $${values.length}`);
+  }
 
   if (setClauses.length === 0) {
     return getLink(userId, linkId);
@@ -257,6 +289,68 @@ export async function updateLink(
  * (not a thrown error) for both "no such link" and "not yours" — the
  * route layer converts that uniformly into a 404.
  */
+// Deliberately a separate column list/row type/interface from LINK_COLUMNS
+// /LinkRow/Link above — this is the one place in the file that legitimately
+// needs the raw password_hash (to bcrypt-compare in the redirect route),
+// so it's kept structurally incapable of being run through toLink() and
+// serialized into a JSON response by accident.
+const REDIRECT_LOOKUP_COLUMNS = `
+  id, destination_url, password_hash, expires_at, max_clicks, click_count, is_active
+`;
+
+export interface RedirectLink {
+  id: string;
+  destinationUrl: string;
+  passwordHash: string | null;
+  expiresAt: Date | null;
+  maxClicks: number | null;
+  clickCount: number;
+  isActive: boolean;
+}
+
+interface RedirectLinkRow {
+  id: string;
+  destination_url: string;
+  password_hash: string | null;
+  expires_at: Date | null;
+  max_clicks: number | null;
+  click_count: number;
+  is_active: boolean;
+}
+
+function toRedirectLink(row: RedirectLinkRow): RedirectLink {
+  return {
+    id: row.id,
+    destinationUrl: row.destination_url,
+    passwordHash: row.password_hash,
+    expiresAt: row.expires_at,
+    maxClicks: row.max_clicks,
+    clickCount: row.click_count,
+    isActive: row.is_active,
+  };
+}
+
+/**
+ * Looks up a link by its public short code for the redirect route —
+ * deliberately NOT scoped by user_id, unlike every other lookup in this
+ * file. This is the one query in the whole codebase with no owner to
+ * scope against: the redirect route is public by design (see
+ * src/routes/redirect.ts and Notes.md, "Phase 7: The Public Redirect").
+ *
+ * Returns the raw password_hash for bcrypt comparison. Callers must never
+ * serialize the result to JSON — getLink()/listLinks() above (which never
+ * even select the raw hash) are the only functions safe to expose in a
+ * response body.
+ */
+export async function getLinkByShortCode(shortCode: string): Promise<RedirectLink | null> {
+  const result = await query<RedirectLinkRow>(
+    `SELECT ${REDIRECT_LOOKUP_COLUMNS} FROM links WHERE short_code = $1`,
+    [shortCode],
+  );
+  const row = result.rows[0];
+  return row ? toRedirectLink(row) : null;
+}
+
 export async function deleteLink(userId: string, linkId: string): Promise<boolean> {
   const result = await query('DELETE FROM links WHERE id = $1 AND user_id = $2 RETURNING id', [
     linkId,

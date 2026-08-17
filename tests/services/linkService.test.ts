@@ -16,19 +16,22 @@ let listLinks: typeof import('../../src/services/linkService.js').listLinks;
 let getLink: typeof import('../../src/services/linkService.js').getLink;
 let updateLink: typeof import('../../src/services/linkService.js').updateLink;
 let deleteLink: typeof import('../../src/services/linkService.js').deleteLink;
+let getLinkByShortCode: typeof import('../../src/services/linkService.js').getLinkByShortCode;
 let signup: typeof import('../../src/services/authService.js').signup;
 let query: typeof import('../../src/db/pool.js').query;
 let AppError: typeof import('../../src/lib/errors.js').AppError;
+let verifyPassword: typeof import('../../src/services/passwordService.js').verifyPassword;
 let generateShortCode: ReturnType<typeof vi.fn>;
 
 beforeAll(async () => {
   process.loadEnvFile('.env.test');
-  ({ createLink, listLinks, getLink, updateLink, deleteLink } = await import(
+  ({ createLink, listLinks, getLink, updateLink, deleteLink, getLinkByShortCode } = await import(
     '../../src/services/linkService.js'
   ));
   ({ signup } = await import('../../src/services/authService.js'));
   ({ query } = await import('../../src/db/pool.js'));
   ({ AppError } = await import('../../src/lib/errors.js'));
+  ({ verifyPassword } = await import('../../src/services/passwordService.js'));
   const shortCode = await import('../../src/lib/shortCode.js');
   generateShortCode = shortCode.generateShortCode as unknown as ReturnType<typeof vi.fn>;
 });
@@ -148,6 +151,38 @@ describe('linkService.createLink', () => {
     ).rejects.toMatchObject({ statusCode: 500 });
     expect(generateShortCode).toHaveBeenCalledTimes(5);
   });
+
+  it('creates a link without a password: isPasswordProtected is false, password_hash is NULL', async () => {
+    const user = await createUser('create-no-password');
+    const link = await createLink(user.id, { destinationUrl: 'https://example.com/open' });
+
+    expect(link.isPasswordProtected).toBe(false);
+
+    const stored = await query<{ password_hash: string | null }>(
+      'SELECT password_hash FROM links WHERE id = $1',
+      [link.id],
+    );
+    expect(stored.rows[0]?.password_hash).toBeNull();
+  });
+
+  it('creates a link with a password: isPasswordProtected is true, the stored hash is bcrypt (not the plaintext)', async () => {
+    const user = await createUser('create-password');
+    const link = await createLink(user.id, {
+      destinationUrl: 'https://example.com/gated',
+      password: 'a-link-password',
+    });
+
+    expect(link.isPasswordProtected).toBe(true);
+    expect(link).not.toHaveProperty('passwordHash');
+    expect(link).not.toHaveProperty('password_hash');
+
+    const stored = await query<{ password_hash: string | null }>(
+      'SELECT password_hash FROM links WHERE id = $1',
+      [link.id],
+    );
+    expect(stored.rows[0]?.password_hash).toMatch(/^\$2[aby]\$/);
+    expect(stored.rows[0]?.password_hash).not.toBe('a-link-password');
+  });
 });
 
 describe('linkService.getLink', () => {
@@ -260,6 +295,85 @@ describe('linkService.updateLink', () => {
       [created.id],
     );
     expect(stored.rows[0]?.destination_url).toBe('https://example.com/theirs');
+  });
+
+  it('sets a password on a previously open link', async () => {
+    const user = await createUser('update-set-password');
+    const created = await createLink(user.id, { destinationUrl: 'https://example.com/open' });
+    expect(created.isPasswordProtected).toBe(false);
+
+    const updated = await updateLink(user.id, created.id, { password: 'new-password' });
+
+    expect(updated?.isPasswordProtected).toBe(true);
+  });
+
+  it('explicit null clears a password', async () => {
+    const user = await createUser('update-clear-password');
+    const created = await createLink(user.id, {
+      destinationUrl: 'https://example.com/gated',
+      password: 'original-password',
+    });
+
+    const updated = await updateLink(user.id, created.id, { password: null });
+
+    expect(updated?.isPasswordProtected).toBe(false);
+    const stored = await query<{ password_hash: string | null }>(
+      'SELECT password_hash FROM links WHERE id = $1',
+      [created.id],
+    );
+    expect(stored.rows[0]?.password_hash).toBeNull();
+  });
+
+  it('leaves the password unchanged when the key is absent from the input', async () => {
+    const user = await createUser('update-password-unchanged');
+    const created = await createLink(user.id, {
+      destinationUrl: 'https://example.com/gated',
+      password: 'stays-the-same',
+    });
+    const before = await query<{ password_hash: string | null }>(
+      'SELECT password_hash FROM links WHERE id = $1',
+      [created.id],
+    );
+
+    const updated = await updateLink(user.id, created.id, { destinationUrl: 'https://example.com/moved' });
+
+    expect(updated?.isPasswordProtected).toBe(true);
+    const after = await query<{ password_hash: string | null }>(
+      'SELECT password_hash FROM links WHERE id = $1',
+      [created.id],
+    );
+    expect(after.rows[0]?.password_hash).toBe(before.rows[0]?.password_hash);
+  });
+});
+
+describe('linkService.getLinkByShortCode', () => {
+  it('returns null for a nonexistent short code', async () => {
+    const found = await getLinkByShortCode(uniqueAlias('nonexistent'));
+    expect(found).toBeNull();
+  });
+
+  it('is not scoped to any owner — the redirect route has no authenticated user to scope by', async () => {
+    const user = await createUser('lookup-unscoped');
+    const created = await createLink(user.id, { destinationUrl: 'https://example.com/public' });
+
+    const found = await getLinkByShortCode(created.shortCode);
+
+    expect(found?.id).toBe(created.id);
+    expect(found?.destinationUrl).toBe('https://example.com/public');
+  });
+
+  it('returns a usable raw password_hash for a protected link', async () => {
+    const user = await createUser('lookup-password');
+    const created = await createLink(user.id, {
+      destinationUrl: 'https://example.com/gated',
+      password: 'the-real-password',
+    });
+
+    const found = await getLinkByShortCode(created.shortCode);
+
+    expect(found?.passwordHash).not.toBeNull();
+    await expect(verifyPassword('the-real-password', found!.passwordHash!)).resolves.toBe(true);
+    await expect(verifyPassword('wrong-password', found!.passwordHash!)).resolves.toBe(false);
   });
 });
 

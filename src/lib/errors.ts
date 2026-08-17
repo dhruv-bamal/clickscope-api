@@ -10,6 +10,7 @@ export type ErrorCode =
   | 'UNAUTHORIZED'
   | 'FORBIDDEN'
   | 'NOT_FOUND'
+  | 'GONE'
   | 'CONFLICT'
   | 'TOO_MANY_REQUESTS'
   | 'INTERNAL_ERROR';
@@ -63,6 +64,19 @@ export function forbidden(message = 'Forbidden', details: unknown = null): AppEr
 
 export function notFound(message = 'Not found', details: unknown = null): AppError {
   return new AppError(404, 'NOT_FOUND', message, details);
+}
+
+/**
+ * 410, not 404: the server knows exactly what this resource was and is
+ * deliberately declining to serve it, as opposed to 404's "no idea what
+ * this could ever refer to." Used by the redirect route (Phase 7) for
+ * links that are deactivated, expired, or click-exhausted — see
+ * Notes.md, "Phase 7: The Public Redirect" for why all three are treated
+ * as the same class of outcome even though each is technically
+ * reversible via a PATCH.
+ */
+export function gone(message = 'Gone', details: unknown = null): AppError {
+  return new AppError(410, 'GONE', message, details);
 }
 
 export function conflict(message: string, details: unknown = null): AppError {

@@ -5592,3 +5592,876 @@ denial-of-service vector on its own — a single request for an enormous
 page forces the server to materialize and serialize an arbitrarily large
 result set, real memory/CPU/bandwidth cost that a `MAX_PAGE_SIZE` closes
 regardless of whether it's enforced by rejection or by clamping.
+
+---
+
+## Phase 7: The Public Redirect
+
+### The redirect as a hot, unauthenticated path
+
+**What it is.** `GET /:shortCode` (`src/routes/redirect.ts`) is the one
+route in this API with no `requireAuth`, no per-user scoping anywhere in
+its query, and — by the nature of a URL shortener — the highest expected
+request volume of any route in the system by a wide margin. Every other
+route in this codebase serves an authenticated owner looking at their own
+data; this one serves the general public clicking a link they found
+somewhere else entirely.
+
+**Why it exists in this project.** A short link is useless if only its
+owner can resolve it — the entire point of Click Scope is that anyone,
+logged in or not, can click `clickscope.io/abc1234` and land on the real
+destination. That requirement is what makes this route structurally
+different from every route built in Phases 4-6: there is no bearer token
+to check, no `user_id` to scope a query by, and no session to reason
+about.
+
+**How it works mechanically.** `getLinkByShortCode` in
+`src/services/linkService.ts` is the one lookup function in the file with
+no `userId` parameter — `SELECT ... FROM links WHERE short_code = $1`,
+full stop. Every other lookup in that file (`getLink`, `updateLink`,
+`deleteLink`) scopes with `AND user_id = $2` as the actual authorization
+boundary; this one has no such boundary because there's no user to check
+against. The route itself has no `requireAuth` middleware in its chain at
+all.
+
+**Where it lives in the codebase.** `src/routes/redirect.ts` (no auth
+middleware); `src/services/linkService.ts`'s `getLinkByShortCode` (the
+unscoped lookup); `src/app.ts` (mount position, see below).
+
+**Common pitfalls.**
+
+- Reflexively adding `requireAuth` here out of habit, since every other
+  route in the app has it — that would break the entire feature; a
+  visitor clicking a shared link has no account and no token.
+- Reusing `getLink`/its `user_id`-scoped query for the redirect path "for
+  consistency" — there is no authenticated user to scope by here, so the
+  query would need `user_id` to be nullable/wildcarded, quietly
+  reintroducing an authorization check that doesn't apply and can only
+  confuse the one function in the file that's deliberately public.
+
+**Production considerations.** Being the hottest, most public path in the
+system is exactly why Phases 9-11 (caching, background click recording,
+rate limiting) all target this route specifically, in that order — each
+addresses a different cost that only shows up at real traffic volume:
+repeated identical lookups, synchronous write latency, and abuse/DoS
+exposure from having no auth gate at all.
+
+**Interview answer.** The redirect route has no authentication and no
+per-user scoping because it's the one endpoint in the API meant for the
+general public, not an authenticated owner — `getLinkByShortCode` is
+deliberately the only lookup in `linkService.ts` without a `user_id`
+clause, since there's no logged-in user to scope against. That's also
+why it's the highest-traffic route in the system and the target of every
+later hardening phase — caching, moving click-recording off the request
+path, and rate limiting all exist because this route can't lean on "only
+an authenticated owner can even reach this" the way every other route
+in the app does.
+
+---
+
+### 301 vs. 302 vs. 307/308 — the caching trap
+
+**What it is.** HTTP defines several redirect status codes that differ in
+two independent dimensions: whether the redirect is *permanent* (301,
+308) or *temporary* (302, 307), and whether the client is required to
+preserve the original request method/body (307, 308) or allowed to
+switch to GET (301, 302 — in practice, universally switched to GET by
+real browsers regardless of what the spec technically permits).
+
+**Why it exists in this project.** `res.redirect(302, link.destinationUrl)`
+in `src/routes/redirect.ts` uses 302, not 301, and the difference is not
+cosmetic. Browsers are permitted — and in practice do — cache a 301
+response aggressively and indefinitely, often without ever re-checking
+with the server again for that exact URL. A 302 is documented as
+non-cacheable by default.
+
+**How it works mechanically.** Every state check this route performs —
+`is_active`, `expires_at`, `max_clicks` vs. `click_count`, the password
+gate — runs on *every single request*, because nothing about a 302
+tells the browser it may skip asking the server next time. Click
+recording (`recordClick`) likewise runs on every request. If this route
+returned 301 instead, the first browser to follow a given short link
+would cache "`/abc1234` → `https://real-destination.com`" locally and,
+for that browser, never issue another request to `/abc1234` again — not
+tomorrow, not after the link is deactivated, not after its
+`destinationUrl` is edited via `PATCH /api/links/:id`, not after it
+expires or hits its click limit. The browser already has what it thinks
+is the permanent answer and has no reason to ask again. Concretely, this
+means: click counts silently stop incrementing for that visitor forever;
+`is_active: false` and `expires_at` become unenforceable for anyone who
+already clicked once; a password gate added *after* someone already
+unlocked-and-cached a 301 response is simply bypassed on every future
+click; and editing `destinationUrl` has no effect for that visitor. The
+link *looks* like it's working — the visitor's browser still lands
+somewhere — while every dynamic feature of the system silently stops
+applying to that specific visitor, and there is no way to reverse it
+server-side: a cache the server never sees again cannot be busted by
+anything the server does.
+
+**Where it lives in the codebase.** `src/routes/redirect.ts`, the
+`res.redirect(302, link.destinationUrl)` call.
+
+**Common pitfalls.**
+
+- Using 301 for "it's simpler" or "it's marginally faster for the
+  visitor" — the performance argument is real (one fewer round trip on
+  repeat visits) but it trades away every piece of server-side control
+  this phase just built, permanently, for whichever browsers happen to
+  cache it.
+- Assuming 307/308 are safer defaults because they're "newer" — they
+  solve a completely different problem (preserving method/body across
+  the redirect, relevant for redirecting a POST/PUT), not the caching
+  question. 307 shares 302's non-cached-by-default behavior and would
+  work here, but a GET-only redirect target has no method/body to
+  preserve, so 302 is the simpler, purpose-fit choice — 307 adds no
+  benefit for this route.
+
+**Production considerations.** Some URL shorteners intentionally use 301
+for search-engine-facing reasons (SEO tools sometimes prefer permanent
+redirects) or to shave latency at massive scale by leaning on CDN/browser
+caching instead of hitting origin — but that tradeoff only makes sense
+once click tracking, expiry, and password gating are either not needed
+or handled entirely at the edge (e.g., a CDN that can independently
+invalidate its own cache). Given this project's whole premise is
+per-click tracking and dynamic link state, that tradeoff doesn't apply
+here.
+
+**Interview answer.** I used 302, not 301, because the browser caching
+behavior isn't a performance detail — it's irreversible. A 301 gets
+cached by the browser, often indefinitely, so a visitor who's clicked a
+link once may never send another request to this server for that link
+again, silently freezing click counts, expiry enforcement, password
+gating, and destination edits for that visitor specifically, with no
+server-side way to invalidate a cache it can't see. 302 (or 307, which
+differs only in method/body preservation, irrelevant for a GET-only
+redirect) tells the browser explicitly not to cache, so every click
+actually reaches the server and gets evaluated against current link
+state.
+
+---
+
+### Route ordering and wildcard shadowing, tied to reserved words
+
+**What it is.** Continued from Phase 6's "Reserved words and route
+shadowing" section — this is where that anticipated problem actually
+gets solved, now that `redirectRouter` exists.
+
+**Why it exists in this project.** `redirectRouter`'s `GET /:shortCode`
+is a single-segment wildcard: Express (via path-to-regexp) matches
+`:shortCode` against exactly one path segment, never spanning a `/`. That
+means it can only ever collide with other *single-segment* routes —
+`/health` today, a bare `/api` if ever requested with nothing after it —
+and never with multi-segment routes like `/api/auth/login` or
+`/api/links/:id`, which always win on their own more specific prefix
+match regardless of where `redirectRouter` is mounted.
+
+**How it works mechanically.** Two independent layers protect against
+this, and they protect against different failure modes:
+
+1. **Write-time (Phase 6):** `RESERVED_SHORT_CODES` in
+   `src/lib/shortCode.ts` stops anyone from ever *creating* a link whose
+   short code is `health`, `api`, `auth`, etc. — `customAliasSchema`'s
+   `.refine()` rejects it with 400 before the row can exist.
+2. **Runtime (this phase):** `src/app.ts` mounts `app.use(redirectRouter)`
+   *after* `rootRouter`, `healthRouter`, `/api/auth`, and `/api/links` —
+   and before the catch-all 404. Express matches middleware/routes in
+   registration order and stops at the first match, so `/health` is
+   handled by the real `healthRouter` before `redirectRouter` ever sees
+   the request, regardless of what row (if any) exists at `short_code =
+   'health'`.
+
+The second layer matters even though the first, in isolation, already
+guarantees no such row can exist — because the two layers guard against
+different failures. Layer 1 is a guarantee about *data*: no row can ever
+impersonate a real path. Layer 2 is a guarantee about *request handling*:
+even if that data guarantee were ever violated (a bug in the `.refine()`,
+a direct DB write bypassing the API, a future reserved word added after
+existing links were created), correct mount order still means the
+`/health` *request* reaches the real health check first — `redirectRouter`
+would simply never be consulted for that literal path. Relying on either
+layer alone leaves a gap; both together close it from two independent
+directions.
+
+**Where it lives in the codebase.** `src/app.ts` (mount order and the
+comment explaining it); `src/lib/shortCode.ts` (`RESERVED_SHORT_CODES`,
+carried over from Phase 6).
+
+**Common pitfalls.**
+
+- Mounting `redirectRouter` early "since it's simple" or alongside
+  `rootRouter` — the *content* of the route doesn't change based on
+  mount position, but *which requests it ever gets a chance to handle*
+  does. A route mounted first always wins ties against a route mounted
+  later, for any request shape both could match.
+- Believing the reserved-word list alone is sufficient and skipping the
+  mount-order reasoning — as explained above, the two guarantees cover
+  different failure modes; dropping either one narrows, but doesn't
+  eliminate, the shadowing risk.
+
+**Production considerations.** At a much larger route surface, manually
+keeping `RESERVED_SHORT_CODES` and "mount the wildcard route last" in
+sync by hand becomes more error-prone — Phase 6 already noted deriving
+the reserved list programmatically from the router's own registered
+top-level paths as the scalable alternative; the same observation applies
+here; mount order itself, however, has no equivalent shortcut — a
+wildcard route being last is a structural property of the app, not
+something that can be derived from data.
+
+**Interview answer.** `/:shortCode` only matches a single path segment,
+so it can only ever collide with other single-segment routes like
+`/health` — never with `/api/auth/*` or `/api/links/*`, which always win
+on their own more specific prefix regardless of mount order. Two
+independent layers guard the single-segment case: `RESERVED_SHORT_CODES`
+stops a link from ever being *created* at a real path like `health`
+(a write-time guarantee), and mounting the redirect router last in
+`src/app.ts` means the real `/health` handler always gets first refusal
+on that literal request (a runtime guarantee). I keep both because they
+protect against different failures — one about what data can exist, the
+other about which handler a given request actually reaches — and either
+one alone leaves a gap the other closes.
+
+---
+
+### 404 vs. 410 for deliberately-ended resources
+
+**What it is.** RFC 9110 §15.5.9 defines 410 Gone as "the target resource
+is no longer available... this condition is considered to be permanent,"
+distinct from 404's "the origin server did not find a current
+representation... or is not willing to disclose that one exists."
+
+**Why it exists in this project.** `src/routes/redirect.ts`'s
+`deadStateError` returns 410 for three cases: `is_active: false`,
+`expires_at` in the past, and `click_count >= max_clicks`. All three
+describe a link the server *knows about* and is *declining to serve on
+purpose* — a materially different claim than "no idea what this could
+ever refer to," which is what a genuinely nonexistent short code (still
+404) means.
+
+**How it works mechanically.** `deadStateError` in `src/routes/redirect.ts`
+checks all three conditions, in order, against the row `getLinkByShortCode`
+returns, and is shared between `GET /:shortCode` and `POST
+/:shortCode/unlock` so both agree on what "dead" means without
+duplicating the logic. `gone()` in `src/lib/errors.ts` is a new factory
+alongside the existing `notFound`/`conflict`/etc., producing `{ statusCode:
+410, code: 'GONE' }` through the same centralized error-formatting
+middleware every other error already uses.
+
+**Where it lives in the codebase.** `src/lib/errors.ts` (`gone()`,
+the `'GONE'` `ErrorCode`); `src/routes/redirect.ts` (`deadStateError`).
+
+**Common pitfalls.**
+
+- Treating "technically reversible via `PATCH`" as disqualifying 410 —
+  it doesn't. RFC 9110 doesn't require true permanence, only that the
+  server isn't obligated to imply the resource might return; an owner
+  flipping `isActive` back to `true`, raising `maxClicks`, or extending
+  `expiresAt` doesn't retroactively make 404 the more accurate status
+  for the moment the request was actually rejected.
+- Splitting `is_active: false` into its own 404 case while treating
+  expiry/click-limit as 410 — all three are the same class of outcome
+  ("this used to resolve, doesn't right now, on purpose"), and treating
+  them identically at the status-code level is more useful to API
+  consumers than an inconsistency with no real semantic basis.
+
+**Production considerations.** Some link-shortener APIs distinguish
+further — e.g., a distinct code or `details` payload for "deactivated by
+owner" vs. "expired" vs. "click limit reached" — useful if a frontend
+wants to show a different message per cause. This project's `gone()`
+calls already pass a cause-specific `message` (`details` in the AppError
+shape), so that distinction exists in the response body without needing
+three different HTTP status codes for it.
+
+**Interview answer.** 404 means the server has no idea what a URI could
+ever refer to; 410 means the server knows exactly what it was and is
+declining to serve it on purpose — which is the case for a deactivated,
+expired, or click-exhausted link, since `getLinkByShortCode` found a real
+row and evaluated real state to reject it. I treat all three "dead"
+states identically as 410, including `is_active: false`, even though all
+three are technically reversible via a later `PATCH` — RFC 9110 doesn't
+require true permanence for 410, and splitting one of the three cases
+into 404 for no reason beyond that reversibility would be an
+inconsistency with no real semantic basis.
+
+---
+
+### Lazy vs. scheduled expiry
+
+**What it is.** Lazy expiry checks whether something has expired only
+when it's actually read/used, doing nothing until then. Scheduled expiry
+runs a separate process on a timer that proactively finds and handles
+expired rows regardless of whether anyone reads them.
+
+**Why it exists in this project.** `deadStateError` in
+`src/routes/redirect.ts` is lazy-only, by design, for this phase: it
+compares `expires_at`/`click_count` against the current time/limit *at
+request time* and returns 410 if they've passed, but never `UPDATE`s or
+`DELETE`s the row to reflect that. An expired link's row looks identical
+in the database the instant after it expires and a year later — nothing
+proactively marks it.
+
+**How it works mechanically.** Every dead-state check in this phase is a
+pure read: `deadStateError` computes a boolean from data already fetched
+by `getLinkByShortCode` and either throws or doesn't — no write happens
+as a side effect of discovering expiry. This is a deliberate scope
+boundary for Phase 7 (per the task brief driving this phase): "lazy
+expiry only... Phase 10 adds the sweep."
+
+**Where it lives in the codebase.** `src/routes/redirect.ts`
+(`deadStateError`'s read-only checks).
+
+**Common pitfalls.**
+
+- Assuming lazy expiry alone is sufficient in production — it only
+  closes the gap for rows someone actually requests. An expired link
+  nobody ever clicks again sits in the table forever, invisibly, taking
+  up storage and (once Phase 12's indexing pass adds `expires_at`/
+  `is_active` indexes) still costing index maintenance on every write to
+  a table that's silently accumulating dead weight.
+- Assuming a scheduled sweep alone is sufficient — between sweep runs,
+  a link can be technically expired but still lazily unaware of it until
+  the next sweep tick if nothing else checks in between. Lazy expiry is
+  what closes *that* gap: correctness the instant a request arrives,
+  not just eventually on the sweep's schedule.
+
+**Production considerations.** This is exactly why production systems
+that expire things at scale (session stores, cache entries, this table
+eventually) tend to run both mechanisms together: lazy expiry gives
+immediate, per-request correctness with zero extra infrastructure;
+scheduled expiry (a sweep job, Phase 10 here) reclaims storage and index
+space from rows nobody's requesting, and stops every future read from
+repeatedly re-evaluating a row that's provably, permanently dead. Running
+only one leaves either a correctness gap (scheduled-only, between sweeps)
+or a storage/cost gap (lazy-only, forever) that the other closes.
+
+**Interview answer.** This phase only implements lazy expiry: `is_active`,
+`expires_at`, and `click_count` vs. `max_clicks` are checked at read
+time, and an expired row is never written to or deleted as a result —
+that's Phase 10's sweep job. Lazy expiry alone gives immediate,
+per-request correctness for free, but leaves expired rows accumulating
+in the table forever since nothing proactively cleans them up; a
+scheduled sweep alone would leave a correctness gap between runs. That's
+why production systems that expire things at real scale usually run
+both — lazy for instant correctness, scheduled to reclaim storage and
+stop repeatedly re-evaluating rows that are already known to be dead.
+
+---
+
+### Per-link passwords as a distinct auth problem from user sessions
+
+**What it is.** `tokenService.ts`'s JWTs (`TokenPayload { sub, iat, exp }`)
+authenticate a *user* of Click Scope — someone with a row in `users`,
+logging in to manage their own links. A password on an individual link
+authenticates a *visitor's knowledge of that one link's password* — an
+entirely different subject, with no user row behind it at all.
+
+**Why it exists in this project.** A visitor unlocking a
+password-protected link is, by definition, someone reachable through
+`redirectRouter` — the unauthenticated, public route. They may not have
+a Click Scope account at all. Reusing `tokenService.signToken(userId)`
+here would require inventing a fake `userId` to put in `sub`, or
+stretching `sub`'s meaning to sometimes mean "a link id instead of a
+user id" — either one is a category error: `sub` in every other part of
+this codebase means exactly one thing (a row in `users`), and quietly
+overloading it here would make every future piece of code that reads a
+token's `sub` unable to assume that anymore.
+
+**How it works mechanically.** `src/services/unlockTokenService.ts` is a
+separate, small module — `signUnlockToken(linkId)` /
+`verifyUnlockToken(token)` — with its own payload shape (`{ linkId, typ:
+'link_unlock' }`, no `sub`) and its own lifetime (`UNLOCK_TOKEN_TTL =
+'30m'`, vs. `tokenService`'s 7-day default). It reuses
+`config.JWT_SECRET` rather than adding a second secret (see "Scoped,
+short-lived grants" below for why that's still safe), but the `typ`
+discriminator keeps the two token *shapes* non-interchangeable — a real
+user session token has no `linkId`/`typ` claim, so `verifyUnlockToken`
+rejects it even though `jwt.verify()` would happily validate its
+signature.
+
+**Where it lives in the codebase.** `src/services/unlockTokenService.ts`
+(new, separate from `src/services/tokenService.ts`).
+
+**Common pitfalls.**
+
+- Reaching for `requireAuth`/`tokenService` "since it's already there" —
+  it would silently require every link-unlocker to have a Click Scope
+  account, which breaks the entire feature for anonymous visitors, who
+  are the overwhelming majority of people who'll ever see this
+  interstitial.
+- Putting `linkId` in a real session token's payload instead of building
+  a separate token type — even if it "worked" mechanically, it would mean
+  `tokenService.verifyToken`'s callers (i.e., `requireAuth`) now need to
+  know about a claim that only makes sense for a completely different,
+  unrelated flow.
+
+**Production considerations.** If link-unlock grants ever needed to be
+independently revocable without touching real user sessions (e.g., "log
+this visitor out of every link they've unlocked" as a feature), a
+denylist or a per-link version counter checked at `verifyUnlockToken`
+time would be the next step — not built here, since nothing in this
+phase needs unlock grants to be revocable before their 30-minute expiry
+anyway.
+
+**Interview answer.** I built a separate token service for link unlocks
+rather than reusing the user-session JWTs from Phase 4, because the
+subject is fundamentally different — a visitor proving they know one
+link's password isn't a user of Click Scope and may have no account at
+all, so there's no `users` row to put in a session token's `sub` claim.
+The unlock token has its own payload shape (`linkId`, not `sub`), its
+own short lifetime (30 minutes vs. 7 days), and a `typ` discriminator
+that keeps it structurally rejected by anything expecting a real session
+token, even though both happen to share a signing secret.
+
+---
+
+### Scoped, short-lived grants
+
+**What it is.** A "scoped" grant proves authorization for one specific
+resource, not a category of resources — the opposite of a session token
+that, once valid, is valid for everything a user account can do.
+
+**Why it exists in this project.** Unlocking link A must never grant
+access to link B, even though both are protected by the same mechanism
+and, in this project, the same JWT secret. That's the CRITICAL
+requirement this phase names explicitly, and it's what
+`unlockTokenService.signUnlockToken(linkId)` and the caller-side check in
+`src/routes/redirect.ts` are built specifically to guarantee.
+
+**How it works mechanically.** Two layers, doing two different jobs:
+
+1. **Cookie naming** — `link_unlock_<shortCode>`, plus `path:
+   /${shortCode}` on the cookie itself — means a browser won't even
+   *attach* link A's cookie to a request for link B under normal
+   operation. This is a convenience/defense-in-depth layer, not the
+   actual security boundary: it's just a naming convention a client could
+   ignore or a request could be crafted to bypass.
+2. **Payload comparison** — `verified.linkId !== link.id` in
+   `redirectRouter`'s `GET /:shortCode` handler — is the real
+   enforcement. Even if a cookie named `link_unlock_<shortCodeB>` somehow
+   arrived carrying link A's signed token (exactly what
+   `tests/routes/redirect.test.ts`'s "CRITICAL" test forges and sends),
+   `verifyUnlockToken` still returns link A's real id, and the equality
+   check against link B's actual id fails — the interstitial is served
+   again, not a redirect.
+
+The grant names the specific link *inside the signed payload*, not just
+in an external convention like a cookie name, precisely so that the
+enforcement doesn't depend on any client behaving cooperatively.
+
+**Where it lives in the codebase.**
+`src/services/unlockTokenService.ts` (`signUnlockToken`,
+`verifyUnlockToken`); `src/routes/redirect.ts` (`cookieNameFor`, the
+`verified.linkId !== link.id` check); the "CRITICAL" test in
+`tests/routes/redirect.test.ts`.
+
+**Common pitfalls.**
+
+- Relying on cookie-name scoping alone and skipping the payload
+  comparison — this is exactly the bug the CRITICAL test is designed to
+  catch: a forged or misdirected cookie with the *right name* but the
+  *wrong linkId inside it* would silently succeed without the equality
+  check.
+- A grant that names "a link was unlocked" (a boolean) instead of *which*
+  link — the CRITICAL requirement is unenforceable without the specific
+  id being part of what's verified, since there'd be nothing to compare
+  against.
+
+**Production considerations.** The 30-minute expiry is a judgment call,
+not a load-bearing security boundary the way a user session's expiry is
+— it exists so a stale grant doesn't linger indefinitely in a visitor's
+browser, not to defend against a sophisticated attacker (bcrypt already
+handles the actual password-guessing resistance, rate limiting on
+`/unlock` is the still-open gap noted below).
+
+**Interview answer.** The unlock grant is scoped by embedding the link's
+real database id inside the signed JWT payload and comparing it against
+the actually-requested link's id on every subsequent request — that
+comparison in `src/routes/redirect.ts` is the real enforcement. The
+per-link cookie name is a second, independent layer that stops a browser
+from even sending the wrong cookie under normal use, but it's not what
+actually prevents the attack; I wrote a test that forges a
+correctly-named cookie carrying a *different* link's signed token
+specifically to prove the payload check, not the naming convention, is
+what closes the gap.
+
+---
+
+### Denormalized counters
+
+**What it is.** A denormalized counter is a value stored redundantly
+alongside data it could otherwise be computed from on demand — trading
+storage and write-time complexity for cheap, O(1) reads instead of
+recomputing an aggregate every time it's needed.
+
+**Why it exists in this project.** `links.click_count` could, in
+principle, always be derived as `SELECT COUNT(*) FROM clicks WHERE
+link_id = $1` — `clicks` already has every row needed to compute it.
+Maintaining `click_count` as its own column exists so that every
+`deadStateError` check (`click_count >= max_clicks`) and every list/get
+response doesn't have to run a `COUNT(*)` over a table that will, at real
+scale, be far larger than `links` itself — one row per link vs. one row
+per click, potentially thousands of clicks per popular link.
+
+**How it works mechanically.** `clickService.recordClick` writes both:
+one `INSERT` into `clicks` (the detailed, append-only record — one row
+per click, with `referrer`/`user_agent`) and one `UPDATE links SET
+click_count = click_count + 1` (the maintained aggregate). `clicks`
+remains the source of truth; `click_count` is a cache of one aggregate
+over it, kept in sync by every write path that adds a click.
+
+**Where it lives in the codebase.**
+`migrations/20260810111606896_create-links-table.ts` (`click_count`
+column, with its non-negative check constraint);
+`migrations/20260810111607018_create-clicks-table.ts` (`clicks`, the
+source of truth); `src/services/clickService.ts` (`recordClick`, the one
+function that writes both).
+
+**Common pitfalls.**
+
+- Forgetting that a denormalized value needs *every* write path that
+  affects the underlying data to also update it — `recordClick` is
+  currently the only place clicks are recorded, so this isn't an issue
+  yet, but a future feature that inserts into `clicks` through any other
+  path (a bulk import, an admin tool) would need to remember to also
+  update `click_count`, or the two would silently drift.
+- Treating the denormalized counter as more authoritative than the table
+  it's derived from — `clicks` is the source of truth; `click_count`
+  is a read-path optimization over it, not the other way around. This
+  ordering matters directly for the transaction decision below.
+
+**Production considerations.** At the scale where `COUNT(*)` on `clicks`
+becomes genuinely too slow for a hot read path, denormalization is the
+standard answer — the alternative, a materialized view or a periodic
+recomputation job, trades staleness for not having to keep a counter
+manually in sync on every write; not needed here since `recordClick`
+already keeps both in sync inline on every click.
+
+**Interview answer.** `click_count` exists purely as a read-path
+optimization — `clicks` already has everything needed to compute it via
+`COUNT(*)`, but that gets expensive at scale since `clicks` will have far
+more rows than `links`. `clicks` stays the source of truth; `click_count`
+is a maintained cache over it, updated by the one write path
+(`recordClick`) that adds a click. That ordering — cache vs. source of
+truth — is exactly what let me reason clearly about how much consistency
+between the two actually matters when deciding whether to wrap their
+writes in a transaction.
+
+---
+
+### Atomic increments vs. read-then-write, and the lost-update race
+
+**What it is.** A "lost update" is a race condition where two concurrent
+operations each read the same starting value, then each independently
+write back their own "value + 1" — and because both reads happened
+before either write, one of the two increments is silently overwritten
+and never reflected in the final value.
+
+**Why it exists in this project.** Every click to a popular link is, by
+definition, a concurrent write to the same row's `click_count`. A naive
+implementation — `SELECT click_count FROM links WHERE id = $1` in
+application code, add 1 in JavaScript, then `UPDATE links SET click_count
+= $2` — is exactly the shape of the race: two requests arriving close
+together can both read `click_count = 5` before either writes back `6`,
+and the final stored value is `6`, not `7`, even though two clicks
+happened.
+
+**How it works mechanically.** `clickService.recordClick` never reads
+`click_count` into application memory at all — `UPDATE links SET
+click_count = click_count + 1 WHERE id = $1` computes the increment
+entirely inside Postgres, as part of a single statement. Postgres
+executes that statement atomically per row: a second concurrent `UPDATE`
+targeting the same row either waits for the first to complete (under
+MVCC's row-level locking) or operates on the post-first-update value —
+there is no window where two concurrent increments can both read the
+same pre-increment value, because neither one ever reads it into
+anywhere a race could occur. This holds regardless of whether the
+statement runs inside an explicit multi-statement transaction or on its
+own — the atomicity is a property of the single `UPDATE`, not of any
+wrapping around it.
+
+**Where it lives in the codebase.** `src/services/clickService.ts`
+(`recordClick`'s `UPDATE ... SET click_count = click_count + 1`); the
+concurrency test in `tests/routes/redirect.test.ts` ("concurrent
+redirects to the same link do not lose clicks"), which fires 20 parallel
+requests and asserts the final count is exactly 20 — a test that would
+fail under a naive read-then-write implementation but passes here.
+
+**Common pitfalls.**
+
+- Reading a counter into application code "just to log it" or "to decide
+  whether to also check max_clicks" and then writing back
+  `count + 1` from that same read — even if the read is only used for a
+  side purpose, writing back a value derived from it reintroduces the
+  exact race, regardless of intent.
+- Assuming an explicit transaction is what prevents the lost-update race
+  here — it isn't; the single computed `UPDATE` is what prevents it,
+  independent of transactional wrapping. This distinction is what the
+  next section's benchmark decision turns on.
+
+**Production considerations.** This pattern — `column = column + 1`
+computed server-side — generalizes to any counter under concurrent
+writes (rate-limit counters, inventory counts, view counters); the
+general fix is always "let the database compute the delta," never "read,
+modify, write" from application code, regardless of the specific ORM or
+query builder in use.
+
+**Interview answer.** The lost-update race happens when two concurrent
+requests both read the same counter value before either writes back an
+incremented one, so one increment is silently lost — exactly what would
+happen with `SELECT click_count`, add 1 in JavaScript, `UPDATE`. I avoid
+it entirely by never reading the counter into application code: `UPDATE
+links SET click_count = click_count + 1` computes the increment inside a
+single Postgres statement, which executes atomically per row under
+MVCC. I proved this concretely with a test that fires 20 concurrent
+redirects at the same link and asserts the final count is exactly 20 —
+it would fail under a naive read-then-write and passes here.
+
+---
+
+### Synchronous side effects on a latency-critical path
+
+**What it is.** A "synchronous side effect" here means the redirect
+response doesn't get sent to the visitor until the click-recording writes
+have actually completed — the opposite of firing them off and responding
+immediately without waiting.
+
+**Why it exists in this project — deliberately, for now.** This phase
+keeps click recording synchronous on purpose, specifically so its real
+cost can be measured before Phase 10 moves it onto a queue (BullMQ,
+already a project dependency for the worker process). Optimizing before
+measuring would mean never actually knowing whether the queue made a
+meaningful difference.
+
+**How it works mechanically, and what the measurement showed.**
+`src/routes/redirect.ts`'s `GET /:shortCode` handler times the
+`recordClick` call specifically (`process.hrtime.bigint()` before/after,
+logged via `req.log.info({ durationMs }, 'Click recorded')`) — separate
+from `requestContext.ts`'s whole-request timing, because isolating the
+DB-write cost specifically is what Phase 10's comparison actually needs,
+not overall request latency (which also includes routing, cookie
+parsing, and the link lookup).
+
+Before settling on `clickService.recordClick`'s final shape, two versions
+were benchmarked head-to-head against the same local Postgres instance,
+300 iterations each after a warm-up: the two writes (`INSERT` into
+`clicks`, `UPDATE` on `click_count`) issued as plain, independent calls
+through `query()`, versus the same two writes wrapped in an explicit
+`BEGIN`/`COMMIT` transaction on one dedicated connection. Median latency:
+**~0.5ms non-transactional vs. ~0.75ms transactional** — the
+transactional version cost roughly 1.5x as long, consistent with paying
+for two extra network round trips (`BEGIN`, `COMMIT`) on top of the same
+two statements.
+
+That overhead bought exactly one thing: `clicks` and `click_count` never
+disagreeing even if the process crashes in the gap between the `INSERT`
+resolving and the `UPDATE` being issued. It did **not** buy the
+"no lost updates under concurrency" guarantee — as the previous section
+covers, that's already fully guaranteed by the single computed `UPDATE`
+statement, with or without a wrapping transaction; the concurrency test
+passes either way. And per "Denormalized counters" above, `clicks` is
+already the source of truth, `click_count` a read-path cache over it —
+the `INSERT` always runs first, so the only possible drift from skipping
+the transaction is `click_count` under-counting by however many clicks
+were physically mid-flight at the exact instant of a crash (over-counting
+isn't possible, since an `UPDATE` never fires without its `INSERT`
+already having committed). That's a narrow, self-limiting, low-severity
+risk — a rare crash causing a rare, small, one-directional undercount of
+a display counter with no reconciliation job to matter to even in Phase
+10 — traded against a consistent ~50% latency tax on the single hottest
+path in the entire system, which locally is sub-millisecond but would
+scale with real network round-trip time to a production database, not
+shrink.
+
+Given that, `recordClick` ships as the plain two-write version — no
+transaction. The `withTransaction` helper built to run the benchmark was
+removed from `src/db/pool.ts` afterward rather than left in as unused
+infrastructure, since nothing in this codebase currently calls it; the
+exact pattern (a dedicated `pool.connect()` client, `BEGIN`/try/`COMMIT`/
+catch-`ROLLBACK`/finally-`release`) is what to reach for if a future
+phase adds a write that genuinely needs multi-statement atomicity —
+e.g., anything where `click_count` (or an equivalent) becomes a hard
+security or billing boundary rather than a display counter, which would
+flip this cost/benefit calculation.
+
+**Where it lives in the codebase.** `src/services/clickService.ts`
+(`recordClick`, with the reasoning inline); `src/routes/redirect.ts`
+(the `durationMs` timing/logging around the `recordClick` call).
+
+**Common pitfalls.**
+
+- Reaching for a transaction by default whenever two related writes
+  happen together, without asking what specific guarantee it adds beyond
+  what a single atomic statement (or the actual consistency
+  requirements) already provides — "two writes that are related" is not
+  automatically "two writes that need ACID atomicity together."
+- Benchmarking on localhost and assuming the *relative* cost transfers
+  unchanged to production — the ratio (roughly 2x round trips for the
+  transactional version: `BEGIN`+`INSERT`+`UPDATE`+`COMMIT` vs.
+  `INSERT`+`UPDATE`) is what should transfer; the *absolute* added
+  latency should be expected to grow, not shrink, once real network RTT
+  to a production database (e.g., via Supabase's Supavisor pooler) replaces
+  near-zero local loopback latency.
+
+**Production considerations.** This decision is explicitly revisitable:
+if `click_count` (or a similar counter) is ever used for something where
+a rare, small undercount is unacceptable — billing, a hard usage cap
+enforced as a security boundary rather than a courtesy limit — the
+transactional version is a known, already-benchmarked option to fall
+back to, at a known, already-measured cost.
+
+**Interview answer.** I kept click recording synchronous this phase
+specifically to measure its real cost before Phase 10 moves it to a
+queue — a representative synchronous redirect, including the click
+write, ran in the single-digit milliseconds locally, with the write
+itself the dominant cost. I also benchmarked wrapping the two writes
+(insert + counter update) in an explicit transaction versus not, and
+found the transactional version cost about 1.5x as long — roughly two
+extra network round trips for `BEGIN`/`COMMIT`. I chose not to keep the
+transaction: the "no lost updates" guarantee people usually reach for a
+transaction to get is already fully provided by the single atomic
+`UPDATE click_count = click_count + 1` regardless of transactional
+wrapping, so the only thing the transaction actually bought was
+protection against a rare crash landing in a sub-millisecond gap between
+two statements, causing at most a small, one-directional undercount of a
+denormalized display counter that already isn't the source of truth.
+That felt like the wrong trade on the hottest path in the whole system,
+especially on the exact metric this phase exists to establish a baseline
+for.
+
+---
+
+### Why not `cookie-parser`
+
+**What it is.** `cookie-parser` is a widely-used Express middleware that
+parses the `Cookie` request header into `req.cookies` (and, with a
+secret, `req.signedCookies`), and can help construct `Set-Cookie` values.
+
+**Why it wasn't added.** Two things this phase needs from cookies —
+setting one, and reading one specific, known-named one back — need
+either nothing or a few lines, respectively. `res.cookie(...)` is built
+into Express itself; no middleware is required to *set* a cookie, only
+to parse incoming ones. And the unlock grant is already a signed JWT
+(`unlockTokenService.ts`) — tamper-evidence is already handled there, so
+`cookie-parser`'s own signed-cookie feature would be a second, redundant
+signing mechanism layered on top of the first.
+
+**How it works mechanically.** `src/lib/cookies.ts`'s `readCookie(header,
+name)` splits the raw `Cookie` header on `;`, finds the segment whose
+name matches, and returns its decoded value — a handful of lines that
+cover exactly the one thing this phase needs (look up one named cookie),
+without pulling in `cookie-parser`'s broader feature set: parsing *every*
+cookie into `req.cookies` regardless of whether anything reads it, JSON
+cookie support, and its own independent signing scheme.
+
+**Where it lives in the codebase.** `src/lib/cookies.ts` (`readCookie`);
+`src/routes/redirect.ts` (`res.cookie(...)` to set, `readCookie` to
+read back).
+
+**Common pitfalls.**
+
+- Adding a well-known middleware reflexively because "that's what you use
+  for cookies in Express" without checking what this specific use case
+  actually needs — CLAUDE.md's "never add a dependency silently, name it,
+  justify it, note the alternative" applies just as much to a *decision
+  not to add one*, which is why this section exists.
+- Hand-rolling cookie *signing* as well as parsing — not needed here,
+  since the unlock token is already a signed JWT; a hand-rolled signing
+  scheme on top would be actively worse than either using
+  `cookie-parser`'s signing or (as done here) not needing cookie-level
+  signing at all.
+
+**Production considerations.** If a future phase needs to read many
+different, dynamically-named cookies, or JSON-valued cookies, or several
+independently-signed ones, `cookie-parser` (or an equivalent) becomes the
+right call at that point — this isn't "cookie-parser is bad," it's "this
+phase's actual requirement doesn't need it yet."
+
+**Interview answer.** I didn't add `cookie-parser` because the two things
+this phase needs from cookies don't require it: setting one is built
+into Express (`res.cookie`, no middleware needed), and reading back one
+specific, known cookie name is a short loop over the raw header. The
+unlock token is already a signed JWT, so `cookie-parser`'s signed-cookie
+feature would just be a second, redundant signing layer on top of the
+first. I'd reach for it if a future feature needed to parse many
+different or dynamically-named cookies, but that's not what this phase
+does.
+
+---
+
+### Privacy considerations of click tracking
+
+**What it is.** Every click records `referrer` and `user_agent` alongside
+the link it belongs to — data that, even without a user account attached
+to it, can be used to fingerprint or profile a visitor across clicks.
+
+**Why it exists in this project.** `referrer` and `user_agent` are the
+two pieces of context Phase 7's spec calls for capturing per click, and
+they're genuinely useful for the analytics this project is building
+toward — knowing where clicks come from and what device/browser clicked
+is standard link-analytics functionality. But capturing them isn't
+free of privacy considerations just because no login is involved.
+
+**How it works mechanically.** `clickService.recordClick` reads
+`req.header('referer')` (the HTTP header's actual, historically-misspelled
+name — this project's own column is spelled correctly, `referrer`) and
+`req.header('user-agent')`, both nullable — a request through most
+browsers' privacy modes, or with `Referrer-Policy` restricting outbound
+referrers, may send neither, and both are stored as `NULL` rather than
+erroring. Notably, **no IP address is captured or stored anywhere in this
+schema** — `clicks` has a `country` column (nullable, presumably meant to
+be resolved from a request's IP by some future geolocation step) but no
+`ip_address` column at all, so a raw IP is never persisted even
+transiently by the code in this phase.
+
+**Where it lives in the codebase.**
+`migrations/20260810111607018_create-clicks-table.ts` (`referrer`,
+`user_agent`, `country` columns — no IP column);
+`src/services/clickService.ts` (what's actually read from the request and
+stored).
+
+**Common pitfalls.**
+
+- Treating "no user account" as equivalent to "no privacy
+  consideration" — `user_agent` combined with `referrer` and click
+  timing can still meaningfully fingerprint a device/browser across
+  multiple clicks on links from the same short-code owner, even with zero
+  identifying account data attached.
+- Assuming `country` being nullable-and-unpopulated in this phase means
+  no location signal exists at all — the column's presence signals an
+  intent to resolve it from IP later; whatever mechanism eventually
+  populates it will need its own privacy reasoning about IP handling at
+  that point, not just at storage time.
+
+**Production considerations, deliberately not built in this phase:**
+
+- **Retention limits.** Nothing in this schema or this phase deletes old
+  `clicks` rows — a production system handling real traffic would need
+  an explicit retention/TTL policy, not indefinite accumulation.
+- **Consent.** No consent banner or opt-out mechanism exists for EU (or
+  other jurisdiction) visitors; a production deployment serving such
+  visitors would need one before recording `referrer`/`user_agent` at
+  all, under GDPR and similar regimes.
+- **IP handling.** If a future phase adds IP-based geolocation to
+  populate `country`, that raises its own questions (store the raw IP?
+  for how long? hash/truncate it?) that this phase deliberately doesn't
+  need to answer, since no IP is captured at all right now.
+- **Anonymization.** No hashing, truncation, or aggregation of
+  `user_agent`/`referrer` happens before storage — they're kept exactly
+  as the request sent them.
+- **Rate limiting on `/unlock`.** Not privacy-specific, but the same
+  "deliberately deferred" category: nothing currently limits how many
+  password guesses `POST /:shortCode/unlock` will accept — that's
+  explicitly Phase 11's job, not this phase's. bcrypt's own cost factor
+  slows each individual guess, but that's not a substitute for rate
+  limiting against a sustained automated attempt.
+
+**Interview answer.** Click recording stores `referrer` and `user_agent`
+per click, both nullable to handle privacy-mode browsers or restrictive
+referrer policies gracefully rather than erroring — but deliberately no
+IP address at all; the schema's `country` column exists for a future
+geolocation step, not for storing a raw IP now. Even without an account
+attached, that combination can still fingerprint a device across clicks,
+so a production version of this would need retention limits, consent
+handling for regulated visitors, and a real answer for how (or whether)
+IP gets involved once geolocation is added — none of which this phase
+builds, along with rate limiting on the password-unlock endpoint, which
+is an explicitly open gap until Phase 11.

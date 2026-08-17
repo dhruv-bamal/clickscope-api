@@ -7,6 +7,7 @@ import { corsMiddleware, securityHeaders } from './middleware/security.js';
 import { authRouter } from './routes/auth.js';
 import { healthRouter } from './routes/health.js';
 import { linksRouter } from './routes/links.js';
+import { redirectRouter } from './routes/redirect.js';
 import { rootRouter } from './routes/root.js';
 
 /**
@@ -58,6 +59,19 @@ app.use(healthRouter);
 // declaring paths relative to a mount prefix here is what scales.
 app.use('/api/auth', authRouter);
 app.use('/api/links', linksRouter);
+// Flat-mounted, deliberately last among routes — /:shortCode only ever
+// matches a single path segment (Express/path-to-regexp can't span a '/'
+// with it), so it can only ever collide with other single-segment routes
+// (/health today; a bare /api if ever requested) — never with
+// /api/auth/* or /api/links/*, which win on their own more specific
+// prefix regardless of mount order. RESERVED_SHORT_CODES (src/lib/
+// shortCode.ts) stops someone from *registering* a link that impersonates
+// a real single-segment path; this mount position is the independent
+// second layer — it's what stops this router from *shadowing* that
+// route's real behavior even if such a row could somehow exist. One is a
+// write-time guarantee (no such row exists), the other a runtime one
+// (even if it did, this router isn't reached first for /health).
+app.use(redirectRouter);
 
 // 6. Catch-all 404, after every real route (so it only fires for
 //    genuinely unmatched paths) and before the error handler (so an

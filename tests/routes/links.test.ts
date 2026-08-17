@@ -21,6 +21,15 @@ function uniqueAlias(label: string): string {
   return `${label}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** password_hash must never appear in a response body, under any key spelling. */
+function assertNoPasswordHash(body: unknown): void {
+  const serialized = JSON.stringify(body);
+  expect(serialized.toLowerCase()).not.toContain('password_hash');
+  expect(serialized.toLowerCase()).not.toContain('passwordhash');
+  expect(serialized).not.toContain('$2a$');
+  expect(serialized).not.toContain('$2b$');
+}
+
 async function signupUser(label: string): Promise<{ token: string; userId: string }> {
   const res = await request(app)
     .post('/api/auth/signup')
@@ -111,6 +120,26 @@ describe('POST /api/links', () => {
     const res = await request(app).post('/api/links').send({ destinationUrl: 'https://example.com' });
     expect(res.status).toBe(401);
   });
+
+  it('creates a password-protected link: isPasswordProtected true, no password_hash leaked', async () => {
+    const { token } = await signupUser('create-password');
+
+    const res = await post(token, { destinationUrl: 'https://example.com/gated', password: 'link-secret' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.link.isPasswordProtected).toBe(true);
+    assertNoPasswordHash(res.body);
+  });
+
+  it('creates a link with no password: isPasswordProtected is false', async () => {
+    const { token } = await signupUser('create-open');
+
+    const res = await post(token, { destinationUrl: 'https://example.com/open' });
+
+    expect(res.status).toBe(201);
+    expect(res.body.link.isPasswordProtected).toBe(false);
+    assertNoPasswordHash(res.body);
+  });
 });
 
 describe('GET /api/links', () => {
@@ -176,6 +205,15 @@ describe('GET /api/links', () => {
     expect(res.body.links).toHaveLength(1);
     expect(res.body.links[0].destinationUrl).toBe('https://example.com/a');
   });
+
+  it('never leaks password_hash for a password-protected link', async () => {
+    const { token } = await signupUser('list-no-leak');
+    await post(token, { destinationUrl: 'https://example.com/gated', password: 'link-secret' });
+
+    const res = await request(app).get('/api/links').set('Authorization', `Bearer ${token}`);
+
+    assertNoPasswordHash(res.body);
+  });
 });
 
 describe('GET /api/links/:id', () => {
@@ -199,6 +237,18 @@ describe('GET /api/links/:id', () => {
       .set('Authorization', `Bearer ${token}`);
 
     expect(res.status).toBe(400);
+  });
+
+  it('never leaks password_hash for a password-protected link', async () => {
+    const { token } = await signupUser('getid-no-leak');
+    const created = await post(token, { destinationUrl: 'https://example.com/gated', password: 'link-secret' });
+
+    const res = await request(app)
+      .get(`/api/links/${created.body.link.id}`)
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.body.link.isPasswordProtected).toBe(true);
+    assertNoPasswordHash(res.body);
   });
 });
 
@@ -316,6 +366,52 @@ describe('PATCH /api/links/:id', () => {
       .send({ destinationUrl: 'https://example.com/x' });
 
     expect(res.status).toBe(400);
+  });
+
+  it('sets a password on a previously open link, no password_hash leaked', async () => {
+    const { token } = await signupUser('patch-set-password');
+    const created = await post(token, { destinationUrl: 'https://example.com/open' });
+
+    const res = await request(app)
+      .patch(`/api/links/${created.body.link.id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ password: 'new-link-password' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.link.isPasswordProtected).toBe(true);
+    assertNoPasswordHash(res.body);
+  });
+
+  it('an explicit null clears a password', async () => {
+    const { token } = await signupUser('patch-clear-password');
+    const created = await post(token, {
+      destinationUrl: 'https://example.com/gated',
+      password: 'original-password',
+    });
+
+    const res = await request(app)
+      .patch(`/api/links/${created.body.link.id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ password: null });
+
+    expect(res.status).toBe(200);
+    expect(res.body.link.isPasswordProtected).toBe(false);
+  });
+
+  it('leaves the password unchanged when the key is absent from the body', async () => {
+    const { token } = await signupUser('patch-password-unchanged');
+    const created = await post(token, {
+      destinationUrl: 'https://example.com/gated',
+      password: 'stays-the-same',
+    });
+
+    const res = await request(app)
+      .patch(`/api/links/${created.body.link.id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ destinationUrl: 'https://example.com/moved' });
+
+    expect(res.status).toBe(200);
+    expect(res.body.link.isPasswordProtected).toBe(true);
   });
 });
 

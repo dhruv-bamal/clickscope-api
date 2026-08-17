@@ -35,11 +35,21 @@ const futureDateSchema = z.coerce
   .date()
   .refine((date) => date.getTime() > Date.now(), 'expiresAt must be in the future');
 
+// bcrypt silently truncates input beyond 72 bytes — capped here so a
+// caller isn't misled into thinking a longer password matters at verify
+// time. This is a per-link access gate, not an account password, so no
+// stronger policy (mixed case, etc.) is enforced beyond "not empty."
+const linkPasswordSchema = z
+  .string()
+  .min(1, 'password must not be empty')
+  .max(72, 'password must be at most 72 characters');
+
 const createLinkSchema = z.object({
   destinationUrl: destinationUrlSchema,
   customAlias: customAliasSchema.optional(),
   expiresAt: futureDateSchema.optional(),
   maxClicks: z.number().int().positive('maxClicks must be a positive integer').optional(),
+  password: linkPasswordSchema.optional(),
 });
 
 // .strict() rejects customAlias/shortCode in a PATCH body — the short code
@@ -51,6 +61,7 @@ const updateLinkSchema = z
     expiresAt: futureDateSchema.nullable().optional(),
     maxClicks: z.number().int().positive('maxClicks must be a positive integer').nullable().optional(),
     isActive: z.boolean().optional(),
+    password: linkPasswordSchema.nullable().optional(),
   })
   .strict();
 
@@ -69,6 +80,7 @@ linksRouter.post('/', requireAuth, validateBody(createLinkSchema), async (req, r
   if (parsed.customAlias !== undefined) input.customAlias = parsed.customAlias;
   if (parsed.expiresAt !== undefined) input.expiresAt = parsed.expiresAt;
   if (parsed.maxClicks !== undefined) input.maxClicks = parsed.maxClicks;
+  if (parsed.password !== undefined) input.password = parsed.password;
 
   const link = await createLink(req.userId!, input);
   res.status(201).json({ link });
@@ -129,6 +141,7 @@ linksRouter.patch(
     if ('expiresAt' in body) input.expiresAt = parsed.expiresAt ?? null;
     if ('maxClicks' in body) input.maxClicks = parsed.maxClicks ?? null;
     if (parsed.isActive !== undefined) input.isActive = parsed.isActive;
+    if ('password' in body) input.password = parsed.password ?? null;
 
     const link = await updateLink(req.userId!, id, input);
     if (!link) {
