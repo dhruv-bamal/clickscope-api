@@ -4,7 +4,7 @@ import { logger } from './logger.js';
 
 /**
  * Shared Redis client. Connection only in this phase — no caching logic,
- * that's Phase 9. BullMQ (the future worker/ process) requires ioredis
+ * that's Phase 8. BullMQ (the future worker/ process) requires ioredis
  * specifically, so this is also the client that phase will reuse rather
  * than introducing a second Redis library.
  *

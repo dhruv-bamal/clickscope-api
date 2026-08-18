@@ -1,9 +1,10 @@
 import type { Express } from 'express';
 import request from 'supertest';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 let app: Express;
 let query: typeof import('../../src/db/pool.js').query;
+let redis: typeof import('../../src/lib/redis.js').redis;
 
 beforeAll(async () => {
   // Same dynamic-import-after-loadEnvFile requirement as tests/routes/links.test.ts —
@@ -11,6 +12,7 @@ beforeAll(async () => {
   process.loadEnvFile('.env.test');
   ({ app } = await import('../../src/app.js'));
   ({ query } = await import('../../src/db/pool.js'));
+  ({ redis } = await import('../../src/lib/redis.js'));
 });
 
 function uniqueEmail(label: string): string {
@@ -142,16 +144,28 @@ describe('GET /:shortCode — dead/missing states', () => {
     expect(res.status).toBe(410);
   });
 
-  it('returns 410 once click_count reaches maxClicks', async () => {
-    const { token } = await signupUser('redirect-maxclicks');
-    const link = await createLink(token, { destinationUrl: 'https://example.com/limited', maxClicks: 1 });
+  it(
+    'returns 410 once click_count reaches maxClicks',
+    async () => {
+      const { token } = await signupUser('redirect-maxclicks');
+      const link = await createLink(token, { destinationUrl: 'https://example.com/limited', maxClicks: 1 });
 
-    const first = await request(app).get(`/${link.shortCode}`);
-    expect(first.status).toBe(302);
+      const first = await request(app).get(`/${link.shortCode}`);
+      expect(first.status).toBe(302);
 
-    const second = await request(app).get(`/${link.shortCode}`);
-    expect(second.status).toBe(410);
-  });
+      // A capped link is cached with a short TTL (see "response caching
+      // (Redis)" below) precisely because click_count can be stale — an
+      // immediate next request can still land within that accepted
+      // overshoot window and get served again. Waiting past the capped TTL
+      // is what actually proves the limit takes effect, rather than
+      // asserting an immediate-enforcement guarantee caching no longer makes.
+      await new Promise((resolve) => setTimeout(resolve, 6000));
+
+      const second = await request(app).get(`/${link.shortCode}`);
+      expect(second.status).toBe(410);
+    },
+    15000,
+  );
 });
 
 describe('password-protected links', () => {
@@ -229,6 +243,200 @@ describe('password-protected links', () => {
     expect(res.status).toBe(200);
     expect(res.headers.location).toBeUndefined();
     expect(res.text).toContain('<form');
+  });
+});
+
+describe('response caching (Redis)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('first request populates the Redis cache entry for the link', async () => {
+    const { token } = await signupUser('cache-populate');
+    const link = await createLink(token, { destinationUrl: 'https://example.com/cache-populate' });
+
+    expect(await redis.get(`link:${link.shortCode}`)).toBeNull();
+
+    const res = await request(app).get(`/${link.shortCode}`);
+    expect(res.status).toBe(302);
+
+    const cached = await redis.get(`link:${link.shortCode}`);
+    expect(cached).not.toBeNull();
+    const parsed = JSON.parse(cached!) as { id: string; destinationUrl: string };
+    expect(parsed.id).toBe(link.id);
+    expect(parsed.destinationUrl).toBe(link.destinationUrl);
+  });
+
+  it('a nonexistent short code is negative-cached with the miss sentinel', async () => {
+    const code = `no-such-code-${Date.now()}`;
+
+    const res = await request(app).get(`/${code}`);
+    expect(res.status).toBe(404);
+
+    expect(await redis.get(`link:${code}`)).toBe('__MISS__');
+  });
+
+  it('PATCH invalidates the cache: an immediate re-request reflects the new destination', async () => {
+    const { token } = await signupUser('cache-patch-invalidate');
+    const link = await createLink(token, { destinationUrl: 'https://example.com/before-edit' });
+
+    await request(app).get(`/${link.shortCode}`); // populates the cache
+    expect(await redis.get(`link:${link.shortCode}`)).not.toBeNull();
+
+    await request(app)
+      .patch(`/api/links/${link.id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ destinationUrl: 'https://example.com/after-edit' });
+
+    // Proves invalidation itself, not just that the follow-up request
+    // happens to see fresh data despite a stale cache entry.
+    expect(await redis.get(`link:${link.shortCode}`)).toBeNull();
+
+    const res = await request(app).get(`/${link.shortCode}`);
+    expect(res.status).toBe(302);
+    expect(res.headers.location).toBe('https://example.com/after-edit');
+  });
+
+  it('DELETE invalidates the cache: an immediate re-request is 404, not served from a stale entry', async () => {
+    const { token } = await signupUser('cache-delete-invalidate');
+    const link = await createLink(token, { destinationUrl: 'https://example.com/to-be-deleted' });
+
+    await request(app).get(`/${link.shortCode}`); // populates the cache
+    expect(await redis.get(`link:${link.shortCode}`)).not.toBeNull();
+
+    await request(app).delete(`/api/links/${link.id}`).set('Authorization', `Bearer ${token}`);
+
+    expect(await redis.get(`link:${link.shortCode}`)).toBeNull();
+
+    const res = await request(app).get(`/${link.shortCode}`);
+    expect(res.status).toBe(404);
+  });
+
+  it('falls back to Postgres when Redis GET fails', async () => {
+    const { token } = await signupUser('cache-redis-get-down');
+    const link = await createLink(token, { destinationUrl: 'https://example.com/redis-get-down' });
+
+    vi.spyOn(redis, 'get').mockRejectedValueOnce(new Error('simulated Redis outage'));
+
+    const res = await request(app).get(`/${link.shortCode}`);
+    expect(res.status).toBe(302);
+    expect(res.headers.location).toBe('https://example.com/redis-get-down');
+  });
+
+  it('falls back gracefully when Redis SET fails while populating the cache', async () => {
+    const { token } = await signupUser('cache-redis-set-down');
+    const link = await createLink(token, { destinationUrl: 'https://example.com/redis-set-down' });
+
+    vi.spyOn(redis, 'set').mockRejectedValueOnce(new Error('simulated Redis outage'));
+
+    const res = await request(app).get(`/${link.shortCode}`);
+    expect(res.status).toBe(302);
+
+    // The failed write means nothing got cached — not that a stale/partial
+    // entry was left behind.
+    expect(await redis.get(`link:${link.shortCode}`)).toBeNull();
+  });
+
+  it('falls back gracefully when Redis DEL fails during invalidation', async () => {
+    const { token } = await signupUser('cache-redis-del-down');
+    const link = await createLink(token, { destinationUrl: 'https://example.com/redis-del-down' });
+
+    await request(app).get(`/${link.shortCode}`); // populates the cache
+
+    vi.spyOn(redis, 'del').mockRejectedValueOnce(new Error('simulated Redis outage'));
+
+    const res = await request(app)
+      .patch(`/api/links/${link.id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ destinationUrl: 'https://example.com/redis-del-down-after' });
+
+    // A failed cache invalidation must not fail the write request itself.
+    expect(res.status).toBe(200);
+  });
+
+  it('a link with maxClicks set is cached with a much shorter TTL than an uncapped link', async () => {
+    const { token } = await signupUser('cache-capped-ttl');
+    const link = await createLink(token, {
+      destinationUrl: 'https://example.com/capped-ttl',
+      maxClicks: 5,
+    });
+
+    await request(app).get(`/${link.shortCode}`);
+
+    const ttl = await redis.ttl(`link:${link.shortCode}`);
+    expect(ttl).toBeGreaterThan(0);
+    expect(ttl).toBeLessThanOrEqual(5);
+  });
+
+  it(
+    'a capped link can overshoot its click limit within the short cache TTL, then self-corrects',
+    async () => {
+      const { token } = await signupUser('cache-capped-overshoot');
+      const link = await createLink(token, {
+        destinationUrl: 'https://example.com/overshoot',
+        maxClicks: 1,
+      });
+
+      // Cache miss: reads click_count=0 from Postgres (0 < 1, live), caches
+      // that pre-increment value with the 5s capped TTL, then recordClick
+      // bumps the real count to 1.
+      const first = await request(app).get(`/${link.shortCode}`);
+      expect(first.status).toBe(302);
+
+      // Cache hit, still within the TTL: still sees the stale click_count=0
+      // cached above, so it's served again even though the real count is
+      // already at the cap. This is the accepted, documented overshoot —
+      // not a bug.
+      const second = await request(app).get(`/${link.shortCode}`);
+      expect(second.status).toBe(302);
+
+      // Wait out the 5s capped TTL so the next lookup is a genuine cache miss.
+      await new Promise((resolve) => setTimeout(resolve, 6000));
+
+      // Fresh read: click_count now reflects both prior clicks and is >= maxClicks.
+      const third = await request(app).get(`/${link.shortCode}`);
+      expect(third.status).toBe(410);
+    },
+    15000,
+  );
+
+  it('dead-state checks are identical whether the entry is a cache hit or a cache miss', async () => {
+    const { token } = await signupUser('cache-dead-state-consistency');
+    const link = await createLink(token, { destinationUrl: 'https://example.com/dead-state' });
+    await request(app)
+      .patch(`/api/links/${link.id}`)
+      .set('Authorization', `Bearer ${token}`)
+      .send({ isActive: false });
+
+    const cold = await request(app).get(`/${link.shortCode}`); // cache miss
+    expect(cold.status).toBe(410);
+
+    const warm = await request(app).get(`/${link.shortCode}`); // cache hit
+    expect(warm.status).toBe(410);
+  });
+
+  it('a password-protected link served from a warm cache still requires the unlock cookie, and unlocking still works', async () => {
+    const { token } = await signupUser('cache-password-warm');
+    const link = await createLink(token, {
+      destinationUrl: 'https://example.com/warm-gated',
+      password: 'warm-cache-password',
+    });
+
+    const cold = await request(app).get(`/${link.shortCode}`); // cache miss
+    expect(cold.status).toBe(200);
+    expect(cold.text).toContain('<form');
+
+    const warm = await request(app).get(`/${link.shortCode}`); // cache hit
+    expect(warm.status).toBe(200);
+    expect(warm.text).toContain('<form');
+
+    const agent = request.agent(app);
+    const unlockRes = await agent.post(`/${link.shortCode}/unlock`).send({ password: 'warm-cache-password' });
+    expect(unlockRes.status).toBe(302);
+
+    const followUp = await agent.get(`/${link.shortCode}`);
+    expect(followUp.status).toBe(302);
+    expect(followUp.headers.location).toBe('https://example.com/warm-gated');
   });
 });
 

@@ -5640,8 +5640,9 @@ unscoped lookup); `src/app.ts` (mount position, see below).
   confuse the one function in the file that's deliberately public.
 
 **Production considerations.** Being the hottest, most public path in the
-system is exactly why Phases 9-11 (caching, background click recording,
-rate limiting) all target this route specifically, in that order — each
+system is exactly why Phase 8 and Phases 10-11 (caching, background click
+recording, rate limiting) all target this route specifically, in that
+order — each
 addresses a different cost that only shows up at real traffic volume:
 repeated identical lookups, synchronous write latency, and abuse/DoS
 exposure from having no auth gate at all.
@@ -6465,3 +6466,675 @@ handling for regulated visitors, and a real answer for how (or whether)
 IP gets involved once geolocation is added — none of which this phase
 builds, along with rate limiting on the password-unlock endpoint, which
 is an explicitly open gap until Phase 11.
+
+---
+
+## Phase 8: Caching the Redirect Path
+
+### What makes data worth caching — and what in this app isn't
+
+**What it is.** A cache trades a slower, authoritative read (Postgres) for
+a faster, secondary copy (Redis) that can go stale. That trade is only
+worth making for data that's read far more often than it changes, and
+where a bounded amount of staleness is tolerable.
+
+**Why it exists in this project.** `getLinkByShortCode` (Phase 7) is read
+on literally every visit to a short link, but a given link's row changes
+rarely — only on an owner's `PATCH`/`DELETE`, which is a low-frequency,
+authenticated, low-volume operation compared to public redirect traffic.
+That read-to-write ratio is what makes it a good caching candidate at all.
+
+**How it works mechanically.** Not every field on that row is equally
+cacheable, which is the whole reason Phase 8 exists as a design problem and
+not just a mechanical "wrap it in Redis" exercise:
+
+- `destination_url`, `password_hash`, `expires_at`, `is_active` — change
+  only via an explicit owner action, invalidated explicitly on write (see
+  "Invalidation ordering" below). Good caching candidates.
+- `click_count` — changes on *every single click*, with no invalidation
+  hook at all (see "The click_count problem" below). A bad caching
+  candidate in the naive sense; this phase caches it anyway but bounds the
+  damage with a much shorter TTL specifically because of this.
+- Anything scoped to a user (e.g. a future cache of `listLinks`'s results)
+  is a different category again — see "Key namespacing" below.
+
+**Where it lives in the codebase.** `src/services/linkService.ts`,
+`getLinkByShortCode` and its private `getCachedLink`/`setCachedLink`/
+`setCachedMiss`/`invalidateLinkCache` helpers.
+
+**Common pitfalls.**
+
+- Caching a whole row indiscriminately because "it's one query" without
+  asking whether every field on it has the same staleness tolerance —
+  `click_count` inside `RedirectLink` is exactly this trap, and is the
+  reason this phase can't just be "cache the SELECT."
+- Assuming a low read-to-write ratio disqualifies something from caching
+  entirely, rather than asking whether a *shorter* TTL still captures most
+  of the benefit — see the click_count decision below.
+
+**Production considerations.** As the app grows, other read-heavy,
+write-light data becomes a candidate the same way — e.g. a future
+`GET /api/links/:id` cache, which would need the user-scoping rule below
+applied from day one, not retrofitted after a leak.
+
+**Interview answer.** I picked `getLinkByShortCode` to cache because it's
+read on every redirect but written only on an owner's occasional edit — a
+large read-to-write ratio is the basic precondition for caching being
+worth it at all. But not every field on that row shares that property:
+`click_count` changes on every click, so I treated it as a separate
+sub-problem rather than assuming the whole row was equally safe to cache.
+
+---
+
+### Cache-aside, step by step
+
+**What it is.** Cache-aside (also called lazy loading) is a pattern where
+the application, not the cache, owns the read/write logic: on a read, check
+the cache first; on a miss, read the source of truth and populate the
+cache; on a write, update the source of truth and then evict (or update)
+the cache entry.
+
+**Why it exists in this project.** Three other patterns exist and each
+implies infrastructure this project doesn't have:
+
+- **Read-through** — the cache itself, not the application, knows how to
+  load from the source of truth on a miss (e.g. via a configured loader).
+  This needs a caching layer that can talk to Postgres on its own; plain
+  Redis can't, and standing up something that can (e.g. a caching proxy)
+  would be infrastructure with no other use here.
+- **Write-through** — every write goes to the cache first, which
+  synchronously writes through to the source of truth. This makes the
+  cache sit *in front of* Postgres for writes, adding Redis to the
+  critical path of every `PATCH`/`DELETE` even though those are already
+  low-volume and not latency-sensitive — no benefit to justify the added
+  dependency on that path.
+- **Write-behind** — writes go to the cache and are asynchronously flushed
+  to the source of truth later. This trades durability (a crash between
+  the cache write and the flush loses data) for write latency, which isn't
+  a problem this app has — `updateLink`/`deleteLink` are already fast,
+  low-volume, single-row writes.
+
+Cache-aside is the only one of the four that adds Redis purely as an
+optional accelerant on the read path, with Postgres remaining fully
+authoritative and reachable independent of Redis — which is exactly the
+"graceful degradation" property this phase requires (see below).
+
+**How it works mechanically.** `getLinkByShortCode`:
+
+1. `getCachedLink(shortCode)` — GET `link:<shortCode>`. A hit (positive or
+   negative-sentinel) returns immediately, no Postgres involved.
+2. On a miss, `SELECT ... FROM links WHERE short_code = $1` against
+   Postgres, same query as before this phase.
+3. The result (found or not) is written back to Redis with an appropriate
+   TTL, so the *next* read is a cache hit.
+4. `updateLink`/`deleteLink`/`createLink`'s custom-alias branch explicitly
+   evict the entry on a write, rather than waiting for the TTL (see
+   "Invalidation ordering" below) — the "aside" part of cache-aside: the
+   application manages invalidation itself, the cache is otherwise passive.
+
+**Where it lives in the codebase.** `src/services/linkService.ts` —
+`getLinkByShortCode` (the read path), `updateLink`/`deleteLink`/`createLink`
+(the write paths that call `invalidateLinkCache`).
+
+**Common pitfalls.**
+
+- Reaching for read-through/write-through by default because they sound
+  more "automatic" — both require infrastructure (a smart cache or a
+  cache sitting in the write path) this app has no other reason to run.
+- Forgetting that cache-aside puts invalidation correctness entirely on
+  the application — unlike write-through, nothing enforces that a write
+  and a cache update happen together; that discipline has to be built in
+  by hand (see "Invalidation ordering").
+
+**Production considerations.** At much higher write volume, write-through
+or write-behind's tradeoffs (added write latency vs. eventual durability)
+start to matter more — neither applies today given how infrequent
+`PATCH`/`DELETE` are relative to redirect traffic.
+
+**Interview answer.** I used cache-aside because it's the only one of the
+four core caching patterns that keeps Redis purely optional on the read
+path — Postgres stays fully authoritative and reachable with Redis
+completely absent, which is what let me build graceful degradation as a
+first-class requirement rather than an afterthought. Read-through and
+write-through both need Redis to sit *in* a critical path (a smart loader,
+or the write path itself); write-behind trades durability for write
+latency this app doesn't need, since writes here are already fast and rare.
+
+---
+
+### The click_count problem
+
+**What it is.** `links.click_count` is a denormalized counter (Phase 7)
+incremented by `recordClick` on every single redirect. `deadStateError`
+compares it against `max_clicks` to decide whether a link has hit its
+limit. Caching `RedirectLink` naively would cache this value too — but
+nothing re-populates the cache when `recordClick` increments it, so a
+cached `click_count` is frozen for the entire life of its TTL.
+
+**Why it exists in this project.** Four options were on the table, with
+very different worst-case behavior:
+
+| Option | Worst-case overshoot past `maxClicks` | Caching benefit for capped links |
+|---|---|---|
+| (a) never cache `click_count`; read it separately from Postgres on every request | none | none — still a DB read every request |
+| (b) cache the whole row with the normal 300s TTL | unbounded by however much traffic arrives within 300s | full |
+| (c) never cache links that have `maxClicks` set at all | none | none |
+| (d) cache capped links too, but with a much shorter TTL | bounded by however much traffic arrives within that short TTL | most of it |
+
+(c) was the first instinct — exclude the risky case entirely — but it's
+the wrong trade: a link only *has* a click cap because its owner expects
+meaningful volume, so (c) excludes from caching exactly the links most
+likely to be hot. (d) was chosen instead: capped links are cached like any
+other link, but with `LINK_CACHE_CAPPED_TTL_SECONDS = 5` instead of the
+usual 300. This isn't really a "concurrency race" — it's structural: a
+cache entry is always written with the `click_count` read *before* that
+same request's own `recordClick` call runs, so even a single next request
+landing within the 5s window sees a value that doesn't yet reflect the
+request(s) already served since. A 5-second window bounds that overshoot
+to "however many clicks arrive in 5 seconds" instead of "however many
+arrive in 5 minutes" — for all but the most viral links, a handful of
+clicks at worst, self-correcting on the very next cache miss.
+
+**How it works mechanically.** `getLinkByShortCode` picks the TTL based on
+`link.maxClicks === null ? LINK_CACHE_TTL_SECONDS : LINK_CACHE_CAPPED_TTL_SECONDS`
+right before caching a positive result. Nothing else about the code path
+differs — `deadStateError` in `src/routes/redirect.ts` evaluates whatever
+`RedirectLink` it's handed exactly the same way whether it came from
+Postgres or Redis; it has no idea caching exists.
+
+**Where it lives in the codebase.** `src/services/linkService.ts` —
+`LINK_CACHE_CAPPED_TTL_SECONDS`, and the TTL-selection line inside
+`getLinkByShortCode`. Proven directly in
+`tests/routes/redirect.test.ts`, `describe('response caching (Redis)')` —
+one test asserts the capped TTL via `redis.ttl`, another walks through the
+accepted one-request overshoot and its self-correction after the TTL
+expires. The original Phase 7 test
+(`'returns 410 once click_count reaches maxClicks'`) was updated to wait
+out the capped TTL before asserting 410, since it previously encoded a
+stricter immediate-enforcement guarantee that caching deliberately no
+longer makes.
+
+**Common pitfalls.**
+
+- Treating "cache it or don't" as a binary choice — the actually useful
+  lever here was the TTL, not the yes/no decision.
+- Assuming the overshoot is a concurrency bug to be "fixed" with locking —
+  it's a deliberate, bounded, and self-correcting tradeoff, not a defect.
+
+**Production considerations.** **What would flip this back to option
+(a):** if a click cap ever acquires billing or legal significance — a paid
+tier enforced by click count, or a contractual "this link stops working at
+exactly N clicks" guarantee — a few seconds of possible overshoot stops
+being acceptable. At that point `click_count` should go back to an
+uncached, per-request Postgres read for capped links specifically (or move
+enforcement server-side into an atomic Redis counter/Lua script rather
+than a lazy read at all). Today it's a display/soft-limit counter with no
+such stakes.
+
+**Interview answer.** The core tension is that `click_count` changes on
+every request but nothing invalidates its cache entry when that happens —
+so any cached value is stale the instant it's written. My first instinct
+was to just never cache links with a click cap, but that's backwards:
+those are exactly the links most likely to get real traffic, since an
+owner only sets a cap when they expect volume. Instead I cache them with a
+5-second TTL instead of the normal 5 minutes, which bounds the possible
+overshoot to "clicks that arrive in 5 seconds" rather than an open-ended
+window, while still capturing most of the caching benefit. If click
+enforcement ever became a hard boundary — billing, contractual limits — I'd
+go back to an uncached read for that specific case, because a few seconds
+of slack stops being acceptable once real stakes are attached to it.
+
+---
+
+### Invalidation ordering: write, then invalidate
+
+**What it is.** When a write and a cache invalidation both need to happen,
+there are two possible orderings — invalidate the cache first, then write
+the database; or write the database first, then invalidate the cache —
+and they are not equivalent.
+
+**Why it exists in this project.** `updateLink`/`deleteLink` both write to
+Postgres and need `link:<shortCode>` gone from Redis afterward.
+Invalidate-then-write has a real race: a concurrent `GET /:shortCode`
+landing between the delete and the write finds no cache entry, reads
+Postgres (still the *old* value, since the write hasn't landed yet), and
+re-populates the cache with that old value — and nothing will ever
+invalidate it again until its own TTL expires naturally. That's strictly
+worse than doing nothing: a stale entry that outlives the very fix meant
+to remove it. Write-then-invalidate's race window is bounded instead: a
+concurrent read landing between the write and the delete gets one stale
+response, and the very next request after the delete completes is
+guaranteed fresh.
+
+**How it works mechanically.** `updateLink` runs its `UPDATE ... RETURNING`
+first, then calls `invalidateLinkCache(row.short_code)` before building
+and returning the `Link`. `deleteLink` runs `DELETE ... RETURNING id,
+short_code` first, then invalidates using the returned `short_code` before
+returning `true`. Both invalidate unconditionally, even for a link that
+was never cached (a capped link, say) — a `DEL` on an absent key is a
+harmless no-op, simpler than branching on whether caching would have
+applied.
+
+**Where it lives in the codebase.** `src/services/linkService.ts` —
+`updateLink`, `deleteLink`, and `invalidateLinkCache`'s doc comment, which
+spells out the race being avoided. Proven in
+`tests/routes/redirect.test.ts`: the PATCH/DELETE invalidation tests
+assert `redis.get` is `null` *immediately* after the write, not just that
+a later request happens to see fresh data.
+
+**Common pitfalls.**
+
+- Invalidating before the write "to be safe" — this is the exact ordering
+  that produces a permanently stale entry under a concurrent read, not a
+  safer one.
+- Assuming the race is purely theoretical — it only requires one read to
+  land in a narrow window between two Redis/Postgres calls under real
+  concurrent traffic, which this app's own redirect volume is specifically
+  expected to have.
+
+**Production considerations.** At higher write concurrency on the *same*
+link (multiple simultaneous edits), the invalidation call itself is still
+just a `DEL` — idempotent and order-independent between concurrent
+writers, so this doesn't need additional locking even then.
+
+**Interview answer.** I invalidate after the database write commits, never
+before, because invalidate-then-write has a race that leaves a stale cache
+entry with no way to ever get fixed: a concurrent read can slip in between
+the delete and the write, see the old data in Postgres, and re-cache it —
+at which point nothing will invalidate that entry again until its TTL
+expires on its own. Write-then-invalidate has a race too, but a strictly
+smaller one: a read in that narrow window gets one stale response, and the
+very next request is guaranteed correct once the delete lands.
+
+---
+
+### TTL as a safety net, not the primary mechanism
+
+**What it is.** This cache has two invalidation mechanisms doing different
+jobs: explicit `DEL` calls on every write (the primary mechanism, correct
+immediately), and a TTL on every entry (a fallback that bounds staleness
+even when explicit invalidation doesn't happen).
+
+**Why it exists in this project.** Explicit invalidation can fail to run:
+`invalidateLinkCache`'s own `DEL` can fail if Redis is unreachable at the
+exact moment of a `PATCH`/`DELETE` (see "Graceful degradation" below,
+which requires that failure not fail the request). If that happens, the
+stale entry left behind has no other trigger to remove it — except its
+TTL. The TTL isn't there to make invalidation unnecessary; it's there to
+guarantee an upper bound on staleness even in the case explicit
+invalidation was designed to handle but couldn't, for a reason outside the
+application's control.
+
+**How it works mechanically.** Every `SET` in this cache carries an `EX`
+TTL — 300s for uncapped links, 5s for capped links, 30s for negative
+entries. `invalidateLinkCache`'s `catch` block logs
+`'Redis DEL failed while invalidating link cache; stale entry may persist
+until TTL expiry'` specifically so a Redis outage during an edit is
+diagnosable after the fact, even though the request itself succeeded.
+
+**Where it lives in the codebase.** `src/services/linkService.ts` — every
+`redis.set(...)` call includes an `EX` argument; `invalidateLinkCache`'s
+catch block and its accompanying comment.
+
+**Common pitfalls.**
+
+- Treating a long TTL as an acceptable substitute for explicit
+  invalidation because "it'll expire eventually" — the whole point of
+  building invalidation was to make edits visible immediately, not to make
+  a long staleness window tolerable.
+- Forgetting to log a failed invalidation, which would make a rare "why is
+  this link still showing the old destination" report undiagnosable.
+
+**Production considerations.** If Redis outages during writes become
+frequent enough that TTL-bounded staleness starts mattering operationally,
+that's a signal to page on the `'Redis DEL failed...'` log line
+specifically, rather than to shorten every TTL globally.
+
+**Interview answer.** Explicit invalidation is what makes edits visible
+immediately — that's the part users actually experience. The TTL exists
+for the case explicit invalidation can't cover: if Redis itself is down at
+the exact moment of an edit, the `DEL` call fails, gets logged, and the
+request still succeeds (it must — see graceful degradation) — but that
+leaves a stale entry with nothing else to clean it up except its TTL. So
+the TTL isn't a substitute for invalidation, it's the bound on how bad
+things get on the specific path where invalidation itself failed.
+
+---
+
+### Negative caching
+
+**What it is.** Caching the *absence* of a resource — a nonexistent short
+code — so a repeated lookup for the same missing key doesn't hit Postgres
+every time either.
+
+**Why it exists in this project.** `GET /:shortCode` is a public,
+unauthenticated route reachable by anyone, including automated scanners
+enumerating or guessing short codes. Without negative caching, every
+single guess — valid or not — costs a Postgres round trip. With it, only
+the first guess for a given code does.
+
+**How it works mechanically.** A miss is stored at the *same* key
+(`link:<shortCode>`) as a hit would use, with the sentinel value
+`'__MISS__'` instead of a serialized link — one `GET` distinguishes all
+three states (absent from cache / negative hit / positive hit) with no
+second key or round trip. Its TTL (`LINK_CACHE_NEGATIVE_TTL_SECONDS = 30`)
+is deliberately much shorter than the positive TTL: it bounds how long a
+short code can stay invisible if it was probed moments before being
+claimed. That bound matters because nothing else invalidates a negative
+entry when the code stops being "nonexistent" — `createLink` has no
+inherent hook into a lookup cache it doesn't know about. The custom-alias
+branch of `createLink` closes this for its own case explicitly, calling
+`invalidateLinkCache(shortCode)` right after a successful insert — the
+30s TTL is deliberately not the only mechanism there, just the fallback.
+The generated-code path doesn't get the same treatment: with 62^7 possible
+codes, a fresh random code being pre-probed within a 30-second window
+before it's ever generated isn't a realistic scenario worth an extra
+Redis call on every signup.
+
+**Where it lives in the codebase.** `src/services/linkService.ts` —
+`LINK_CACHE_MISS_SENTINEL`, `setCachedMiss`, the `getCachedLink` branch
+that returns `{found: true, link: null}`, and the `invalidateLinkCache`
+call inside `createLink`'s custom-alias branch.
+
+**Common pitfalls.**
+
+- Giving negative entries the same TTL as positive ones — a nonexistent
+  code is much more likely to *become* real (via creation) than an
+  existing link's destination is to silently change without going through
+  `PATCH`, so the tolerable staleness window is genuinely different.
+- Assuming the negative-cache TTL alone is sufficient and skipping the
+  `createLink` invalidation — for the realistic case (custom aliases,
+  which are guessable/memorable and thus more likely to be pre-probed)
+  that leaves an avoidable window of a link 404ing right after its own
+  creation.
+
+**Production considerations.** At real scale, negative caching also
+meaningfully reduces the load a scanning/enumeration attempt puts on
+Postgres — the *first* request for a given nonexistent code still pays a
+full lookup, but a sustained scan of the same handful of codes doesn't
+repeat that cost.
+
+**Interview answer.** I cache misses too, using a sentinel value at the
+same key a hit would use, so a single `GET` covers all three outcomes with
+no extra round trip. The tradeoff is that a link can 404 for up to the
+negative TTL if its exact code was probed right before creation — I keep
+that TTL short (30s) specifically to bound that window, and for the
+realistic case (a custom alias, since those are guessable) I close it
+entirely by having `createLink` invalidate the negative entry the moment
+the alias is actually claimed.
+
+---
+
+### Graceful degradation: a cache that can fail must never fail the request
+
+**What it is.** Every Redis operation on this path — `GET`, `SET`, `DEL`
+— is wrapped so an error is caught, logged, and treated as "proceed as if
+the cache weren't there," never allowed to propagate and fail the
+request.
+
+**Why it exists in this project.** A cache is, by definition, an optional
+accelerant over a source of truth that already works on its own. If a
+caching layer's failure could fail requests that would have succeeded
+without it, adding the cache would have made the system *less* reliable
+than having no cache at all — trading a fast path that sometimes helps for
+a new way the whole system can go down. That's the opposite of what
+caching is supposed to buy.
+
+**How it works mechanically.** `getCachedLink` catches any error from
+`redis.get` and returns `{found: false}` — indistinguishable, from
+`getLinkByShortCode`'s perspective, from a genuine cache miss, so
+execution falls straight through to the existing Postgres query.
+`setCachedLink`/`setCachedMiss` catch errors from `redis.set` and simply
+don't cache that lookup — the response the caller already has is
+unaffected. `invalidateLinkCache` catches errors from `redis.del` — see
+"TTL as a safety net" above for what that specifically trades away. Each
+catch block logs via `logger.error` so a real Redis outage is visible in
+aggregate, even though no individual request fails because of it.
+
+This is a deliberate divergence from `oauthState.ts`'s `storeState`/
+`consumeState`, which do *not* catch Redis errors — and that's correct
+there, not an oversight here. Redis is the actual source of truth for
+OAuth state (there's no Postgres fallback for "is this CSRF token valid");
+a failed state store or lookup should fail that request, because
+proceeding without it would mean skipping a real security check. Here,
+Redis is purely a performance layer over a Postgres query that already
+returns a correct answer on its own — the two modules have genuinely
+different reliability requirements, not just an inconsistent style.
+
+**Where it lives in the codebase.** `src/services/linkService.ts` — every
+`try`/`catch` inside `getCachedLink`/`setCachedLink`/`setCachedMiss`/
+`invalidateLinkCache`. Proven directly in
+`tests/routes/redirect.test.ts`'s `describe('response caching (Redis)')`:
+three tests use `vi.spyOn(redis, 'get'|'set'|'del').mockRejectedValueOnce`
+to simulate a live Redis failure on each operation and assert the request
+still succeeds. Manually confirmed too: stopping the local Redis container
+(`docker compose stop redis`) and issuing a redirect still returned 302.
+
+**Common pitfalls.**
+
+- Letting a cache-layer error propagate "because it should never happen in
+  practice" — a caching layer that can silently take down an
+  already-working code path on a transient network blip is a regression,
+  not a resilience improvement.
+- Catching the error but forgetting to log it — an unlogged Redis outage
+  degrades performance invisibly, discoverable only much later via a low
+  hit rate with no obvious cause.
+
+**Production considerations.** At real scale, a sustained Redis outage
+under this design degrades to "every redirect pays the full Postgres
+lookup cost" — worse latency, but a fully functional system, which is the
+entire point.
+
+**Interview answer.** Every Redis call on this path is wrapped so a
+failure logs and falls through to Postgres rather than failing the
+request — because a cache is supposed to be optional, and a cache that can
+take down an already-working code path on a transient failure would make
+the system less reliable than having no cache at all. I deliberately did
+this differently from the existing `oauthState.ts` module, which lets
+Redis errors propagate — that's correct there because Redis *is* the
+source of truth for OAuth state with no fallback, so a failure there
+should fail the request. Here Redis is purely a performance layer over a
+Postgres query that's already correct on its own, so the two modules have
+genuinely different failure requirements.
+
+---
+
+### Cache stampede
+
+**What it is.** A stampede happens when a popular cache entry expires (or
+is evicted) and a burst of concurrent requests all miss at once, each
+independently hitting the source of truth simultaneously — turning one
+slow query into many.
+
+**Why it exists in this project — or rather, doesn't, yet.** No stampede
+mitigation (single-flight locking, probabilistic early expiration,
+stale-while-revalidate) is implemented this phase. At this app's actual
+scale — a single API process talking directly to a local/managed Postgres
+instance that comfortably handles individual lookups — the failure mode a
+stampede protects against (many *simultaneous* first-touch requests for
+the *same* key, arriving in the same instant a TTL lapses) isn't a
+realistic problem yet. Adding locking or coordination for a scenario that
+isn't happening would be complexity with no measured benefit.
+
+**How it works mechanically.** Nothing — a TTL expiry today just means the
+next request (or requests, if several arrive close together) each
+independently miss and each independently re-populate the cache with the
+same value. Redundant work, but bounded and self-correcting, not a
+correctness problem.
+
+**Where it lives in the codebase.** Nowhere — this is a deliberate
+non-implementation, not an oversight.
+
+**Common pitfalls.**
+
+- Building stampede protection preemptively "because it's a known caching
+  problem" without a concrete scenario where it's actually biting — that's
+  solving a problem this app doesn't have yet at the cost of real
+  complexity (coordination logic, an extra failure mode of its own).
+
+**Production considerations.** The trigger that would change this answer:
+a single link receiving enough concurrent first-touch traffic within one
+TTL window (a link going viral, essentially) that the redundant Postgres
+reads during that burst become a measurable load problem — at that point,
+a short single-flight lock (e.g. a Redis `SETNX`-based mutex around the
+Postgres read) or stale-while-revalidate (serve the expiring value while
+one request refreshes it in the background) would be the next step, not
+before.
+
+**Interview answer.** I didn't implement stampede protection — no
+locking, no probabilistic early expiration — because at this app's actual
+traffic level, many concurrent requests missing the cache for the exact
+same key in the exact same instant isn't a real scenario yet; a TTL
+lapsing just means a request or two redundantly re-populates the cache,
+which is bounded and self-correcting. I'd revisit this the moment a single
+link's traffic within one TTL window makes those redundant Postgres reads
+a measurable cost, not before — building the coordination for it earlier
+would be complexity without a problem to justify it.
+
+---
+
+### Key namespacing
+
+**What it is.** `link:<shortCode>` follows the same flat
+`<namespace>:<identifier>` convention `oauthState.ts` already established
+with `oauth:state:<state>`.
+
+**Why it exists in this project.** `getLinkByShortCode` is deliberately
+the one *unscoped* lookup in `linkService.ts` (Phase 7) — there's no
+authenticated user to scope it by, since the redirect route is public.
+`link:<shortCode>` mirrors that: no user id in the key, because the data
+behind it isn't user-scoped either.
+
+**How it works mechanically.** `linkCacheKey(shortCode)` builds
+`` `link:${shortCode}` `` — nothing else goes into the key.
+
+**Where it lives in the codebase.** `src/services/linkService.ts`,
+`linkCacheKey` and `LINK_CACHE_PREFIX`.
+
+**Common pitfalls — and the rule this sets up for later.** The critical
+rule for *any future cache over user-owned data* is that the user id must
+be part of the key, not just a filter applied after reading a shared
+cache entry. Concretely: if a future phase caches `getLink(userId,
+linkId)` (the owner-scoped lookup, distinct from this one) and keys it as
+just `link-by-id:<linkId>` — omitting `userId` — then user A's request for
+`linkId` populates a cache entry that user B's request for the *same*
+`linkId` (if B ever guessed or was given that id) would also read, because
+nothing about the key itself encodes whose request it was. The fix isn't
+an application-level ownership check after the cache read (that's exactly
+the "if-statement instead of the query" mistake this codebase's own
+conventions already forbid for Postgres queries — see this file's
+"Conventions" section) — it's `` `link-by-id:${userId}:${linkId}` ``, so a
+cache hit is structurally impossible unless the requesting user matches
+the one whose request created the entry. `link:<shortCode>` gets to skip
+this because `getLinkByShortCode` itself has no owner to scope by in the
+first place — this is the one deliberate exception, not the general rule.
+
+**Production considerations.** This is the same class of bug as a missing
+`WHERE user_id = $2` on a Postgres query, just relocated to Redis — and
+just as serious, since a cache is exactly as capable of leaking
+cross-tenant data as a database is if it isn't scoped correctly.
+
+**Interview answer.** The redirect cache key is deliberately unscoped —
+just `link:<shortCode>` — because the function it caches,
+`getLinkByShortCode`, is itself the one deliberately public, unscoped
+lookup in this codebase; there's no user id to include because there's no
+authenticated user in the request at all. But that's specifically because
+this data has no owner-scoping requirement to begin with — any *future*
+cache over owner-scoped data would need the user id baked directly into
+the key, not checked after the fact, for the same reason every Postgres
+query in this codebase scopes ownership in the `WHERE` clause instead of
+an `if` statement: a cache entry keyed without the user id is exactly as
+capable of serving user A's cached data to user B as a query missing
+`AND user_id = $2` is.
+
+---
+
+### Measuring cache effectiveness
+
+**What it is.** Two separate measurements: raw latency (is a cache hit
+actually faster than a cache miss, and by how much) and hit rate (in
+steady-state traffic, how often is the cache actually being used).
+
+**Why it exists in this project.** Building a cache without measuring it
+is exactly the mistake Phase 7 avoided with `recordClick`'s benchmark —
+optimizing before measuring means never actually knowing whether the
+change made a meaningful difference.
+
+**How it works mechanically.** A throwaway local script (following Phase
+7's own precedent — `recordClick`'s `withTransaction` benchmark helper was
+written, used once, and deleted afterward, not kept as unused
+infrastructure) called `getLinkByShortCode` directly, isolating it with
+`process.hrtime.bigint()` the same way `recordClick` was isolated: 300
+iterations after a 20-iteration warmup, median latency, once with the
+cache forcibly cleared before every call (cold — Postgres read + cache
+populate every time) and once with the cache pre-populated (warm — every
+call a cache hit).
+
+**Results, against local Postgres and local Redis over loopback:**
+
+| Path | Median latency (n=300) |
+|---|---|
+| Cold (cache miss: Postgres read + cache populate) | **~0.569ms** |
+| Warm (cache hit: single Redis `GET`) | **~0.169ms** |
+
+A warm lookup is roughly **3.4x faster** than a cold one locally — a
+~0.4ms absolute improvement on top of Phase 7's ~1.7ms measured end-to-end
+redirect baseline. That's real, but it understates the production case
+significantly: `links.short_code` is already a unique, indexed column, so
+the *local* Postgres lookup this replaces is already about as cheap as a
+single-row indexed read gets, over near-zero loopback latency. Against a
+network-attached production database (real round-trip time replacing
+loopback), the Postgres side of that comparison gets meaningfully more
+expensive while the Redis side — typically also network-attached, but a
+simpler single-key `GET` — stays comparatively cheap; the *relative*
+benefit of a cache hit should be expected to grow, not shrink, once real
+network RTT is involved on both sides.
+
+For hit rate: every cache lookup logs at debug level via `logger.debug`
+with `{shortCode, cache: 'hit' | 'miss' | 'negative-hit'}` and a single
+consistent message (`'Link cache lookup'`), so hit rate is derivable by
+counting log lines grouped by that field in a log aggregator — no new
+metrics dependency (e.g. `prom-client`) was added for this, consistent
+with this project's rule against silently adding dependencies.
+
+**Where it lives in the codebase.** The benchmark script itself was
+deleted after this measurement (`scripts/benchmarkLinkCache.ts`, no longer
+present) — the numbers above are the artifact that matters, not the
+script. The debug logging lives in `getCachedLink` in
+`src/services/linkService.ts`.
+
+**Common pitfalls.**
+
+- Trusting the local benchmark's absolute numbers as representative of
+  production — the ratio is informative, the absolute milliseconds
+  measured over loopback are not.
+- Keeping a one-off benchmark script around as permanent infrastructure
+  nothing else calls, rather than recording its output and deleting it.
+
+**Production considerations.** A *low* hit rate in production logs would
+mean one of a few things worth investigating in order: TTLs set too short
+for actual traffic patterns (unlikely here given 300s for the common
+case), traffic spread across a very large number of distinct, rarely
+repeated short codes (a link-sharing pattern where most links get one or
+two clicks total, in which case caching has genuinely limited headroom no
+matter the TTL), or — worth checking first, since it's cheap to rule
+out — Redis itself intermittently failing and silently falling back to
+Postgres on every request (see "Graceful degradation" above), which would
+look like a low hit rate but is actually an outage that needs fixing, not
+a caching-strategy problem.
+
+**Interview answer.** I measured cold-vs-warm latency locally the same
+way Phase 7 measured `recordClick` — an isolated, throwaway benchmark, 300
+iterations after warmup, median latency — and got about 0.57ms cold versus
+0.17ms warm, roughly a 3.4x improvement. But I called that number out as
+an underestimate of the real-world benefit: the local Postgres lookup
+here is already an indexed single-row read over loopback, about as cheap
+as that operation gets, so the comparison is stacked against caching
+looking impressive. Against a network-attached production database, the
+Postgres side gets meaningfully slower while the Redis side stays roughly
+as cheap, so the relative benefit should grow, not shrink. For hit rate in
+production, I didn't add a metrics library — every cache lookup logs a
+consistent, structured debug line, so hit rate is derivable from log
+aggregation alone, and a low hit rate would point me first at whether
+Redis itself is silently failing before I'd assume it's a TTL-tuning
+problem.

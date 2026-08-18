@@ -1,6 +1,8 @@
 import { DatabaseError } from 'pg';
 import { query } from '../db/pool.js';
 import { conflict, internal } from '../lib/errors.js';
+import { logger } from '../lib/logger.js';
+import { redis } from '../lib/redis.js';
 import { generateShortCode } from '../lib/shortCode.js';
 import { hashPassword } from './passwordService.js';
 
@@ -150,6 +152,14 @@ export async function createLink(userId: string, input: CreateLinkInput): Promis
     if (!row) {
       throw conflict('This alias is already taken');
     }
+    // Closes a narrow window the negative cache would otherwise leave open:
+    // if someone probed this exact alias (e.g. to check availability) right
+    // before it was claimed here, getLinkByShortCode would have cached a
+    // miss for it — without this, the new link would 404 until that
+    // negative entry's TTL expires. Not needed on the generated-code path
+    // below: a fresh random code being pre-probed in that same window isn't
+    // realistic given 62^7 possible codes.
+    await invalidateLinkCache(input.customAlias);
     return toLink(row);
   }
 
@@ -281,7 +291,15 @@ export async function updateLink(
     values,
   );
   const row = result.rows[0];
-  return row ? toLink(row) : null;
+  if (!row) return null;
+
+  // Invalidate AFTER the write commits, never before — see
+  // invalidateLinkCache's doc comment for the race this ordering avoids.
+  // Unconditional (not branched on maxClicks): a DEL against a short code
+  // that was never cached (a capped link, or one edited before its first
+  // redirect) is a harmless no-op.
+  await invalidateLinkCache(row.short_code);
+  return toLink(row);
 }
 
 /**
@@ -297,6 +315,131 @@ export async function updateLink(
 const REDIRECT_LOOKUP_COLUMNS = `
   id, destination_url, password_hash, expires_at, max_clicks, click_count, is_active
 `;
+
+// Cache-aside over getLinkByShortCode, the redirect route's hot-path lookup.
+// Keyed `link:<shortCode>`, matching oauthState.ts's `oauth:state:<state>`
+// prefix convention. Kept colocated with the one function it caches rather
+// than pulled into its own module — nothing else in the codebase needs it.
+const LINK_CACHE_PREFIX = 'link:';
+
+// 5 minutes for links with no click cap. Long enough to meaningfully
+// absorb a burst of repeat clicks (e.g. a link shared in a group chat),
+// short enough that if explicit invalidation is ever missed (a bug, a
+// direct DB write, Redis unavailable at edit time), staleness self-heals
+// within minutes rather than lingering indefinitely.
+const LINK_CACHE_TTL_SECONDS = 300;
+
+// Much shorter for links WITH a click cap (maxClicks !== null). recordClick
+// never touches Redis (touching it on every single click would defeat the
+// point of caching the read path), so a cached link's click_count is
+// frozen for the life of its TTL — this bounds how far a capped link can
+// overshoot its limit to "however many clicks arrive in 5 seconds," not
+// "however many arrive in 5 minutes." See Notes.md, "Phase 8: Caching the
+// Redirect Path" / "The click_count problem" for the full comparison
+// against never caching capped links at all (which trades away caching
+// benefit on exactly the links most likely to be hot) and what would flip
+// this decision (click_count acquiring billing/legal significance).
+const LINK_CACHE_CAPPED_TTL_SECONDS = 5;
+
+// Shorter than the positive TTL: bounds how long a short code that was
+// probed just before being claimed as a custom alias stays invisible to
+// the redirect route. createLink's custom-alias branch also explicitly
+// invalidates on a successful insert, so this TTL is the fallback for the
+// (much less likely) generated-code case, not the primary mechanism.
+const LINK_CACHE_NEGATIVE_TTL_SECONDS = 30;
+
+// Distinguishes "this short code is known not to resolve" from "absent
+// from the cache" using a single GET, rather than a second key/round trip.
+const LINK_CACHE_MISS_SENTINEL = '__MISS__';
+
+function linkCacheKey(shortCode: string): string {
+  return `${LINK_CACHE_PREFIX}${shortCode}`;
+}
+
+/**
+ * Every Redis operation below is wrapped so a failure logs and falls
+ * through to Postgres — never throws, never fails the request. A cache
+ * that hard-fails on a Redis outage would make the system LESS reliable
+ * than having no cache at all, which is unacceptable on the redirect path.
+ * This is a deliberate divergence from oauthState.ts, which lets Redis
+ * errors propagate — that's correct there (a failed state store/consume
+ * should fail the OAuth flow, not silently no-op), but wrong here, where
+ * Redis is purely a performance optimization over a Postgres lookup that
+ * already works on its own.
+ */
+async function getCachedLink(
+  shortCode: string,
+): Promise<{ found: false } | { found: true; link: RedirectLink | null }> {
+  try {
+    const raw = await redis.get(linkCacheKey(shortCode));
+    if (raw === null) {
+      logger.debug({ shortCode, cache: 'miss' }, 'Link cache lookup');
+      return { found: false };
+    }
+    if (raw === LINK_CACHE_MISS_SENTINEL) {
+      logger.debug({ shortCode, cache: 'negative-hit' }, 'Link cache lookup');
+      return { found: true, link: null };
+    }
+    logger.debug({ shortCode, cache: 'hit' }, 'Link cache lookup');
+    return { found: true, link: deserializeRedirectLink(raw) };
+  } catch (err) {
+    logger.error({ err, shortCode }, 'Redis GET failed for link cache; falling back to Postgres');
+    return { found: false };
+  }
+}
+
+// JSON.stringify(link) round-trips every RedirectLink field cleanly except
+// expiresAt, which comes back as an ISO string rather than a Date —
+// deadStateError in src/routes/redirect.ts calls .getTime() on it
+// directly, so it must be reconstructed here.
+function deserializeRedirectLink(raw: string): RedirectLink {
+  const parsed = JSON.parse(raw) as Omit<RedirectLink, 'expiresAt'> & { expiresAt: string | null };
+  return { ...parsed, expiresAt: parsed.expiresAt === null ? null : new Date(parsed.expiresAt) };
+}
+
+async function setCachedLink(shortCode: string, link: RedirectLink, ttlSeconds: number): Promise<void> {
+  try {
+    await redis.set(linkCacheKey(shortCode), JSON.stringify(link), 'EX', ttlSeconds);
+  } catch (err) {
+    logger.error({ err, shortCode }, 'Redis SET failed for link cache; continuing without caching this lookup');
+  }
+}
+
+async function setCachedMiss(shortCode: string): Promise<void> {
+  try {
+    await redis.set(linkCacheKey(shortCode), LINK_CACHE_MISS_SENTINEL, 'EX', LINK_CACHE_NEGATIVE_TTL_SECONDS);
+  } catch (err) {
+    logger.error(
+      { err, shortCode },
+      'Redis SET failed for negative link cache; continuing without caching this lookup',
+    );
+  }
+}
+
+/**
+ * Called after a link's row changes (update, delete, or a custom alias
+ * being claimed) so the next redirect lookup sees fresh data immediately
+ * rather than waiting out the TTL. Callers invoke this AFTER the
+ * corresponding database write commits, never before — deleting the cache
+ * entry first would leave a window where a concurrent read repopulates the
+ * cache with the stale pre-write value, and nothing would ever invalidate
+ * that again until its own TTL expired. Invalidating after the write bounds
+ * the same race to a single stale read that self-heals on the very next
+ * request once this DEL completes.
+ */
+async function invalidateLinkCache(shortCode: string): Promise<void> {
+  try {
+    await redis.del(linkCacheKey(shortCode));
+  } catch (err) {
+    // Must not fail the caller's request — but does mean a stale entry can
+    // persist for up to its full TTL. That TTL is exactly the safety net
+    // for this case.
+    logger.error(
+      { err, shortCode },
+      'Redis DEL failed while invalidating link cache; stale entry may persist until TTL expiry',
+    );
+  }
+}
 
 export interface RedirectLink {
   id: string;
@@ -343,18 +486,39 @@ function toRedirectLink(row: RedirectLinkRow): RedirectLink {
  * response body.
  */
 export async function getLinkByShortCode(shortCode: string): Promise<RedirectLink | null> {
+  const cached = await getCachedLink(shortCode);
+  if (cached.found) {
+    return cached.link;
+  }
+
   const result = await query<RedirectLinkRow>(
     `SELECT ${REDIRECT_LOOKUP_COLUMNS} FROM links WHERE short_code = $1`,
     [shortCode],
   );
   const row = result.rows[0];
-  return row ? toRedirectLink(row) : null;
+  const link = row ? toRedirectLink(row) : null;
+
+  if (link === null) {
+    await setCachedMiss(shortCode);
+  } else {
+    const ttl = link.maxClicks === null ? LINK_CACHE_TTL_SECONDS : LINK_CACHE_CAPPED_TTL_SECONDS;
+    await setCachedLink(shortCode, link, ttl);
+  }
+
+  return link;
 }
 
 export async function deleteLink(userId: string, linkId: string): Promise<boolean> {
-  const result = await query('DELETE FROM links WHERE id = $1 AND user_id = $2 RETURNING id', [
-    linkId,
-    userId,
-  ]);
-  return result.rows.length > 0;
+  // short_code is selected here purely to invalidate the right cache key —
+  // it's never returned to the caller, so this function's public
+  // Promise<boolean> contract is unchanged.
+  const result = await query<{ id: string; short_code: string }>(
+    'DELETE FROM links WHERE id = $1 AND user_id = $2 RETURNING id, short_code',
+    [linkId, userId],
+  );
+  const row = result.rows[0];
+  if (!row) return false;
+
+  await invalidateLinkCache(row.short_code);
+  return true;
 }
