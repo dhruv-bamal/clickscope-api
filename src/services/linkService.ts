@@ -188,7 +188,10 @@ export interface ListLinksResult {
  * link belonging to another user, because no query here is ever built
  * without that clause.
  */
-export async function listLinks(userId: string, options: ListLinksOptions): Promise<ListLinksResult> {
+export async function listLinks(
+  userId: string,
+  options: ListLinksOptions,
+): Promise<ListLinksResult> {
   const [rowsResult, countResult] = await Promise.all([
     query<LinkRow>(
       `SELECT ${LINK_COLUMNS} FROM links
@@ -197,7 +200,9 @@ export async function listLinks(userId: string, options: ListLinksOptions): Prom
        LIMIT $2 OFFSET $3`,
       [userId, options.limit, options.offset],
     ),
-    query<{ count: number }>('SELECT count(*)::int AS count FROM links WHERE user_id = $1', [userId]),
+    query<{ count: number }>('SELECT count(*)::int AS count FROM links WHERE user_id = $1', [
+      userId,
+    ]),
   ]);
 
   return {
@@ -329,16 +334,22 @@ const LINK_CACHE_PREFIX = 'link:';
 // within minutes rather than lingering indefinitely.
 const LINK_CACHE_TTL_SECONDS = 300;
 
-// Much shorter for links WITH a click cap (maxClicks !== null). recordClick
-// never touches Redis (touching it on every single click would defeat the
-// point of caching the read path), so a cached link's click_count is
-// frozen for the life of its TTL — this bounds how far a capped link can
-// overshoot its limit to "however many clicks arrive in 5 seconds," not
-// "however many arrive in 5 minutes." See Notes.md, "Phase 8: Caching the
-// Redirect Path" / "The click_count problem" for the full comparison
-// against never caching capped links at all (which trades away caching
-// benefit on exactly the links most likely to be hot) and what would flip
-// this decision (click_count acquiring billing/legal significance).
+// Much shorter for links WITH a click cap (maxClicks !== null). Nothing on
+// the click-write path touches this cache (touching it on every single
+// click would defeat the point of caching the read path), so a cached
+// link's click_count is frozen for the life of its TTL — this bounds how
+// far a capped link can overshoot its limit to "however many clicks arrive
+// in 5 seconds," not "however many arrive in 5 minutes." See Notes.md,
+// "Phase 8: Caching the Redirect Path" / "The click_count problem" for the
+// full comparison against never caching capped links at all (which trades
+// away caching benefit on exactly the links most likely to be hot) and
+// what would flip this decision (click_count acquiring billing/legal
+// significance). Since Phase 9, click_count is written by the worker/
+// process asynchronously, not synchronously on the request that reads this
+// cache — this TTL still bounds cache staleness exactly as before, but
+// it's no longer the only lag source; see Notes.md, "Phase 9: Background
+// Jobs" / "click_count's new worst-case overshoot" for the second,
+// queue-processing-lag term that now compounds with it.
 const LINK_CACHE_CAPPED_TTL_SECONDS = 5;
 
 // Shorter than the positive TTL: bounds how long a short code that was
@@ -397,17 +408,29 @@ function deserializeRedirectLink(raw: string): RedirectLink {
   return { ...parsed, expiresAt: parsed.expiresAt === null ? null : new Date(parsed.expiresAt) };
 }
 
-async function setCachedLink(shortCode: string, link: RedirectLink, ttlSeconds: number): Promise<void> {
+async function setCachedLink(
+  shortCode: string,
+  link: RedirectLink,
+  ttlSeconds: number,
+): Promise<void> {
   try {
     await redis.set(linkCacheKey(shortCode), JSON.stringify(link), 'EX', ttlSeconds);
   } catch (err) {
-    logger.error({ err, shortCode }, 'Redis SET failed for link cache; continuing without caching this lookup');
+    logger.error(
+      { err, shortCode },
+      'Redis SET failed for link cache; continuing without caching this lookup',
+    );
   }
 }
 
 async function setCachedMiss(shortCode: string): Promise<void> {
   try {
-    await redis.set(linkCacheKey(shortCode), LINK_CACHE_MISS_SENTINEL, 'EX', LINK_CACHE_NEGATIVE_TTL_SECONDS);
+    await redis.set(
+      linkCacheKey(shortCode),
+      LINK_CACHE_MISS_SENTINEL,
+      'EX',
+      LINK_CACHE_NEGATIVE_TTL_SECONDS,
+    );
   } catch (err) {
     logger.error(
       { err, shortCode },

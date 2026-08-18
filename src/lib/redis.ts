@@ -3,10 +3,17 @@ import { config } from '../config/index.js';
 import { logger } from './logger.js';
 
 /**
- * Shared Redis client. Connection only in this phase — no caching logic,
- * that's Phase 8. BullMQ (the future worker/ process) requires ioredis
- * specifically, so this is also the client that phase will reuse rather
- * than introducing a second Redis library.
+ * Shared Redis client, used for cache-aside link lookups (Phase 8).
+ *
+ * ioredis is also the library BullMQ's `Queue`/`Worker` classes require
+ * (Phase 9's worker/ process and src/queues/) — but this specific client
+ * *instance* is never reused for either. Its `maxRetriesPerRequest: 1`
+ * setting is incompatible with BullMQ's `Worker`, which throws at
+ * construction unless its connection's `maxRetriesPerRequest` is exactly
+ * `null`. Even for a `Queue` (which has no such hard requirement), a
+ * dedicated connection avoids coupling this client's shutdown/retry
+ * semantics to BullMQ's — see src/queues/connection.ts and Notes.md,
+ * "Phase 9: Background Jobs" for the full reasoning.
  *
  * `lazyConnect: true` is deliberate and non-default: ioredis normally
  * opens a real TCP connection the moment `new Redis(...)` runs. Without

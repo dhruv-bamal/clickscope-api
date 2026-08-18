@@ -12,6 +12,10 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "start:local": "node --env-file=.env dist/server.js",
+    "worker:dev": "tsx watch --env-file=.env worker/index.ts",
+    "worker:build": "tsc -p worker/tsconfig.json",
+    "worker:start": "node dist/worker/index.js",
+    "worker:start:local": "node --env-file=.env dist/worker/index.js",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
@@ -25,6 +29,7 @@
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
+    "bullmq": "^6.1.2",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "google-auth-library": "^11.0.2",

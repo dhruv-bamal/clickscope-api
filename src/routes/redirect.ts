@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
 import { config } from '../config/index.js';
@@ -5,7 +6,7 @@ import { readCookie } from '../lib/cookies.js';
 import { type AppError, gone, notFound } from '../lib/errors.js';
 import { MAX_ALIAS_LENGTH } from '../lib/shortCode.js';
 import { validateBody, validateParams } from '../middleware/validate.js';
-import { recordClick } from '../services/clickService.js';
+import { enqueueClick } from '../queues/clickQueue.js';
 import { getLinkByShortCode, type RedirectLink } from '../services/linkService.js';
 import { verifyPassword } from '../services/passwordService.js';
 import { signUnlockToken, verifyUnlockToken } from '../services/unlockTokenService.js';
@@ -73,7 +74,8 @@ function renderInterstitial(shortCode: string, errorMessage?: string): string {
  */
 function deadStateError(link: RedirectLink): AppError | null {
   if (!link.isActive) return gone('This link has been deactivated');
-  if (link.expiresAt && link.expiresAt.getTime() <= Date.now()) return gone('This link has expired');
+  if (link.expiresAt && link.expiresAt.getTime() <= Date.now())
+    return gone('This link has expired');
   if (link.maxClicks !== null && link.clickCount >= link.maxClicks) {
     return gone('This link has reached its click limit');
   }
@@ -97,18 +99,40 @@ redirectRouter.get('/:shortCode', validateParams(shortCodeParamSchema), async (r
     }
   }
 
-  // Deliberately synchronous and timed separately from requestContext's
-  // whole-request logging — this isolates the DB-write cost specifically,
-  // which is the number Phase 10's queue will be measured against. See
-  // Notes.md, "Synchronous side effects on a latency-critical path."
+  // Click recording no longer happens on this path — Phase 9 moved it onto
+  // a BullMQ queue, processed by the separate worker/ process. Enqueuing
+  // replaces the synchronous write Phase 7 timed here; what's measured now
+  // is enqueue cost, not write cost. See Notes.md, "Phase 9: Background
+  // Jobs" and "Phase 7: The Public Redirect" / "Synchronous side effects on
+  // a latency-critical path" for the before/after comparison.
+  //
+  // clickId is generated here, once, and reused as both the BullMQ jobId
+  // and the clicks.job_id unique-constraint value the worker inserts with
+  // — this is the identifier the whole idempotency design keys on. A
+  // failure to enqueue is logged and swallowed, never rethrown: the
+  // redirect's job is getting this visitor to destinationUrl, and a lost
+  // click is a bounded, self-contained failure, whereas failing the
+  // redirect over a Redis blip would turn that blip into a link-shortener-
+  // wide outage. See Notes.md, "Phase 9: Background Jobs" for the full
+  // "accelerant" framing.
+  const clickId = randomUUID();
   const start = process.hrtime.bigint();
-  await recordClick({
-    linkId: link.id,
-    referrer: req.header('referer') ?? null,
-    userAgent: req.header('user-agent') ?? null,
-  });
-  const durationMs = Number(process.hrtime.bigint() - start) / 1e6;
-  req.log.info({ linkId: link.id, durationMs }, 'Click recorded');
+  try {
+    await enqueueClick({
+      clickId,
+      linkId: link.id,
+      shortCode,
+      referrer: req.header('referer') ?? null,
+      userAgent: req.header('user-agent') ?? null,
+    });
+    const durationMs = Number(process.hrtime.bigint() - start) / 1e6;
+    req.log.info({ linkId: link.id, clickId, durationMs }, 'Click enqueued');
+  } catch (err) {
+    req.log.error(
+      { err, linkId: link.id, shortCode },
+      'Failed to enqueue click; redirecting anyway',
+    );
+  }
 
   // 302, never 301 — see Notes.md, "301 vs 302 vs 307/308." A 301 would be
   // cached by the browser essentially forever; every later click for that

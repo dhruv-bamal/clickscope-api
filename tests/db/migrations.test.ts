@@ -51,7 +51,7 @@ describe('migrations', () => {
       dir: 'migrations',
       migrationsTable: 'pgmigrations',
       direction: 'down',
-      count: 3,
+      count: 4,
     });
 
     const client = new Client({ connectionString: databaseUrl });

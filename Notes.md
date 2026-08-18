@@ -2644,8 +2644,13 @@ client and `checkRedisHealth()`; `src/db/pool.ts` for the analogous
 `ioredis` was chosen here for connection-only health checking rather
 than a different, perhaps simpler, client: it's the one client this
 codebase will need again regardless, so introducing it now means the
-worker phase reuses this exact client rather than adding a second Redis
-library to the dependency tree later.
+worker phase reuses this exact *library* rather than adding a second
+Redis client to the dependency tree later. (Phase 9, once it arrives,
+turns out to *not* reuse this exact client *instance* for BullMQ —
+`maxRetriesPerRequest: 1` here is incompatible with BullMQ's `Worker`,
+which requires `maxRetriesPerRequest: null`. See Notes.md, "Phase 9:
+Background Jobs" for the dedicated-connection reasoning; the shared
+library choice made here still stands.)
 
 **Interview answer.** `ioredis` connects eagerly by default — opening a
 real socket the moment the client is constructed — which is the
@@ -5905,7 +5910,7 @@ pure read: `deadStateError` computes a boolean from data already fetched
 by `getLinkByShortCode` and either throws or doesn't — no write happens
 as a side effect of discovering expiry. This is a deliberate scope
 boundary for Phase 7 (per the task brief driving this phase): "lazy
-expiry only... Phase 10 adds the sweep."
+expiry only... Phase 9 adds the sweep."
 
 **Where it lives in the codebase.** `src/routes/redirect.ts`
 (`deadStateError`'s read-only checks).
@@ -5928,7 +5933,7 @@ expiry only... Phase 10 adds the sweep."
 that expire things at scale (session stores, cache entries, this table
 eventually) tend to run both mechanisms together: lazy expiry gives
 immediate, per-request correctness with zero extra infrastructure;
-scheduled expiry (a sweep job, Phase 10 here) reclaims storage and index
+scheduled expiry (a sweep job, Phase 9 here) reclaims storage and index
 space from rows nobody's requesting, and stops every future read from
 repeatedly re-evaluating a row that's provably, permanently dead. Running
 only one leaves either a correctness gap (scheduled-only, between sweeps)
@@ -5937,7 +5942,7 @@ or a storage/cost gap (lazy-only, forever) that the other closes.
 **Interview answer.** This phase only implements lazy expiry: `is_active`,
 `expires_at`, and `click_count` vs. `max_clicks` are checked at read
 time, and an expired row is never written to or deleted as a result —
-that's Phase 10's sweep job. Lazy expiry alone gives immediate,
+that's Phase 9's sweep job. Lazy expiry alone gives immediate,
 per-request correctness for free, but leaves expired rows accumulating
 in the table forever since nothing proactively cleans them up; a
 scheduled sweep alone would leave a correctness gap between runs. That's
@@ -6227,17 +6232,17 @@ immediately without waiting.
 
 **Why it exists in this project — deliberately, for now.** This phase
 keeps click recording synchronous on purpose, specifically so its real
-cost can be measured before Phase 10 moves it onto a queue (BullMQ,
-already a project dependency for the worker process). Optimizing before
-measuring would mean never actually knowing whether the queue made a
-meaningful difference.
+cost can be measured before Phase 9 moves it onto a queue (BullMQ,
+added as a dependency in that phase). Optimizing before measuring would
+mean never actually knowing whether the queue made a meaningful
+difference.
 
 **How it works mechanically, and what the measurement showed.**
 `src/routes/redirect.ts`'s `GET /:shortCode` handler times the
 `recordClick` call specifically (`process.hrtime.bigint()` before/after,
 logged via `req.log.info({ durationMs }, 'Click recorded')`) — separate
 from `requestContext.ts`'s whole-request timing, because isolating the
-DB-write cost specifically is what Phase 10's comparison actually needs,
+DB-write cost specifically is what Phase 9's comparison actually needs,
 not overall request latency (which also includes routing, cookie
 parsing, and the link lookup).
 
@@ -6266,8 +6271,8 @@ were physically mid-flight at the exact instant of a crash (over-counting
 isn't possible, since an `UPDATE` never fires without its `INSERT`
 already having committed). That's a narrow, self-limiting, low-severity
 risk — a rare crash causing a rare, small, one-directional undercount of
-a display counter with no reconciliation job to matter to even in Phase
-10 — traded against a consistent ~50% latency tax on the single hottest
+a display counter with no reconciliation job to matter to even in Phase 9
+— traded against a consistent ~50% latency tax on the single hottest
 path in the entire system, which locally is sub-millisecond but would
 scale with real network round-trip time to a production database, not
 shrink.
@@ -6310,7 +6315,7 @@ transactional version is a known, already-benchmarked option to fall
 back to, at a known, already-measured cost.
 
 **Interview answer.** I kept click recording synchronous this phase
-specifically to measure its real cost before Phase 10 moves it to a
+specifically to measure its real cost before Phase 9 moves it to a
 queue — a representative synchronous redirect, including the click
 write, ran in the single-digit milliseconds locally, with the write
 itself the dominant cost. I also benchmarked wrapping the two writes
@@ -7138,3 +7143,1447 @@ consistent, structured debug line, so hit rate is derivable from log
 aggregation alone, and a low hit rate would point me first at whether
 Redis itself is silently failing before I'd assume it's a TTL-tuning
 problem.
+
+---
+
+## Phase 9: Background Jobs
+
+### Queues vs. fire-and-forget: durability, retries, backpressure
+
+**What it is.** A job queue is durable, ordered (per-queue) storage for
+units of work, decoupled from whoever produces them and whoever consumes
+them — the opposite of an unawaited promise (`recordClick(...)` fired
+without `await` and forgotten), which is just a background task with no
+storage, no retry, and no record it ever existed once it starts running.
+
+**Why it exists in this project.** Phase 7 kept click recording
+synchronous specifically to measure its real cost before this phase moved
+it off the request path — the measurement (see "Measuring the redirect
+path" below) confirmed there was real latency to reclaim, but reclaiming
+it was never the main argument for a queue. An unawaited `recordClick(...)`
+would reclaim the same latency with three concrete costs a queue doesn't
+have:
+
+1. **Durability.** An unawaited promise's only record of existing is the
+   in-memory call stack of the process running it. A crash, a redeploy, or
+   an unhandled rejection between "fired" and "written" loses the click
+   silently — nothing persisted it anywhere first. A BullMQ job is written
+   to Redis *before* anything attempts to process it; a crash after that
+   point loses nothing, because the job is still sitting in Redis for
+   whichever worker comes back online to pick up.
+2. **Retries.** An unawaited promise that throws just throws — into an
+   `unhandledRejection` handler if one exists, or crashes the process if
+   not. There's no built-in notion of "try again," let alone "try again
+   with backoff." A transient Postgres blip (a restart, a brief
+   connection-pool exhaustion) permanently loses every click that happened
+   to land in that window. BullMQ retries a failed job automatically, per
+   its configured `attempts`/`backoff` (see "Retries, backoff, and job
+   retention" below).
+3. **Backpressure.** Nothing bounds how many unawaited promises can be
+   in flight at once — under a traffic spike, or a slow Postgres, the
+   number of concurrently-running `recordClick` calls grows with request
+   volume, each holding its own connection attempt, with no visibility
+   into how far behind the system has fallen until something falls over
+   (connection pool exhaustion, memory pressure from accumulated promises).
+   A queue makes the backlog a first-class, inspectable number — *queue
+   depth* (see "Observability" below) — and the worker's own bounded
+   concurrency (see "Bounded concurrency" below) means a traffic spike
+   grows the queue, not the number of concurrent Postgres connections the
+   worker attempts to open.
+
+**How it works mechanically.** The redirect enqueues a job
+(`enqueueClick`, `src/queues/clickQueue.ts`) instead of writing directly;
+a separate `worker/` process consumes it (`worker/index.ts`), running
+`processClickJob` (`worker/processors/clickProcessor.ts`) against its own
+Postgres connection. Producer and consumer never call each other directly
+— they communicate only through Redis, via BullMQ's `Queue`/`Worker`
+primitives.
+
+**Where it lives in the codebase.** `src/queues/clickQueue.ts`
+(`enqueueClick`); `src/routes/redirect.ts` (the call site);
+`worker/processors/clickProcessor.ts` (`processClickJob`); `worker/
+index.ts` (wires the `Worker` that calls it).
+
+**Common pitfalls.**
+
+- Reaching for a queue by default for *any* background work, without
+  asking whether the three properties above actually matter for this
+  specific task — a queue is real infrastructure (Redis as a dependency,
+  a second deployable, retry/idempotency design work) and isn't free just
+  because "async is good."
+- Assuming an unawaited promise and a queue job are interchangeable
+  because both "run later" — they differ specifically in what survives a
+  crash, not in when the work happens.
+
+**Production considerations.** At higher traffic, the backpressure
+property becomes the most operationally important of the three: a
+transient click-volume spike (a link goes viral) grows queue depth, a
+visible, alertable number, rather than silently degrading redirect
+latency or exhausting the API process's own resources — the redirect
+path stays fast and isolated from however far behind click-processing has
+fallen.
+
+**Interview answer.** I moved click recording off the request path onto a
+BullMQ queue rather than just firing an unawaited promise, for three
+specific reasons: durability (a job persists in Redis before anything
+tries to process it, so a crash mid-processing doesn't lose it — an
+unawaited promise has no such record), retries (BullMQ retries a failed
+job with backoff automatically; a bare unawaited call just throws into the
+void on a transient Postgres blip), and backpressure (queue depth is a
+real, inspectable number that grows under load instead of silently
+piling up in-process memory or connection attempts). The latency
+reclaimed by moving the write off the request path was real but
+secondary — I'd measured it was worth reclaiming, but durability and
+retries are the actual reasons a queue, not just an unawaited call.
+
+---
+
+### How BullMQ uses Redis, and why a naive queue is unsafe
+
+**What it is.** Each BullMQ queue (`click-recording`, `link-cleanup`) is
+backed by several Redis data structures, all under keys namespaced by the
+queue name: a List for jobs waiting to be picked up (`wait`), a Set for
+jobs currently locked by a worker (`active`, each job's data in its own
+Hash), a Sorted Set for delayed jobs — scored by the timestamp they become
+eligible, which is also what backs both retry backoff delays and
+repeatable-job scheduling (`delayed`) — and further Sets/Lists for
+`completed`/`failed`.
+
+**Why it exists in this project.** This is what makes at-least-once
+delivery and crash recovery possible at all, which is the entire point of
+choosing a queue over an unawaited promise (see previous section).
+
+**How it works mechanically.** Moving a job between states — e.g. `wait`
+→ `active` when a worker picks it up — happens via a single Lua script
+executed atomically on the Redis server. The job's ID is never observable
+as "removed from `wait`" without simultaneously being "added to `active`
+with a lock and a `lockDuration`," in the same atomic step. That single
+fact — which state is this job in, and who owns it — is what makes
+stalled-job recovery possible: if a worker crashes or GC-pauses past its
+lock's expiry without renewing it, BullMQ's stalled-job checker can
+detect the orphaned `active` entry and safely move it back to `wait` for
+another attempt, because there's exactly one consistent record of the
+job's state, never two independently-updatable structures that could
+drift apart.
+
+A naive homemade queue — `LPUSH` to add a job, `BRPOP` to consume one, off
+a single plain Redis list — has none of this. `BRPOP` popping a job off
+the list *is* the only record that job ever existed; there's no separate
+"active" bookkeeping, no lock, nothing to expire or detect an orphan
+against. If the consumer process crashes between the `BRPOP` returning and
+the job's effects being durably applied, the job is simply gone — nothing
+recorded that it was ever picked up, so nothing can ever notice it needs
+retrying. This is exactly why a raw Redis list is unsafe as a job queue
+for anything that needs at-least-once delivery: it can silently drop work
+on any crash, with no failure signal at all.
+
+**Where it lives in the codebase.** Entirely inside the `bullmq` library
+— this project only calls `Queue.add`/`new Worker(...)` and never touches
+these Redis structures directly. `src/queues/clickQueue.ts`,
+`src/queues/linkCleanupQueue.ts`, `worker/index.ts`.
+
+**Common pitfalls.**
+
+- Building a "queue" out of `LPUSH`/`BRPOP` because it looks simple and
+  Redis is already a dependency — it's simple precisely because it skips
+  the atomic state-tracking that makes crash recovery possible.
+- Assuming a job's presence in Redis alone guarantees it'll be processed
+  — durability against a *producer* crash (the job was written before the
+  producer could fail) is different from safety against a *consumer*
+  crash mid-processing, which is what the atomic `wait`→`active`
+  transition and stalled-job detection specifically provide.
+
+**Production considerations.** The stalled-job checker's polling interval
+and lock duration are tunable (BullMQ defaults are sane for this
+project's scale and were left as-is — no deployment-config surface was
+added this phase); at much higher throughput or with much longer-running
+jobs, those defaults would be the first thing to revisit against real
+stalled-job frequency data, not speculatively.
+
+**Interview answer.** BullMQ backs each queue with a handful of Redis
+data structures — a list for waiting jobs, a set for active ones (each
+with a lock), a sorted set for delayed/scheduled ones, and sets for
+completed/failed — and moves a job between these states atomically via a
+single Lua script, so a job is never observably "removed from waiting"
+without simultaneously "added to active with a lock" in the same atomic
+step. That's what lets BullMQ detect a stalled job — one whose worker
+crashed or hung past its lock's expiry — and safely requeue it, because
+there's exactly one consistent record of state and ownership. A naive
+`LPUSH`/`BRPOP` queue has none of that: popping the job off the list is
+the only record it ever existed, so a consumer crash between popping and
+finishing the work loses the job with no trace and no way to detect it.
+
+---
+
+### Producer/consumer separation, and why a separate process
+
+**What it is.** `src/queues/` (the API process) only ever produces jobs;
+`worker/` (a separate process) only ever consumes them. Neither imports
+application logic from the other — the only file shared between them is
+`src/queues/contracts.ts`, the queue names and job payload shape.
+
+**Why it exists in this project.** Splitting cleanly along produce/consume
+lines is what makes "the worker is a separate deployable" (see "One repo,
+multiple deployables" below) actually true rather than aspirational —
+if `worker/` depended on `src/routes/` or vice versa, they couldn't be
+built, deployed, or scaled independently even if run as separate
+processes.
+
+**How it works mechanically.** `contracts.ts` is deliberately
+zero-dependency and side-effect-free: queue name constants and a
+`ClickJobData` interface, nothing else. It exists specifically so a typo
+in a hand-duplicated queue-name string (`'click-recording'` vs.
+`'clickRecording'`) is a compile error instead of two silently disjoint,
+empty queues — Redis just treats mismatched names as two unrelated key
+namespaces, with no error at all. Everything else the worker needs (its
+own config, logger, Postgres pool, Redis connection) is built fresh under
+`worker/`, not imported from `src/`.
+
+**Why a separate OS process, not a thread or an in-process poller.**
+
+- A `setInterval`-based poller sharing the API's event loop would compete
+  for the same single thread as every HTTP request — a slow or blocked
+  click-processing tick adds latency to concurrent requests, and vice
+  versa, exactly the coupling Phase 7's synchronous-recording decision was
+  trying to *measure*, not accept permanently.
+- A Node `worker_thread` shares the process's memory and crash domain —
+  an unhandled error or a runaway job could take the HTTP server down
+  with it, and it still shares the process's resource limits (one event
+  loop budget, one memory ceiling), so it can't be scaled or restarted
+  independently of the API.
+- A separate OS process gets independent crash isolation (a worker crash
+  never takes the API down and vice versa), independent scaling (add
+  worker replicas without touching API replica count), independent deploy
+  cadence, and its own resource budget — its own Postgres pool `max`
+  (`worker/db/pool.ts`), its own memory ceiling. This is exactly what
+  `src/db/pool.ts`'s own `max: 10` comment already assumed, since before
+  this phase: "10 leaves headroom for ... the separate worker process's
+  own pool."
+
+**Where it lives in the codebase.** `src/queues/` (producer),
+`worker/` (consumer), `src/queues/contracts.ts` (the shared contract).
+
+**Common pitfalls.**
+
+- Letting the worker import from `src/services/` or `src/routes/` "just
+  this once" for convenience — every such import re-couples a deployable
+  that's supposed to be independent, and the coupling is easy to add and
+  easy to forget was added.
+- Assuming a queue alone gives process isolation — it's the *separate
+  process* that gives crash/resource isolation; the queue is what lets two
+  isolated processes communicate without directly depending on each
+  other.
+
+**Production considerations.** This split is what makes it possible to
+run zero, one, or many worker replicas independently of API replica
+count later, without touching the API's deployment at all — not exercised
+in this phase (no deployment configuration was added), but the
+producer/consumer boundary is what makes it possible when it's needed.
+
+**Interview answer.** The worker is a separate OS process, not a thread or
+an in-process poller, for isolation on three axes: crash isolation (a bug
+in job processing can't take the HTTP server down), resource isolation
+(it gets its own Postgres pool and memory budget, sized independently),
+and deploy/scale isolation (it can be redeployed or scaled without
+touching the API). To make that isolation real rather than aspirational,
+`worker/` shares almost nothing with `src/` — just one small, dependency-
+free file defining the queue names and job payload shape, so a typo can't
+silently create two disconnected queues, but neither process can
+accidentally couple to the other's internals.
+
+---
+
+### The `maxRetriesPerRequest` conflict: why BullMQ gets its own connections
+
+**What it is.** Every BullMQ connection needs `maxRetriesPerRequest: null`
+— the shared `redis` client from `src/lib/redis.ts` sets
+`maxRetriesPerRequest: 1` instead, and BullMQ's `Worker` throws at
+construction if that isn't exactly `null`.
+
+**Why it exists in this project.** `Worker` issues blocking commands
+internally that must not race ioredis's own per-command retry logic —
+`maxRetriesPerRequest: 1` was a deliberate Phase 3 choice so the health
+check's `PING` fails fast rather than riding out ioredis's default retry
+budget, and that choice is incompatible with what `Worker` needs. This
+directly contradicted a claim Phase 3's own Notes.md made ahead of this
+phase actually arriving — "the worker phase reuses this exact client" —
+which turned out not to hold once BullMQ's actual requirements were in
+front of it; see the correction inline in "Phase 3: API Foundation" /
+"Why `ioredis`, not `node-redis`."
+
+**How it works mechanically.** Two new, dedicated connections, both built
+with `maxRetriesPerRequest: null`:
+
+- `src/queues/connection.ts` — `queueConnection`, used by the API
+  process's `Queue` instances (`clickQueue`, `linkCleanupQueue`). A
+  `Queue` has no hard requirement here (it issues no blocking commands),
+  but it's built the same way anyway, for two reasons: one consistent
+  mental model for "any BullMQ connection" rather than a `Queue`-only
+  exception to remember, and to avoid coupling this connection's shutdown
+  ordering to the unrelated `redis` singleton's (`src/server.ts`'s
+  shutdown calls `redis.quit()` unconditionally, with no knowledge a
+  `Queue` might have commands in flight — see "Worker graceful shutdown"
+  below for the analogous concern on the worker side).
+- `worker/redis.ts` — `workerRedis`, shared by every `Worker` instance in
+  the worker process (click processor, cleanup processor). Sharing one
+  connection across multiple `Worker`s *within the same process* is
+  explicitly fine per BullMQ's guidance — the concern that ruled out
+  reusing `src/lib/redis.ts`'s client was specifically about coupling
+  across the API's HTTP-lifecycle connection and BullMQ's requirements,
+  not about sharing within a single worker process.
+
+**Where it lives in the codebase.** `src/lib/redis.ts` (the original
+client, doc comment corrected to point here instead of claiming reuse);
+`src/queues/connection.ts`; `worker/redis.ts`.
+
+**Common pitfalls.**
+
+- Assuming "same library" (ioredis) means "same client instance is safe
+  to share" — the library choice and the connection's configured options
+  are two separate decisions, and BullMQ constrains the second one
+  specifically.
+- Discovering this the hard way at runtime (`Worker` throws at
+  construction) instead of reading BullMQ's connection requirements before
+  wiring it up — the failure is at least loud and immediate, not silent.
+
+**Production considerations.** None of this changes at scale — it's a
+correctness requirement of the library, not a tunable. What would change
+at scale is whether a single shared `workerRedis` connection remains
+sufficient once the worker runs many `Worker` instances with high
+concurrency each; BullMQ's own guidance on connection pooling per
+`Worker` would be the thing to revisit then, against real contention data.
+
+**Interview answer.** BullMQ's `Worker` requires its Redis connection to
+have `maxRetriesPerRequest: null` — it issues blocking commands
+internally that can't race ioredis's own retry logic — but the shared
+Redis client this codebase already had set `maxRetriesPerRequest: 1`
+deliberately, for a fast-failing health check. Rather than changing that
+client's settings (which would slow down the health check for an
+unrelated reason) or making one shared client serve two incompatible
+purposes, I gave the API's queue producers and the worker's consumers
+each their own dedicated connection, built specifically for BullMQ. That
+also avoided coupling BullMQ's shutdown ordering to the existing client's
+— closing a `Queue` correctly needs to happen before its connection
+quits, which the original shutdown code had no way to know about.
+
+---
+
+### Enqueue failures: why a lost click is acceptable but a failed redirect is not
+
+**What it is.** `enqueueClick` in `src/routes/redirect.ts` is wrapped in
+a try/catch that logs and swallows any error — enqueue failure never
+propagates to the centralized error middleware, and the redirect always
+proceeds to `res.redirect(302, ...)` regardless.
+
+**Why it exists in this project.** `src/services/linkService.ts`'s
+cache-aside Redis calls are all try/catch-wrapped and fall through to
+Postgres — Redis there is disposable "optional accelerant" over a system
+that already works without it. `src/lib/oauthState.ts` treats Redis as
+the actual source of truth for OAuth state, so its failures propagate —
+Redis there is load-bearing. The click queue sits with `linkService.ts`,
+not `oauthState.ts`, but for a slightly different reason than "it's a
+cache": it isn't caching anything, and a lost click is a genuinely lost
+write, not a stale read that self-heals. What makes it "accelerant"-
+classified anyway is that the thing it's an accelerant *for* is the
+redirect itself, not click accuracy — the redirect's job is getting the
+visitor to `destinationUrl`, and click recording is a side effect of
+that, not a precondition for it. Losing a click on a Redis outage is a
+bounded, self-contained failure (one click, one link, one outage window);
+failing the redirect on the same outage would turn a Redis blip into a
+link-shortener-wide outage, a categorically worse failure for a system
+whose entire purpose is "make this link work."
+
+**How it works mechanically.** `redirect.ts` generates `clickId` before
+calling `enqueueClick`, `await`s it inside a `try`, logs at `error` level
+with `linkId`/`shortCode` on failure (`req.log.error(...)`, not thrown),
+and always falls through to the same `res.redirect(302, ...)` call
+regardless of which branch ran. Nothing about the response — status,
+`Location` header — differs between the success and failure paths.
+
+**Where it lives in the codebase.** `src/routes/redirect.ts` (the
+try/catch around `enqueueClick`); `tests/routes/redirect.test.ts` ("an
+enqueue failure (e.g. Redis down) does not fail the redirect," mirroring
+the existing Redis-down tests for the link-lookup cache in the same
+file).
+
+**Common pitfalls.**
+
+- Letting an enqueue failure bubble up through the normal `AppError`
+  path "for consistency" — consistency with the rest of the error-
+  handling convention is the wrong goal here; the whole point is that this
+  one failure must never look like a request failure to the caller.
+- Forgetting to log the failure at all once it's swallowed — silently
+  eating an error is different from handling it; the log line is what
+  keeps a real Redis outage visible (see "Observability" below) even
+  though it never surfaces to a client.
+
+**Production considerations.** A sustained Redis outage means every click
+during that window is silently lost, with only server-side logs
+recording it — there is no retry or backlog for enqueue failures
+specifically (only *processing* failures get BullMQ's retry/backoff, once
+a job has actually been enqueued). This is the deliberate trade: an
+enqueue-retry-with-backoff scheme would either block the redirect while
+retrying (defeating the entire point) or need its own separate durable
+buffer to retry from later — which is just reinventing a second queue in
+front of the first one.
+
+**Interview answer.** A failure to enqueue a click is logged and
+swallowed, never allowed to fail the redirect — the redirect's job is
+getting the visitor to their destination, and click recording is a side
+effect of that, not a precondition. I classified this the same way this
+codebase already classifies its Redis cache (log and fall through, never
+fail the request) rather than the way it classifies OAuth state in Redis
+(a hard dependency whose failures propagate), even though a lost click
+isn't really a "cache miss" the way a lookup is — the reasoning that
+carries over is about what the failure is *for*: a Redis blip should cost
+this system one click, not the entire redirect path.
+
+---
+
+### Measuring the redirect path: before and after
+
+**What it is.** Two paired latency measurements, mirroring Phase 7 and
+Phase 8's exact methodology: `process.hrtime.bigint()`, 300 iterations
+after a 20-iteration warmup, median latency, via a throwaway script
+written once and deleted afterward — not kept as unused infrastructure,
+same precedent as `scripts/benchmarkLinkCache.ts` in Phase 8.
+
+**Why it exists in this project.** Optimizing before measuring means
+never actually knowing whether a change made a meaningful difference —
+the same principle that kept click recording synchronous in Phase 7 in
+the first place, specifically so this phase would have a real number to
+compare against rather than an assumption.
+
+**How it works mechanically, and what the measurement showed.** Rather
+than reusing Phase 8's backward-cited "~1.7ms end-to-end" figure as
+"before" (that number was a citation *in* Phase 8, not something Phase 7
+documented with its own iteration count/warmup — see Phase 7's own
+"Synchronous side effects" section), this phase re-measured both "before"
+and "after" freshly, under the same methodology, so the comparison is
+apples-to-apples rather than reusing an unaudited older number. "Before"
+was reconstructed by temporarily substituting the exact two-statement
+write `recordClick` used to run in place of the real `clickQueue.add`
+call, so the *same* route handler code path was exercised either way —
+only the click-recording primitive underneath it changed, which is
+exactly what this phase changed architecturally.
+
+| Measurement | Before (n=300) | After (n=300) |
+|---|---|---|
+| Isolated write vs. enqueue | **~0.517ms** | **~0.222ms** |
+| End-to-end `GET /:shortCode`, warm cache | **~0.989ms** | **~0.595ms** |
+
+The isolated-write number (~0.517ms) lines up closely with Phase 7's own
+original benchmark (~0.5ms), which is a useful sanity check that this
+measurement's methodology is comparable rather than an artifact of a
+different environment or approach. A single BullMQ `Queue.add` call —
+one Redis round trip writing a job's data plus a small amount of
+bookkeeping — costs roughly 2.3x less than two sequential Postgres
+statements (`INSERT`, then `UPDATE`) did, which tracks: it's replacing
+two network round trips to Postgres with one to Redis. The end-to-end
+number reflects a smaller relative improvement than the isolated number
+alone would suggest, because most of a warm-cache redirect's total cost
+is now the Phase 8 cache lookup and routing/middleware overhead, not the
+click-recording step — the write/enqueue step went from being the
+dominant cost on this path (Phase 7's framing) to a comparatively minor
+one.
+
+**Where it lives in the codebase.** The benchmark script was written,
+run, and deleted — the numbers above are the artifact, not the script,
+same as Phase 8's `benchmarkLinkCache.ts`.
+
+**Common pitfalls.**
+
+- Citing an old phase's number as "before" without re-measuring, when a
+  fresh, directly comparable number is cheap to produce — Phase 8 already
+  did this once (backward-citing Phase 7's ~1.7ms without its own
+  methodology), which is exactly what this phase avoided repeating.
+- Treating the isolated-primitive improvement (2.3x) and the end-to-end
+  improvement (about 1.7x) as the same number — they measure different
+  things, and conflating them overstates or understates what actually
+  changed for a real request.
+
+**Production considerations.** Both local numbers understate the real
+benefit for the same reason Phase 8's cache-latency numbers did: over
+loopback, Postgres's two round trips and Redis's one round trip are both
+close to their respective floors; against a network-attached production
+database and Redis instance, the *relative* gap should be expected to
+hold or grow, not shrink, since replacing two remote round trips with one
+scales favorably as round-trip time increases.
+
+**Interview answer.** I re-measured before-and-after rather than reusing
+an old cited number, using the same methodology Phase 7 and 8 already
+established — 300 iterations after warmup, median `hrtime` latency, via a
+throwaway script. The isolated click-recording step went from about
+0.52ms (two sequential Postgres writes) to about 0.22ms (one BullMQ
+enqueue call) — a 2.3x improvement that lines up with Phase 7's original
+number, which gave me confidence the comparison was apples-to-apples.
+End-to-end, a warm-cache redirect went from about 0.99ms to 0.6ms — a
+smaller relative improvement than the isolated number, because most of a
+warm redirect's cost is now the cache lookup and middleware, not click
+recording, which used to be the dominant cost on this path and now isn't.
+
+---
+
+### Bounded concurrency: worker pool size and BullMQ concurrency
+
+**What it is.** The worker's own `Pool` (`worker/db/pool.ts`) is sized
+`max: 10`; the click-processing `Worker`'s `concurrency` option
+(`worker/index.ts`) is set to `5`.
+
+**Why it exists in this project.** Unbounded concurrency in a worker
+means an unbounded number of simultaneous Postgres connection attempts
+under a backlog — exactly the resource-exhaustion risk backpressure
+(see "Queues vs. fire-and-forget" above) is supposed to prevent. Bounding
+it is what turns "queue depth grew" into a safe, visible signal instead
+of a cascading failure.
+
+**How it works mechanically.** Each concurrently-processing job holds one
+Postgres connection from the worker's own pool for the duration of its
+(now transactional — see "Reintroducing a transaction" below) writes.
+`concurrency: 5` against a pool of `max: 10` leaves comfortable headroom
+for the cleanup job's own connection use and any transient retry overlap,
+without needing to reason carefully about contention. `max: 10` for the
+worker's own pool mirrors the API pool's own sizing rationale
+(`src/db/pool.ts`'s comment), which had already earmarked exactly this —
+"10 leaves headroom for psql/other tooling and the separate worker
+process's own pool" — confirming the worker was always expected to have
+its own independent pool sized this way, not to share or extend the
+API's.
+
+**Where it lives in the codebase.** `worker/db/pool.ts` (`max: 10`);
+`worker/index.ts` (`CLICK_WORKER_CONCURRENCY = 5`).
+
+**Common pitfalls.**
+
+- Setting `concurrency` close to or above the pool's `max` — under any
+  real backlog, every concurrent job holding a connection would saturate
+  the pool with no headroom left for the cleanup job or transient retry
+  overlap, turning a processing backlog into a connection-exhaustion
+  failure instead of just a growing, visible queue.
+- Tuning either number from intuition rather than measurement — these are
+  starting points, matching this project's established "measure, don't
+  guess" posture (Phase 7/8), not tuned against real throughput data,
+  which doesn't exist yet at this project's stage.
+
+**Production considerations.** Given Phase 7's measured per-job write
+cost (roughly half a millisecond, and the queue-based version is cheaper
+still — see "Measuring the redirect path" above), 5 concurrent workers
+can process thousands of jobs per second in principle — far beyond any
+realistic click-through rate at this project's current stage. The number
+to revisit first at real scale is `concurrency`, guided by real queue-
+depth and Postgres-latency data, not `max` — the pool ceiling was already
+deliberately sized with this exact use in mind.
+
+**Interview answer.** I set the worker's `Pool` to `max: 10` and its
+`Worker` `concurrency` to `5`, leaving roughly half the pool as headroom
+for the cleanup job and any transient retry overlap, rather than sizing
+concurrency right up against the connection ceiling. Given each job is a
+cheap two-statement transaction, that's already far more throughput than
+this project's realistic click volume needs — these are deliberately
+starting points to revisit against real measured throughput and queue-
+depth data later, not numbers I tuned from intuition, matching how this
+project has approached every other performance decision so far.
+
+---
+
+### Idempotency: why a job can run twice, and what closes it
+
+**What it is.** At-least-once delivery — the guarantee a real queue
+provides instead of the strictly-weaker "probably delivered once" an
+unawaited promise gives — means a job can genuinely run more than once: a
+worker's lock expires mid-job (a crash, a GC pause past `lockDuration`)
+and BullMQ hands the job to another attempt while the original might
+still be finishing; a retry fires after what was actually a successful
+attempt whose acknowledgment was lost; a redeploy lands mid-processing.
+Running the click-write job twice, naively, means one real click gets
+counted as two.
+
+**Why it exists in this project.** The task brief asked for this
+analyzed properly, not hand-waved, so here are the four options actually
+weighed:
+
+- **(a) A deterministic BullMQ `jobId` alone.** Deduplicates repeated
+  *enqueue* attempts — `.add()` called twice with the same `jobId` is a
+  no-op while the original job's record still exists in Redis. It does
+  **not** protect against duplicate *processing* of a job that was only
+  ever enqueued once, which is the actual practical risk described above.
+  Necessary, not sufficient.
+- **(b) A natural key / unique constraint alone.** There's no natural key
+  for a click event to begin with — nothing about a click is inherently
+  deduplicable without first having a deterministic identifier attached to
+  it. Only meaningful combined with (a).
+- **(c) Accept double-counting as tolerable.** Rejected, and deliberately
+  not treated as equivalent to the small undercount risk Phase 7 already
+  accepted for the non-transactional write. Phase 7's accepted risk (a
+  crash in the sub-millisecond gap between `INSERT` and `UPDATE`) is a
+  rare, **self-limiting, bounded undercount** — never more than the number
+  of clicks physically mid-flight at the instant of a crash, and it never
+  compounds. Duplicate job processing from a stalled lock is a
+  **permanent, non-self-correcting overcount** instead: a phantom `clicks`
+  row that Postgres — the documented source of truth — shows forever in
+  any query, plus a permanent extra increment to `click_count`. That's a
+  materially worse failure mode than the one already accepted, so it
+  fails the same "how contained is this" test that got the earlier risk
+  accepted.
+- **(d) Combine (a) and (b) — chosen.** `redirect.ts` generates `clickId`
+  once, at enqueue time, and reuses it as both the BullMQ `jobId`
+  (enqueue-level dedup) *and* a new `clicks.job_id` column with a `UNIQUE`
+  constraint (processing-level dedup), via
+  `INSERT ... ON CONFLICT (job_id) DO NOTHING`. The `click_count`
+  increment is conditioned on whether that insert actually inserted a row
+  — both statements run inside one transaction (see "Reintroducing a
+  transaction" below), so a crash between the insert committing and the
+  update running can never happen.
+
+**How it works mechanically.**
+
+```sql
+INSERT INTO clicks (job_id, link_id, referrer, user_agent)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (job_id) DO NOTHING
+RETURNING id
+```
+
+If `rowCount === 0` (a duplicate `job_id` already exists), the `UPDATE
+links SET click_count = click_count + 1` is skipped entirely — the second
+attempt at a given `clickId` is a true no-op, not just a harmless extra
+row. A dedicated `job_id` column was used rather than overriding `clicks.
+id` itself, because reusing `id` would conflate "row identity" with
+"idempotency key" — every other table in this codebase treats `id` as an
+opaque, server-generated primary key, and quietly making `clicks` the one
+exception is easy to forget and hard to debug later. `job_id` defaults to
+`gen_random_uuid()` purely so the `ALTER TABLE` that added it never
+conflicts against pre-existing rows; every row written going forward
+supplies its own value explicitly.
+
+**Exact residual risk, stated precisely.** This design protects against
+any duplicate *processing* of a job carrying a given `clickId` — a
+stalled lock, a lost-ack retry, a crash mid-job all leave `clicks` and
+`click_count` consistent, because the second attempt's insert safely
+no-ops and the conditional update never fires for it, enforced by
+Postgres itself regardless of how the two attempts race. It does **not**,
+and cannot, protect against a producer-side bug that generates two
+*different* `clickId`s for what a human would consider one physical click
+— neither BullMQ nor Postgres has any way to know two distinct UUIDs
+refer to "the same" real-world event; the dedup key is only as
+trustworthy as the code that generates it. Also worth being precise
+about: BullMQ's own `jobId` dedup specifically only holds while the
+original job's record still exists in Redis — `removeOnComplete`'s
+count-bounded retention (see "Retries, backoff, and job retention" below)
+means a completed job can eventually be evicted, after which a
+theoretical re-`.add()` with the same `jobId` would look like a brand-new
+job to BullMQ. The Postgres `UNIQUE (job_id)` constraint is the actual,
+unconditional backstop — which is exactly why both layers are used rather
+than relying on BullMQ's dedup alone.
+
+**Where it lives in the codebase.** `src/routes/redirect.ts`
+(`clickId` generation); `src/queues/clickQueue.ts` (`jobId: data.clickId`
+on enqueue); `worker/processors/clickProcessor.ts` (the conditional
+insert/update); `migrations/20260818060941680_add-job-id-to-clicks.ts`
+(the `job_id` column and `UNIQUE` constraint); `tests/worker/
+clickProcessor.test.ts` ("processing the same job twice is a no-op the
+second time").
+
+**Common pitfalls.**
+
+- Trusting BullMQ's `jobId` dedup as the complete guarantee — it's a
+  time-bounded optimization (bounded by job retention), not an
+  unconditional one; the Postgres constraint is what actually closes the
+  gap.
+- Generating the idempotency key inside the *worker* instead of the
+  *producer* — if the worker generated its own key per processing
+  attempt, every retry of the same logical click would get a *different*
+  key, and the whole scheme would protect against nothing. The key has to
+  be generated exactly once, at the point the "same click" is first
+  identified as such — which is enqueue time, in the producer.
+- Reusing a table's primary key as an idempotency key "since it's already
+  unique" — conflates two different concerns (row identity vs. dedup
+  key) that happen to both want uniqueness for unrelated reasons.
+
+**Production considerations.** If click accuracy ever becomes a hard
+security or billing boundary rather than a display counter — the same
+condition that would flip Phase 7's transaction decision and Phase 8's
+capped-TTL decision — this design's residual risk (a producer bug
+generating non-deterministic keys) is the one gap that would need
+additional scrutiny: e.g., generating `clickId` deterministically from
+request-identifying data rather than a fresh random UUID, so that even a
+genuine producer retry converges on the same key rather than depending on
+the retry logic itself being bug-free.
+
+**Interview answer.** A queue's at-least-once delivery means a click job
+can genuinely run twice — a stalled worker lock, a lost-ack retry, a
+crash mid-processing. I closed that with a producer-generated `clickId`,
+reused as both the BullMQ `jobId` (a cheap, time-bounded optimization)
+and a new unique `job_id` column in Postgres that the worker's insert
+targets with `ON CONFLICT DO NOTHING`, conditioning the `click_count`
+increment on whether that insert actually happened. I considered relying
+on BullMQ's own jobId dedup alone, but that only holds while the original
+job's Redis record still exists — bounded by retention — so the Postgres
+constraint is the real, unconditional backstop. What this doesn't protect
+against, and can't: if a future bug in the producer ever generated two
+different `clickId`s for what should be one physical click, both layers
+would see two genuine, distinct events — the dedup key is only as
+trustworthy as the code that generates it once, at enqueue time.
+
+---
+
+### Reintroducing a transaction, off the hot path
+
+**What it is.** `worker/db/pool.ts`'s `withTransaction` helper — the
+exact `BEGIN`/try/`COMMIT`/catch-`ROLLBACK`/finally-`release` pattern
+Phase 7 built to benchmark `recordClick`, then deliberately deleted from
+`src/db/pool.ts` once that benchmark concluded it wasn't worth keeping on
+the redirect's hot path.
+
+**Why it exists in this project.** Phase 7's rejection was about *cost
+relative to benefit on that specific path* — a ~50% latency tax on the
+single hottest path in the system, in exchange for a guarantee (`clicks`
+and `click_count` never disagreeing across a crash) that only bought
+protection against a rare, small, self-limiting undercount. Nothing about
+that reasoning transfers unchanged to the worker: the worker isn't on any
+request's critical path at all, so the same ~0.25ms extra round-trip
+cost that was a real tax there is a complete non-issue here. What
+*changed* the calculus isn't the cost side, it's the benefit side —
+idempotency (see previous section) genuinely needs the insert and the
+conditional update to commit or roll back together, or a crash between
+them could leave a click permanently under-counted despite having "run"
+successfully.
+
+**How it works mechanically.** Reintroduced verbatim in `worker/db/
+pool.ts`, not resurrected in `src/db/pool.ts` — nothing in the API
+process needs it, and putting it there would reintroduce exactly the
+unused-infrastructure smell Phase 7 avoided by deleting it in the first
+place. `processClickJob` wraps its insert-then-conditional-update in
+`withTransaction`, so both statements commit together or neither does.
+
+**Where it lives in the codebase.** `worker/db/pool.ts`
+(`withTransaction`); `worker/processors/clickProcessor.ts` (its one
+caller).
+
+**Common pitfalls.**
+
+- Treating "we already decided against a transaction here" as a
+  permanent, context-independent conclusion, rather than a conclusion
+  scoped to the specific cost/benefit tradeoff that produced it — the
+  constraint that drove Phase 7's rejection (hottest path in the system)
+  simply doesn't hold for a background worker.
+- Duplicating the transaction helper into `src/db/pool.ts` "just in case"
+  instead of keeping it exactly where its one caller lives — the same
+  "don't keep unused infrastructure around" principle that got it deleted
+  the first time still applies to *where* it lives, not just *whether* it
+  exists.
+
+**Production considerations.** None — this is a settled, low-cost
+decision for a non-latency-critical path; there's no future condition
+under which reverting to non-transactional writes here would make sense,
+unlike Phase 7's redirect-path decision, which has an explicit reversal
+condition (`click_count` becoming a hard boundary).
+
+**Interview answer.** Phase 7 explicitly rejected a transaction for this
+same insert-then-update pair, on the redirect's hot path, because the
+~50% latency tax wasn't worth the narrow guarantee it bought. I
+reintroduced the exact same helper in the worker, not because that
+earlier reasoning was wrong, but because it was scoped to a constraint —
+"this is the hottest path in the system" — that simply doesn't apply to a
+background job. What changed is the benefit side, not the cost side:
+idempotency needs the insert and the conditional counter update to
+succeed or fail together, and a background job can afford the extra
+network round trip that the redirect path genuinely couldn't.
+
+---
+
+### Retries, exponential backoff, and job retention
+
+**What it is.** `src/queues/clickQueue.ts`'s default job options:
+`attempts: 5`, `backoff: { type: 'exponential', delay: 1000 }`,
+`removeOnComplete: { count: 5000 }`, `removeOnFail: { count: 10000 }`.
+
+**Why it exists in this project.** Retries are what turn a transient
+failure (a Postgres restart, a brief pool-exhaustion spike) into "the job
+eventually succeeds" instead of "the click is silently lost" — but
+retrying forever against a genuinely broken dependency would just mean
+every job eventually fails anyway, after wasting time. Job retention
+exists because a completed-job record is only useful for a while (recent-
+throughput visibility) and unbounded retention of one record per click
+processed is real, unbounded Redis memory growth.
+
+**How it works mechanically.** Five attempts, exponential backoff
+starting at 1 second (1s, 2s, 4s, 8s, 16s between attempts), gives a
+transient blip roughly 30+ seconds to resolve before the job is given up
+on and lands in the `failed` set — long enough to ride out a Postgres
+restart or a brief spike, short enough that a genuinely broken dependency
+doesn't retry indefinitely. `removeOnComplete: { count: 5000 }` keeps a
+rolling window of the most recent 5000 successes (enough to eyeball
+recent throughput) without growing forever; `removeOnFail: { count:
+10000 }`, larger and separate from completed, because a failed job —
+one that exhausted every retry — is exactly the kind of thing that needs
+to stay inspectable, not be discarded as eagerly as a routine success.
+Failed jobs are never silently discarded — they land in, and stay in
+(bounded by that count), the `failed` set, which functions as this
+system's dead-letter queue: inspectable via `Queue.getFailed()`, without
+needing a second, separate queue for the concept.
+
+**Where it lives in the codebase.** `src/queues/clickQueue.ts`
+(`defaultJobOptions`); `src/queues/linkCleanupQueue.ts` (a smaller,
+fixed `{ count: 100 }` for both — cleanup runs are infrequent, so a small
+fixed history is plenty for debugging); `worker/index.ts` (the `'failed'`
+event listener logs `attemptsMade`/`willRetry`, distinguishing "will
+retry" from "landed in failed" — see "Observability" below).
+
+**Common pitfalls.**
+
+- Retrying with a fixed delay instead of exponential backoff — a fixed
+  delay hammers a struggling dependency at a constant rate instead of
+  backing off as it becomes clearer something is actually wrong, not just
+  transiently slow.
+- Leaving `removeOnComplete`/`removeOnFail` unset (unbounded) "to be
+  safe" — for a queue processing one job per click, unbounded retention
+  is a slow, easy-to-miss memory leak in Redis, not a safety margin.
+- Treating a job that landed in `failed` as equivalent to "lost forever"
+  — it's inspectable and (with BullMQ's retry-from-failed tooling)
+  re-triggerable; the retention count bounds *how long* it stays
+  inspectable, not whether it's recoverable at all before that.
+
+**Production considerations.** These are starting points, matching this
+project's "measure, don't guess" posture — `attempts`/`backoff` should be
+revisited against real transient-failure frequency and duration once
+there's production data on how long Postgres blips actually last;
+`removeOnComplete`/`removeOnFail` counts should be revisited against real
+click volume (5000/10000 could be many hours of history at low volume, or
+minutes at very high volume).
+
+**Interview answer.** Failed click jobs retry five times with exponential
+backoff starting at one second, giving a transient Postgres problem
+roughly thirty seconds to resolve before the job is left in BullMQ's
+failed set, which functions as a dead-letter queue — inspectable, not
+discarded. I bounded both completed and failed job retention by count
+rather than leaving them unlimited, since this queue processes one job
+per click and unbounded retention is a genuine, slow Redis memory leak;
+failed jobs get a larger retention window than completed ones, since a
+job that exhausted every retry is exactly the kind of thing that needs to
+stay inspectable longer than a routine success does.
+
+---
+
+### click_count's new worst-case overshoot
+
+**What it is.** Phase 8's capped-link cache TTL (`LINK_CACHE_CAPPED_TTL_
+SECONDS = 5`) bounded how far a capped link's `click_count` could
+overshoot `maxClicks` before enforcement caught up, on the premise that
+Postgres's `click_count` was always current the instant a cache entry was
+(re)populated — true when `recordClick` wrote synchronously, in the same
+request. That premise no longer holds.
+
+**Why it exists in this project.** There are now two independently-
+varying lag sources stacked on top of each other, not one:
+
+1. **Cache lag** (unchanged from Phase 8): up to `LINK_CACHE_CAPPED_TTL_
+   SECONDS`, fixed and bounded at 5 seconds.
+2. **Queue-processing lag** (new this phase): the time between a click
+   being enqueued and the worker's transaction committing the increment —
+   normally sub-second, but *not* fixed. It grows with queue depth,
+   worsens under retry/backoff (a job that fails and retries can take
+   30+ seconds to resolve before either succeeding or landing in
+   `failed` and never incrementing at all), and if the worker process is
+   down entirely, this lag is genuinely unbounded — jobs simply
+   accumulate in `wait` until a worker comes back online.
+
+**How it works mechanically.** The honest worst-case bound is now
+"however many clicks arrive within 5 seconds of a cache refresh, **plus**
+however many clicks are sitting unprocessed in the queue at that moment."
+The first term is still a fixed constant; the second term isn't boundable
+at all without operational visibility into queue depth — which is
+exactly why queue-depth observability (see "Observability" below) isn't
+a nice-to-have here, it's what makes "bounded" an honest claim rather
+than a hopeful one. If the worker is down, the original premise behind
+accepting this overshoot at all — a small, self-limiting window — breaks
+down until someone is alerted to the growing depth and restarts it.
+
+**Does Phase 8's capped-TTL decision still hold?** Yes, for what it
+actually controls — it still bounds the cache-staleness component
+exactly as before, and shrinking it further wouldn't help the queue-lag
+component at all (a shorter TTL just means more frequent cache misses
+re-reading a Postgres row whose `click_count` is itself now lagging
+behind the queue). The decision doesn't need to change; what needed to
+change is not overstating what it guarantees now that a second, more
+variable lag source exists alongside it — which is exactly the correction
+made to `linkService.ts`'s own comment on this TTL as part of this phase.
+
+An active-invalidation enhancement (the worker calling the equivalent of
+`invalidateLinkCache(shortCode)` after a successful click on a capped
+link, to tighten the cache-lag term specifically) was considered and
+deliberately not built this phase — the queue-lag term is the dominant,
+harder-to-bound one regardless, so shaving the cache term wouldn't
+change the overall worst-case story much, for the cost of a third Redis
+client in the worker and an extra payload field.
+
+**Where it lives in the codebase.** `src/services/linkService.ts` (the
+`LINK_CACHE_CAPPED_TTL_SECONDS` comment, corrected to describe both lag
+sources); `worker/index.ts` (`logQueueDepth`, the operational visibility
+into the queue-lag term).
+
+**Common pitfalls.**
+
+- Assuming the 5-second cache TTL is still *the* bound on overshoot,
+  rather than *one of two* — this was true before this phase and isn't
+  anymore.
+- "Fixing" this by shortening the cache TTL further — it doesn't touch
+  the term that actually dominates once the worker falls behind.
+
+**Production considerations.** If a click cap ever acquires billing or
+legal significance — the same condition Phase 8 already named as a
+reversal trigger — this phase makes that reversal more urgent, not less:
+a hard security/billing boundary can no longer tolerate an unbounded
+overshoot term, which is exactly what queue-processing lag introduces
+whenever the worker falls behind. At that point, enforcement would need
+to move off this lazy-read-plus-cache pattern entirely — e.g. a
+synchronous, atomic Redis counter or Lua script checked before the
+redirect fires, not a background job.
+
+**Interview answer.** Before this phase, a capped link's click_count
+overshoot was bounded by a single number — the 5-second cache TTL, since
+the write was synchronous. Moving the write onto a queue added a second,
+independently-varying lag source on top of that: queue-processing time,
+which is normally sub-second but genuinely unbounded if the worker falls
+behind or goes down. So the honest bound now is "clicks within the cache
+window, plus whatever's sitting unprocessed in the queue" — and that
+second term isn't a number I can quote without operational visibility
+into queue depth, which is exactly why I treated queue depth as a
+required piece of observability for this phase, not an optional add-on.
+The 5-second TTL decision itself didn't need to change; what needed to
+change was being honest in the docs about what it actually bounds now.
+
+---
+
+### Scheduled cleanup: lazy and scheduled expiry running together
+
+**What it is.** A repeatable BullMQ job (`worker/processors/
+linkCleanupProcessor.ts`, `sweepExpiredLinks`) that flips `is_active =
+false` for links whose `expires_at` has passed — the scheduled half of
+expiry that Phase 7 deliberately left out, implementing lazy expiry only.
+
+**Why it exists in this project.** Phase 7's "Lazy vs. scheduled expiry"
+already laid out why production systems that expire things at scale
+(session stores, cache entries, this table) tend to run both mechanisms
+together: lazy expiry (Phase 7's `deadStateError`, still unchanged) gives
+immediate, per-request correctness with zero extra infrastructure but
+leaves expired rows accumulating in the table forever, since nothing
+proactively cleans them up; scheduled expiry reclaims that storage and
+stops every future read from repeatedly re-evaluating a row that's
+provably, permanently dead — but alone, it would leave a correctness gap
+between sweep runs that lazy expiry is what actually closes. Running only
+one leaves a gap the other exists specifically to close.
+
+**How it works mechanically.**
+
+```sql
+UPDATE links
+SET is_active = false, updated_at = now()
+WHERE is_active = true
+  AND expires_at IS NOT NULL
+  AND expires_at <= now();
+```
+
+A single `UPDATE`, no transaction needed — one statement is already
+atomic under Postgres's MVCC, the same reasoning already established for
+`click_count`'s increment. Registered as a repeatable job via BullMQ's
+`upsertJobScheduler` (`worker/scheduler.ts`), firing every 60 seconds — a
+starting point chosen for local-dev observability (easy to see it run
+without a long wait) and because a single unindexed `UPDATE` scan over
+`is_active`/`expires_at` is a complete non-issue at this project's scale,
+not a tuned production interval (deployment/scheduling configuration is
+explicitly out of scope for this phase).
+
+**Scoped to `expires_at` only — never `max_clicks`.** `deadStateError`
+checks three conditions in priority order — `is_active`, `expires_at`,
+then `click_count >= maxClicks` — each returning a different message for
+the same 410 status. If the sweep also flipped `is_active` for a link
+that's dead *only* because it's click-exhausted, the next request would
+hit the `is_active` branch first and return "This link has been
+deactivated" instead of "This link has reached its click limit" — a real
+message change the sweep has no business causing. So the sweep touches
+`expires_at` only.
+
+**One deliberate, unavoidable message-text change.** Even scoped this
+way, there's a narrow but real behavior change worth naming rather than
+glossing over: before the sweep has ever run against a given expired-but-
+still-`is_active=true` link, `deadStateError` falls through to the
+`expires_at` branch and returns "This link has expired." After the sweep
+processes that row, a later request hits the now-flipped `is_active`
+check first and returns "This link has been deactivated" instead. This
+is an expected consequence of introducing scheduled expiry, not a
+regression — arguably it's *more* correct after the sweep, since the row
+genuinely is deactivated now, mechanically — but it's an observable
+message-text change a client would see, so it's captured as an explicit
+test assertion (`tests/routes/redirect.test.ts`, "an expired link reads
+... before the sweep ... after") rather than left as an implicit
+surprise.
+
+**No new index.** The sweep's `WHERE` clause touches `is_active`/
+`expires_at`, both explicitly *not* indexed per the `links` migration's
+own comment — deferred to "Phase 12," a dedicated, measurement-driven
+indexing pass. This phase doesn't add one either, for the same reason:
+this is a low-frequency, schedule-driven scan, not a per-request hot
+path, and adding an index now without measurement would repeat the exact
+mistake Phase 7/8's whole methodology has consistently avoided elsewhere.
+Phase 12 now has two consumers who'd benefit from that index (this sweep,
+and any future admin/analytics listing) — which strengthens the case for
+a proper measurement pass later, not for guessing now.
+
+**Where it lives in the codebase.** `worker/processors/
+linkCleanupProcessor.ts` (`sweepExpiredLinks`); `worker/scheduler.ts`
+(`registerLinkCleanupScheduler`); `tests/worker/
+linkCleanupProcessor.test.ts`; `tests/routes/redirect.test.ts` (the
+message-transition test).
+
+**Common pitfalls.**
+
+- Scoping the sweep to *every* dead-state condition "for consistency,"
+  rather than only the one (`expires_at`) that scheduled expiry is
+  actually meant to address — `max_clicks` exhaustion isn't a storage-
+  reclamation problem the way time-based expiry is; there's no equivalent
+  "sits in the table forever, invisibly" failure mode for it, since a
+  click-exhausted link's `click_count` is already being actively written
+  to.
+- Not calling out the message-text transition explicitly, and having it
+  discovered later as an apparent regression instead of a documented,
+  intentional consequence.
+
+**Production considerations.** As sweep frequency or table size grows,
+this is exactly the kind of scan Phase 12's indexing pass should
+prioritize first — but only once there's real data on sweep duration and
+frequency to measure against, not before.
+
+**Interview answer.** Phase 7 only implemented lazy expiry — checking
+`expires_at` at read time, never writing anything back — specifically so
+this phase could add the scheduled half without redoing that decision.
+The sweep is a single, naturally idempotent `UPDATE` that flips
+`is_active` for expired links, run on a BullMQ repeatable schedule. I
+scoped it to `expires_at` only, deliberately excluding `max_clicks`
+exhaustion, because flipping `is_active` for a click-exhausted link would
+change which dead-state message a client sees for a case scheduled
+expiry was never meant to touch. That said, even scoped this way there's
+one real, if narrow, behavior change I called out explicitly rather than
+letting it surprise someone later: once the sweep has processed an
+expired link, its 410 message changes from "this link has expired" to
+"this link has been deactivated" — expected and arguably more accurate,
+but observable, so it's asserted in a test rather than left implicit.
+
+---
+
+### Safe under multiple worker instances
+
+**What it is.** Two independent mechanisms making the cleanup sweep safe
+to run from every worker instance simultaneously, if this project ever
+runs more than one.
+
+**Why it exists in this project.** The task explicitly requires this:
+the sweep "will run on every worker instance if you ever run more than
+one" — worth designing for now, even with a single instance in practice
+today, since retrofitting safety later (after horizontal scaling is
+already relied on) is a worse time to discover a gap.
+
+**How it works mechanically.**
+
+1. **`upsertJobScheduler`'s own idempotent registration.** BullMQ v5+'s
+   `Queue.upsertJobScheduler(schedulerId, ...)` is explicitly designed to
+   *upsert* the schedule definition keyed on `schedulerId`, not create a
+   new one each call. `worker/scheduler.ts` calls this unconditionally
+   from every worker instance at boot — if N replicas all start up and
+   all register with the same `schedulerId` and pattern, the result is
+   exactly one active schedule; calls 2 through N are no-ops by BullMQ's
+   own design. Chosen over the older `.add()`-with-a-`repeat`-option
+   pattern specifically for this upsert semantics — that older pattern
+   has known footguns around removing/re-registering repeatable
+   definitions across versions.
+2. **The sweep SQL's own idempotence, independent of (1).** Even in a
+   hypothetical world where the scheduler-level dedup somehow has an edge
+   case (or someone runs an ad hoc extra cleanup by accident), `UPDATE ...
+   WHERE is_active = true AND expires_at <= now()` converges to the same
+   end state no matter how many times or how concurrently it runs — a row
+   that's already `is_active = false` simply doesn't match the `WHERE`
+   clause on a later run, and Postgres's row-level locking serializes any
+   genuinely concurrent execution against the same rows.
+
+Both are used deliberately, not as redundant belt-and-suspenders for its
+own sake: (1) is what avoids *wasted, redundant scheduling* (multiple
+timers firing the same sweep more often than intended); (2) is what
+actually guarantees the *outcome* is correct even if (1) somehow failed —
+they protect against different failure classes, at very low incremental
+cost to build both.
+
+**Where it lives in the codebase.** `worker/scheduler.ts`
+(`registerLinkCleanupScheduler`); `worker/processors/
+linkCleanupProcessor.ts` (the naturally idempotent `UPDATE`); `tests/
+worker/linkCleanupProcessor.test.ts` ("calling it twice results in
+exactly one active scheduler, not two"; "deactivates ... twice in a row
+without error or double effect").
+
+**Common pitfalls.**
+
+- Relying on only the scheduler-level dedup and assuming the underlying
+  operation is therefore safe under concurrency — dedup at the scheduling
+  layer says nothing about whether the *work itself* is safe if it
+  somehow ran twice; that has to be true independently.
+- Writing a sweep operation that *isn't* naturally idempotent (e.g. one
+  that appends an audit-log row per link deactivated, rather than a
+  pure state-flip) without separately guarding against duplicate
+  execution — the `UPDATE`'s idempotence here is a property of what it
+  *does* (flip a flag to a fixed value), not something guaranteed for
+  every possible sweep operation.
+
+**Production considerations.** This is exactly what makes horizontal
+scaling of the worker safe to turn on later without revisiting this
+code at all — multiple replicas registering the same schedule and
+occasionally racing on the same sweep execution is already a handled
+case, not a future problem.
+
+**Interview answer.** I made the cleanup scheduler safe under multiple
+worker instances two ways, deliberately, not just one. First,
+`upsertJobScheduler` is designed to be called repeatedly with the same
+ID — every worker registers it at boot, and N replicas converge to
+exactly one active schedule. Second, and just as important, the sweep's
+own SQL is independently idempotent — an `UPDATE` gated on `is_active =
+true` simply matches nothing on a row that's already been flipped, so
+even concurrent executions converge to the same correct end state. The
+first mechanism avoids wasted, redundant scheduling; the second is what
+actually guarantees correctness even if the first one somehow had a gap
+— they cover different failure modes, so I built both rather than
+picking one.
+
+---
+
+### Worker graceful shutdown
+
+**What it is.** `worker/shutdown.ts`'s `gracefulShutdown` — closes every
+`Worker` (waiting for its currently in-flight job, if any, to finish),
+then closes the read-only `Queue` handles, the worker's own Postgres
+pool, and its Redis connection, in that order.
+
+**Why it exists in this project.** The same signal-handling need
+`src/server.ts` already has (a container orchestrator sends `SIGTERM`,
+then `SIGKILL` after a grace period; Node's default `SIGTERM` behavior is
+to terminate immediately, abandoning whatever was in flight) — but the
+unit of in-flight work is different. The API drains in-flight *HTTP
+requests*; the worker has no requests at all, only in-flight *jobs*.
+
+**How it works mechanically.** `Worker.close()` (called with no `force`
+argument — i.e. `force: false`) waits for any currently-active job to
+finish before resolving, rather than abandoning it mid-processing. Only
+after every `Worker` has closed does `gracefulShutdown` close the `Queue`
+handles, the Postgres pool, and the Redis connection — the same ordering
+principle `server.ts` already established: nothing an in-flight unit of
+work depends on closes until that work has actually finished, not before
+or concurrently with it. `worker/index.ts` wires this to both `SIGTERM`
+and `SIGINT`, with the same kind of unref'd force-exit timeout `server.
+ts` uses as a safety net if a job never finishes draining.
+`gracefulShutdown` is exported as a standalone function specifically so
+the shutdown *logic* is unit-testable by calling it directly, without
+needing a real process/signal for every test — real signal handling still
+needs an actual child process to test end-to-end (see "What changed in
+the test suite" below), but that cost is paid once, for the one test that
+genuinely needs it.
+
+**Where it lives in the codebase.** `worker/shutdown.ts`
+(`gracefulShutdown`); `worker/index.ts` (`SIGTERM`/`SIGINT` wiring, the
+force-exit timeout).
+
+**Common pitfalls.**
+
+- Copying `src/server.ts`'s shutdown function directly into the worker —
+  it calls `server.close()`, which has no meaning in a process with no
+  HTTP server; the *ordering principle* transfers, the specific code
+  doesn't.
+- Closing the Postgres pool or Redis connection before every `Worker` has
+  actually closed — an in-flight job could still be mid-transaction; the
+  ordering matters for exactly the same reason it matters in `server.ts`.
+- Testing graceful shutdown by calling the shutdown function directly
+  and never exercising a real `SIGTERM` at all — that proves the shutdown
+  *logic* works, not that the process's actual signal handler is wired up
+  correctly, which is a distinct thing to get wrong (e.g. registering the
+  handler after the point where a signal could already have arrived).
+
+**Production considerations.** The 10-second force-exit timeout is a
+starting point mirroring `server.ts`'s own — worth revisiting only if a
+real job's worst-case duration approaches it, which nothing at this
+project's current scale does.
+
+**Interview answer.** The worker's graceful shutdown follows the same
+principle `server.ts` already established — don't close anything an
+in-flight unit of work depends on until that work has actually finished —
+but the unit is different: jobs, not HTTP requests. `Worker.close()`
+without forcing waits for any currently-active job to finish before
+resolving; only after every worker has closed does the shutdown code
+close the Postgres pool and Redis connection. I exported the shutdown
+logic as a standalone function so most of it is unit-testable without a
+real process, but I still wrote one test that spawns the actual worker
+as a child process and sends it a real `SIGTERM`, because signal wiring
+itself — is the handler actually registered, does it actually receive the
+signal — can't be verified any other way.
+
+---
+
+### Observability: structured logging, job lifecycle, queue depth
+
+**What it is.** Worker logs matching the API's exact structured format;
+explicit logging of a job's lifecycle (started, completed with duration,
+failed with attempt number); periodic logging of queue depth.
+
+**Why it exists in this project.** Once click recording moved off the
+request path, there's no HTTP response to signal anything went wrong —
+a click that silently fails to process, or a worker that silently falls
+behind, has no other signal surfacing it. This is also what turns
+"click_count's overshoot is bounded" (see that section above) from a
+hopeful claim into something actually monitored.
+
+**How it works mechanically.** `worker/logger.ts` mirrors `src/lib/
+logger.ts`'s construction exactly — same conditional pino-pretty-in-
+development pattern, forced by the same `exactOptionalPropertyTypes`
+constraint — so worker logs are visually and structurally identical to
+API logs, just from a different process. `worker/index.ts` attaches
+generic `'active'`/`'completed'`/`'failed'` listeners to every `Worker`
+instance (not per-processor logic, so both the click and cleanup workers
+get identical lifecycle logging for free): `'active'` logs `jobId`/
+`attemptsMade` ("Job started"); `'completed'` logs `jobId`/`durationMs`
+(computed from `job.finishedOn - job.processedOn`); `'failed'` logs
+`jobId`/`attemptsMade`/`maxAttempts`/`willRetry`, so a log reader can
+distinguish "will retry" from "exhausted every attempt" at a glance.
+Queue depth (`clickQueue.getWaitingCount()`/`getActiveCount()`/
+`getDelayedCount()`/`getFailedCount()`) is logged every 30 seconds as a
+single structured line.
+
+**What a growing queue depth indicates.** A growing `waiting`/`delayed`
+count means the worker is falling behind — concurrency too low for
+current volume, Postgres degraded, or the worker process down entirely.
+This is the operational signal that makes click_count's two-lag-source
+overshoot bound (see that section above) something an operator can
+actually act on, rather than a theoretical worst case with no way to
+know when it's actually happening.
+
+**Where it lives in the codebase.** `worker/logger.ts`; `worker/index.ts`
+(`'active'`/`'completed'`/`'failed'` listeners, `logQueueDepth`).
+
+**Common pitfalls.**
+
+- Logging job lifecycle events inside each processor function
+  individually, duplicated per job type — centralizing it at the `Worker`
+  level (generic listeners, not processor-specific code) means every
+  current and future job type gets identical, consistent lifecycle
+  logging for free, and a processor only logs what's genuinely specific
+  to its own business logic (e.g. `clickProcessor`'s "duplicate job,
+  skipping increment" warning).
+- Adding a metrics library (`prom-client` or similar) for queue depth
+  without first asking whether structured logs already answer the
+  question — consistent with this codebase's existing rule against
+  silently adding dependencies (Phase 8 made the same call for cache hit
+  rate), queue depth is logged, not exported as a metric, this phase.
+
+**Production considerations.** A real deployment would want queue depth
+alerted on past some threshold (not just logged), and would likely want
+it as an actual metric (a counter/gauge scraped by Prometheus or
+equivalent) rather than parsed out of logs at volume — neither was added
+this phase, consistent with "no deployment configuration" being out of
+scope, but the structured log lines already carry everything a metrics
+pipeline would need to be pointed at later.
+
+**Interview answer.** Worker logs match the API's structured format
+exactly, and I centralized job-lifecycle logging (started, completed
+with duration, failed with attempt number) at the `Worker` level via
+generic event listeners, rather than duplicating logging code inside
+each processor — every job type gets consistent lifecycle logging for
+free, and a processor only logs what's actually specific to its own
+logic. I log queue depth every 30 seconds, because a growing waiting or
+delayed count is the concrete signal that the worker is falling behind —
+concurrency too low, Postgres degraded, or the worker down entirely —
+which is exactly the operational visibility that makes this phase's
+click_count overshoot analysis something actionable rather than a
+theoretical worst case nobody would notice happening in practice.
+
+---
+
+### One repo, multiple deployables
+
+**What it is.** A single repository now produces two independently
+runnable, independently deployable processes — the API (`src/server.ts`)
+and the worker (`worker/index.ts`) — with their own entry points, build
+outputs, and npm scripts, sharing dependencies and one small contracts
+file, nothing else load-bearing.
+
+**Why it exists in this project.** This is the natural consequence of
+"separate process, not a thread" (see "Producer/consumer separation"
+above) actually being followed through into how the project is built and
+run, not just how it's architected in theory.
+
+**How it works mechanically.** `worker/tsconfig.json` extends the root
+`tsconfig.json` but sets its own `rootDir`/`outDir`/`include`, so `tsc -p
+worker/tsconfig.json` compiles `worker/index.ts` (and the one file it
+imports from `src/`, `src/queues/contracts.ts`) into `dist/worker/index.
+js`, independent of the API's own `npm run build` output at `dist/
+server.js` — the root `tsconfig.json`'s `exclude: [...,"worker",...]`
+stays untouched, so the API's build is completely unaffected by the
+worker existing at all. New scripts mirror the API's own naming/shape
+exactly: `worker:dev` (`tsx watch`, hot reload), `worker:build` (`tsc -p
+worker/tsconfig.json`), `worker:start`/`worker:start:local` (run the
+compiled output, with or without loading `.env`).
+
+**Local development.** `docker compose up -d` (unchanged — the Redis
+service's own comment already anticipated "the BullMQ job queue broker
+for the future worker process," and its named volume already anticipated
+persisting queued jobs across a restart) and `npm run migrate:up`, then
+two terminals: `npm run dev` for the API, `npm run worker:dev` for the
+worker, both against the same local Postgres/Redis. No combined "run
+both at once" script was added — a `concurrently`-style dependency for a
+two-command convenience isn't worth the added `package.json` surface at
+this project's stage, and running them separately is what the task
+itself asked to be documented anyway (useful for watching one process's
+logs in isolation while debugging).
+
+**Where it lives in the codebase.** `worker/tsconfig.json`; `package.
+json` (`worker:*` scripts); `docker-compose.yml` (unchanged, already
+correct).
+
+**Common pitfalls.**
+
+- Letting the worker's build accidentally depend on the API's `dist/`
+  output, or vice versa — each `tsconfig.json` compiles independently
+  from source, so neither build has to run, or even exist, for the other
+  to succeed.
+- Assuming "two processes" requires "two repositories" — a monorepo-style
+  single repository with clearly separated build/run configuration per
+  deployable is a completely standard pattern, not a compromise; splitting
+  into separate repos would trade a shared-contracts-file's simplicity for
+  cross-repo versioning overhead, for no benefit at this project's size.
+
+**Production considerations.** No deployment configuration was added
+this phase (explicitly out of scope) — but this is exactly the seam a
+deployment phase would attach to later: two build outputs, two run
+commands, ready to become two separate deployed services (e.g. two
+processes in a `docker-compose.yml`, or two services in a container
+platform) without any further code changes.
+
+**Interview answer.** This phase turned one deployable into two, sharing
+a single repository and almost nothing else load-bearing — one small,
+dependency-free file defines the queue contract both sides agree on, and
+that's it. Each side has its own `tsconfig.json`, compiles independently
+into its own `dist/` output, and has its own npm scripts mirroring the
+API's existing naming. I didn't add a combined dev-runner script, since
+running them in separate terminals is both simpler to set up and more
+useful for debugging one process's logs in isolation — and I didn't add
+any deployment configuration, since turning "two build outputs, two run
+commands" into "two deployed services" is a distinct, later concern this
+phase deliberately left the seam open for, without doing it prematurely.
+
+---
+
+### What changed in the existing test suite, and why
+
+**What it is.** `tests/routes/redirect.test.ts`'s click-recording
+assertions, previously synchronous (checking `clicks`/`click_count`
+immediately after the HTTP response), restructured around the fact that
+recording now happens in a separate process nothing in the test run is
+consuming jobs on behalf of.
+
+**Why it exists in this project.** A test asserting `click_count`
+immediately after `await request(app).get(...)` was implicitly relying on
+`recordClick` having already run synchronously inside that same request —
+true before this phase, false after. Making these tests still pass
+without becoming slow or flaky meant changing *what* they assert and, in
+some cases, *how* click processing gets triggered inside the test itself,
+not just updating expected values.
+
+**How it works mechanically.**
+
+- **Enqueue-payload correctness** (was: assert a `clicks` row exists with
+  the right `referrer`/`user_agent`) now asserts against the real
+  `clickQueue` instead — `vi.spyOn(clickQueue, 'add')` captures the exact
+  call, and the test checks `data.linkId`/`data.shortCode`/`data.referrer`/
+  `data.userAgent`/the `jobId`-equals-`clickId` relationship, without
+  needing a worker to actually process anything.
+- **The old 20-concurrent-redirects test** (was: proving no lost
+  `click_count` increments under concurrency) split into two, at the two
+  different layers where two different guarantees now live: a
+  **producer-side** test in `redirect.test.ts` (20 concurrent redirects
+  enqueue 20 jobs with 20 *distinct* `clickId`s — added specifically
+  because idempotency's entire design keys on that uniqueness holding;
+  see "Idempotency" above for why this needed its own test, separate from
+  processing-correctness), and a **worker-side** test in `tests/worker/
+  clickProcessor.test.ts` (20 concurrently-processed jobs, with already-
+  distinct `clickId`s, never lose an increment — the direct descendant of
+  the original test, just now exercised at the layer where the write
+  actually happens).
+- **maxClicks enforcement and the capped-overshoot test** both needed
+  click processing to actually happen partway through, without waiting on
+  a real worker — a `getAndProcessClick` test helper hits the route,
+  captures the job BullMQ would have received (via the same `add` spy),
+  and immediately calls `processClickJob` directly against it, standing in
+  for the worker. The 5-second cache-TTL wait these tests already had
+  (Phase 8) is unchanged; what changed is that click *processing* is now
+  driven explicitly rather than assumed to have already happened
+  synchronously.
+- **A new test for the sweep's message-text transition** (see "Scheduled
+  cleanup" above) — asserts the 410 message changes from "expired" to
+  "deactivated" once the sweep has actually run, explicitly isolated from
+  Phase 8's cache-staleness window (the cache is cleared directly between
+  the two assertions) so this test is about the sweep specifically, not
+  compounded with caching behavior already covered elsewhere.
+- **A new `afterAll` in `redirect.test.ts`** obliterates `clickQueue`
+  after the file's tests run — every `GET /:shortCode` in the file
+  enqueues a real job, and nothing in the test run consumes them, so
+  without this they'd simply accumulate in the shared dev Redis across
+  every test run indefinitely.
+
+Two smaller, unrelated fixes surfaced along the way: `tests/db/
+migrations.test.ts`'s rollback test had `count: 3` hardcoded for exactly
+three pre-existing migrations — adding this phase's fourth migration
+(`job_id`/`clicks_job_id_unique`) meant a `down` of only 3 no longer fully
+rolled back, leaving `users` still applied and every subsequent test file
+seeing a half-torn-down schema; fixed to `count: 4`. And the graceful-
+shutdown integration test, which spawns the worker as a real child
+process, needed `LOG_LEVEL` overridden to `'info'` specifically for that
+child — `.env.test` sets `'warn'` project-wide (to keep the rest of the
+suite's output quiet), which was silently suppressing every log line the
+test needed to read back from the child's `stdout`, including "ready."
+
+**Where it lives in the codebase.** `tests/routes/redirect.test.ts`;
+`tests/worker/clickProcessor.test.ts`; `tests/worker/
+linkCleanupProcessor.test.ts`; `tests/worker/clickQueue.integration.
+test.ts`; `tests/db/migrations.test.ts` (the `count: 4` fix).
+
+**Common pitfalls.**
+
+- Updating a synchronous test's expected values without questioning
+  whether the test's *timing assumption* still holds at all — a test that
+  happened to pass by accident (because processing was fast enough to
+  finish before the assertion ran) is a flaky test waiting to surface
+  later under different timing, not a correct one.
+- Hardcoding a migration count in a test instead of deriving it (e.g.
+  counting migration files) — a small, easy-to-forget coupling that only
+  breaks the day someone adds a new migration, which is exactly what
+  happened here.
+- Spawning a real child process to test something that unit-testing the
+  underlying function would cover just as well — reserved for the one
+  case (real `SIGTERM` handling) that genuinely can't be verified any
+  other way; everything else in this phase's test suite runs against
+  real Postgres/Redis in-process, matching this project's existing
+  testing philosophy.
+
+**Production considerations.** None specific to this section — this is
+entirely about test-suite correctness, not runtime behavior.
+
+**Interview answer.** Moving click recording off the request path broke
+an implicit assumption several existing tests depended on — that
+`click_count` was already updated by the time the HTTP response came
+back. Rather than just updating expected values, I changed what each
+test actually verifies: payload-correctness tests now assert against the
+real BullMQ queue instead of Postgres; the old concurrency test split
+into a producer-side test (do concurrent requests generate distinct
+idempotency keys — a real, separate failure mode this phase introduced)
+and a worker-side test (does concurrent processing avoid lost
+increments, the original guarantee, now proven where the write actually
+happens); and tests needing an actual recorded click drive processing
+directly through a test helper rather than assuming it already happened.
+I also found and fixed an unrelated latent bug this phase's own migration
+exposed — a test hardcoding "3 migrations" that broke the moment a fourth
+one existed — which is exactly the kind of thing a full test-suite run
+after a schema change is supposed to catch.
+
