@@ -1,5 +1,6 @@
 import express from 'express';
 import { config } from './config/index.js';
+import { logger } from './lib/logger.js';
 import { createErrorHandler } from './middleware/errorHandler.js';
 import { notFoundHandler } from './middleware/notFoundHandler.js';
 import { requestContext } from './middleware/requestContext.js';
@@ -25,6 +26,35 @@ import { rootRouter } from './routes/root.js';
  * regardless, so a factory wouldn't buy any extra testability.
  */
 export const app = express();
+
+// An application setting, not middleware — unlike every app.use() below,
+// where it's placed doesn't affect request-handling order (it's read
+// per-request by Express's own req.ip getter, not executed as a step in
+// the chain). Set once, here, right after construction: every IP-keyed
+// piece of this app — this phase's rate limiters included — needs it to
+// already be correct before it can run. See Notes.md, "Phase 10: Rate
+// Limiting" / "trust proxy" for what breaks in each direction if this is
+// wrong.
+app.set('trust proxy', config.TRUST_PROXY);
+
+// A direct-to-internet deployment (TRUST_PROXY=0) is legitimate — this is
+// not an error. But in production behind an unconfigured load balancer,
+// req.ip collapses to the LB's one address for every request, so every
+// IP-keyed rate limiter below shares a single bucket across all users.
+// The symptom (real users getting 429s they didn't individually earn)
+// points nowhere near this cause, so it must be impossible to miss in
+// startup logs. See Notes.md, "Phase 10: Rate Limiting" / "trust proxy"
+// for the full writeup, and the Phase 15 deployment checklist.
+if (config.NODE_ENV === 'production' && config.TRUST_PROXY === 0) {
+  logger.warn(
+    'TRUST_PROXY is 0 in production — if this deployment sits behind a load ' +
+      "balancer or CDN, every request will appear to come from the proxy's " +
+      'IP, and all IP-keyed rate limits (auth, unlock) will be shared across ' +
+      'every real user instead of enforced per-user. Set TRUST_PROXY to the ' +
+      'number of proxy hops in front of this process (1 for a single load ' +
+      'balancer) if that applies here.',
+  );
+}
 
 // Registration order is semantics, not style — each stage below can only
 // rely on what ran before it, and Express only routes an error into the

@@ -1,16 +1,35 @@
 import type { Express } from 'express';
 import request from 'supertest';
 import { beforeAll, describe, expect, it } from 'vitest';
+import type { Config } from '../../src/config/env.js';
 
 let app: Express;
+let config: Config;
 let query: typeof import('../../src/db/pool.js').query;
+let rateLimitRedisConnection: typeof import('../../src/lib/rateLimitRedis.js').rateLimitRedisConnection;
 
 beforeAll(async () => {
   // Same dynamic-import-after-loadEnvFile requirement as tests/routes/auth.test.ts —
   // src/app.ts transitively imports src/config at module-evaluation time.
   process.loadEnvFile('.env.test');
   ({ app } = await import('../../src/app.js'));
+  ({ config } = await import('../../src/config/index.js'));
   ({ query } = await import('../../src/db/pool.js'));
+  ({ rateLimitRedisConnection } = await import('../../src/lib/rateLimitRedis.js'));
+
+  // See tests/routes/auth.test.ts's beforeAll for why this file-local flush
+  // is necessary now that signupLimiter is backed by real, shared Redis
+  // rather than a per-process in-memory Map: every test file's supertest
+  // requests share one loopback IP, so without this flush this file's ~40
+  // signupUser() calls could inherit budget already spent by whichever
+  // file ran immediately before it in the same `npm test` run. (This
+  // file's own rate limiting describe below tests linksCreateLimiter,
+  // which is keyed per-user and needs no such flush — it never collides
+  // across files.)
+  const authLimiterKeys = await rateLimitRedisConnection.keys('rl:auth-*');
+  if (authLimiterKeys.length > 0) {
+    await rateLimitRedisConnection.del(...authLimiterKeys);
+  }
 });
 
 function uniqueEmail(label: string): string {
@@ -56,7 +75,10 @@ describe('POST /api/links', () => {
     const { token } = await signupUser('create-alias');
     const alias = uniqueAlias('myalias');
 
-    const res = await post(token, { destinationUrl: 'https://example.com/alias', customAlias: alias });
+    const res = await post(token, {
+      destinationUrl: 'https://example.com/alias',
+      customAlias: alias,
+    });
 
     expect(res.status).toBe(201);
     expect(res.body.link.shortCode).toBe(alias);
@@ -68,7 +90,10 @@ describe('POST /api/links', () => {
     const alias = uniqueAlias('taken');
 
     await post(tokenA, { destinationUrl: 'https://example.com/first', customAlias: alias });
-    const res = await post(tokenB, { destinationUrl: 'https://example.com/second', customAlias: alias });
+    const res = await post(tokenB, {
+      destinationUrl: 'https://example.com/second',
+      customAlias: alias,
+    });
 
     expect(res.status).toBe(409);
   });
@@ -76,7 +101,10 @@ describe('POST /api/links', () => {
   it('rejects a reserved-word alias with 400', async () => {
     const { token } = await signupUser('reserved-alias');
 
-    const res = await post(token, { destinationUrl: 'https://example.com/admin', customAlias: 'admin' });
+    const res = await post(token, {
+      destinationUrl: 'https://example.com/admin',
+      customAlias: 'admin',
+    });
 
     expect(res.status).toBe(400);
   });
@@ -111,20 +139,28 @@ describe('POST /api/links', () => {
   it('rejects a non-positive maxClicks with 400', async () => {
     const { token } = await signupUser('bad-maxclicks');
 
-    const res = await post(token, { destinationUrl: 'https://example.com/maxclicks', maxClicks: 0 });
+    const res = await post(token, {
+      destinationUrl: 'https://example.com/maxclicks',
+      maxClicks: 0,
+    });
 
     expect(res.status).toBe(400);
   });
 
   it('rejects an unauthenticated request with 401', async () => {
-    const res = await request(app).post('/api/links').send({ destinationUrl: 'https://example.com' });
+    const res = await request(app)
+      .post('/api/links')
+      .send({ destinationUrl: 'https://example.com' });
     expect(res.status).toBe(401);
   });
 
   it('creates a password-protected link: isPasswordProtected true, no password_hash leaked', async () => {
     const { token } = await signupUser('create-password');
 
-    const res = await post(token, { destinationUrl: 'https://example.com/gated', password: 'link-secret' });
+    const res = await post(token, {
+      destinationUrl: 'https://example.com/gated',
+      password: 'link-secret',
+    });
 
     expect(res.status).toBe(201);
     expect(res.body.link.isPasswordProtected).toBe(true);
@@ -139,6 +175,24 @@ describe('POST /api/links', () => {
     expect(res.status).toBe(201);
     expect(res.body.link.isPasswordProtected).toBe(false);
     assertNoPasswordHash(res.body);
+  });
+});
+
+describe('rate limiting', () => {
+  it("is keyed per authenticated user, not per IP: exhausting user A's budget does not block user B", async () => {
+    const { token: tokenA } = await signupUser('rl-links-a');
+    const { token: tokenB } = await signupUser('rl-links-b');
+
+    let last: request.Response | undefined;
+    for (let i = 0; i < config.RATE_LIMIT_LINKS_MAX + 1; i += 1) {
+      last = await post(tokenA, { destinationUrl: `https://example.com/rl-a-${i}` });
+    }
+    expect(last!.status).toBe(429);
+    expect(last!.body.error.code).toBe('TOO_MANY_REQUESTS');
+    expect(Number(last!.headers['retry-after'])).toBeGreaterThan(0);
+
+    const resB = await post(tokenB, { destinationUrl: 'https://example.com/rl-b' });
+    expect(resB.status).toBe(201);
   });
 });
 
@@ -241,7 +295,10 @@ describe('GET /api/links/:id', () => {
 
   it('never leaks password_hash for a password-protected link', async () => {
     const { token } = await signupUser('getid-no-leak');
-    const created = await post(token, { destinationUrl: 'https://example.com/gated', password: 'link-secret' });
+    const created = await post(token, {
+      destinationUrl: 'https://example.com/gated',
+      password: 'link-secret',
+    });
 
     const res = await request(app)
       .get(`/api/links/${created.body.link.id}`)
@@ -252,14 +309,16 @@ describe('GET /api/links/:id', () => {
   });
 });
 
-describe('object-level authorization: user B against user A\'s link', () => {
+describe("object-level authorization: user B against user A's link", () => {
   it('GET returns 404 and leaves the row unchanged', async () => {
     const { token: tokenA } = await signupUser('authz-get-a');
     const { token: tokenB } = await signupUser('authz-get-b');
     const created = await post(tokenA, { destinationUrl: 'https://example.com/protected' });
     const linkId = created.body.link.id as string;
 
-    const res = await request(app).get(`/api/links/${linkId}`).set('Authorization', `Bearer ${tokenB}`);
+    const res = await request(app)
+      .get(`/api/links/${linkId}`)
+      .set('Authorization', `Bearer ${tokenB}`);
     expect(res.status).toBe(404);
 
     const stored = await query<{ destination_url: string }>(
@@ -307,7 +366,10 @@ describe('object-level authorization: user B against user A\'s link', () => {
 describe('PATCH /api/links/:id', () => {
   it('a partial update leaves other fields untouched', async () => {
     const { token } = await signupUser('patch-partial');
-    const created = await post(token, { destinationUrl: 'https://example.com/original', maxClicks: 10 });
+    const created = await post(token, {
+      destinationUrl: 'https://example.com/original',
+      maxClicks: 10,
+    });
 
     const res = await request(app)
       .patch(`/api/links/${created.body.link.id}`)
@@ -321,7 +383,10 @@ describe('PATCH /api/links/:id', () => {
 
   it('an explicit null clears a nullable field', async () => {
     const { token } = await signupUser('patch-clear');
-    const created = await post(token, { destinationUrl: 'https://example.com/original', maxClicks: 10 });
+    const created = await post(token, {
+      destinationUrl: 'https://example.com/original',
+      maxClicks: 10,
+    });
 
     const res = await request(app)
       .patch(`/api/links/${created.body.link.id}`)

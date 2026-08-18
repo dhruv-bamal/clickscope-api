@@ -89,8 +89,7 @@ export const envSchema = z.object({
   // /api/auth/google request rather than fail fast at startup.
   GOOGLE_CLIENT_ID: z
     .string({
-      required_error:
-        'GOOGLE_CLIENT_ID is required, e.g. 123456789-abc.apps.googleusercontent.com',
+      required_error: 'GOOGLE_CLIENT_ID is required, e.g. 123456789-abc.apps.googleusercontent.com',
     })
     .min(1, 'GOOGLE_CLIENT_ID must not be empty'),
 
@@ -121,6 +120,40 @@ export const envSchema = z.object({
   FRONTEND_URL: z
     .string({ required_error: 'FRONTEND_URL is required, e.g. http://localhost:5173' })
     .url('FRONTEND_URL must be a valid URL'),
+
+  // How many hops of X-Forwarded-For Express should trust when deriving
+  // req.ip — passed straight to app.set('trust proxy', ...). 0 (the
+  // default) means "trust nothing but the real TCP socket," which is
+  // correct for local dev and this test suite, where nothing sits in
+  // front of the app. A deployment behind a load balancer or CDN (Phase
+  // 15 puts this behind Render's) must set this to the number of proxy
+  // hops in front of it — typically 1 for a single load balancer — or
+  // every IP-keyed rate limiter below collapses every user onto the
+  // proxy's one address. Never defaulted to 1 here: trusting a hop that
+  // doesn't exist yet would let a client spoof X-Forwarded-For straight
+  // past every IP-keyed limiter. See Notes.md, "Phase 10: Rate Limiting."
+  TRUST_PROXY: z.coerce
+    .number({ invalid_type_error: 'TRUST_PROXY must be a number' })
+    .int('TRUST_PROXY must be an integer')
+    .min(0, 'TRUST_PROXY must be 0 or greater')
+    .default(0),
+
+  // Auth (signup/login) rate limit: bcryptjs hashes/compares synchronously
+  // on the event loop, so unthrottled concurrent attempts here can stall
+  // every other request this process is handling, redirect path included.
+  // See Notes.md, "Phase 10: Rate Limiting" / "Why rate limit auth at all."
+  RATE_LIMIT_AUTH_WINDOW_SECONDS: z.coerce.number().int().positive().default(900),
+  RATE_LIMIT_AUTH_MAX: z.coerce.number().int().positive().default(5),
+
+  // POST /:shortCode/unlock rate limit — keyed per IP+link (see
+  // src/middleware/rateLimit.ts), so this budget is per link being
+  // attacked, not shared across every link an attacker tries.
+  RATE_LIMIT_UNLOCK_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
+  RATE_LIMIT_UNLOCK_MAX: z.coerce.number().int().positive().default(5),
+
+  // POST /api/links rate limit — keyed per authenticated user, not IP.
+  RATE_LIMIT_LINKS_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
+  RATE_LIMIT_LINKS_MAX: z.coerce.number().int().positive().default(20),
 });
 
 export type Config = z.infer<typeof envSchema>;

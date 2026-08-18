@@ -5,6 +5,7 @@ import { config } from '../config/index.js';
 import { readCookie } from '../lib/cookies.js';
 import { type AppError, gone, notFound } from '../lib/errors.js';
 import { MAX_ALIAS_LENGTH } from '../lib/shortCode.js';
+import { unlockLimiter } from '../middleware/rateLimit.js';
 import { validateBody, validateParams } from '../middleware/validate.js';
 import { enqueueClick } from '../queues/clickQueue.js';
 import { getLinkByShortCode, type RedirectLink } from '../services/linkService.js';
@@ -82,6 +83,14 @@ function deadStateError(link: RedirectLink): AppError | null {
   return null;
 }
 
+// Deliberately no rate limiter on this route — it's the app's core,
+// intentionally-viral product path, and blocking a legitimate traffic
+// burst here would be the worst failure mode a URL shortener can have.
+// Enumeration cost is already bounded by Phase 8's negative cache; the
+// other plausible abuse (maxClicks exhaustion) isn't actually solved by a
+// per-IP limit anyway, since a distributed source defeats it trivially.
+// See Notes.md, "Phase 10: Rate Limiting" / "Rate limiting a public,
+// viral-by-design endpoint without breaking the product."
 redirectRouter.get('/:shortCode', validateParams(shortCodeParamSchema), async (req, res) => {
   const { shortCode } = shortCodeParamSchema.parse(req.validated?.params);
   const link = await getLinkByShortCode(shortCode);
@@ -143,6 +152,7 @@ redirectRouter.get('/:shortCode', validateParams(shortCodeParamSchema), async (r
 
 redirectRouter.post(
   '/:shortCode/unlock',
+  unlockLimiter,
   validateParams(shortCodeParamSchema),
   validateBody(unlockBodySchema),
   async (req, res) => {

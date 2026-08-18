@@ -16,6 +16,7 @@ let app: Express;
 let exchangeCodeForIdentity: ReturnType<typeof vi.fn>;
 let verifyToken: typeof import('../../src/services/tokenService.js').verifyToken;
 let query: typeof import('../../src/db/pool.js').query;
+let rateLimitRedisConnection: typeof import('../../src/lib/rateLimitRedis.js').rateLimitRedisConnection;
 
 beforeAll(async () => {
   process.loadEnvFile('.env.test');
@@ -26,6 +27,18 @@ beforeAll(async () => {
   >;
   ({ verifyToken } = await import('../../src/services/tokenService.js'));
   ({ query } = await import('../../src/db/pool.js'));
+  ({ rateLimitRedisConnection } = await import('../../src/lib/rateLimitRedis.js'));
+
+  // See tests/routes/auth.test.ts's beforeAll for why this file-local flush
+  // is necessary now that signupLimiter/loginLimiter are backed by real,
+  // shared Redis rather than a per-process in-memory Map: every test file's
+  // supertest requests share one loopback IP, so without this flush this
+  // file's one signup call below could inherit budget already spent by
+  // whichever file ran immediately before it in the same `npm test` run.
+  const authLimiterKeys = await rateLimitRedisConnection.keys('rl:auth-*');
+  if (authLimiterKeys.length > 0) {
+    await rateLimitRedisConnection.del(...authLimiterKeys);
+  }
 });
 
 afterEach(() => {

@@ -41,6 +41,13 @@ describe('parseEnv', () => {
       JWT_EXPIRES_IN: '1d',
       BCRYPT_COST: 10, // coerced from string to number
       ...VALID_OAUTH_ENV,
+      TRUST_PROXY: 0,
+      RATE_LIMIT_AUTH_WINDOW_SECONDS: 900,
+      RATE_LIMIT_AUTH_MAX: 5,
+      RATE_LIMIT_UNLOCK_WINDOW_SECONDS: 60,
+      RATE_LIMIT_UNLOCK_MAX: 5,
+      RATE_LIMIT_LINKS_WINDOW_SECONDS: 60,
+      RATE_LIMIT_LINKS_MAX: 20,
     });
   });
 
@@ -58,6 +65,43 @@ describe('parseEnv', () => {
     expect(config.LOG_LEVEL).toBe('info');
     expect(config.JWT_EXPIRES_IN).toBe('7d');
     expect(config.BCRYPT_COST).toBe(12);
+  });
+
+  describe('rate limiting config', () => {
+    const baseEnv = {
+      DATABASE_URL: 'postgres://user:pass@localhost:5432/clickscope',
+      REDIS_URL: 'redis://localhost:6379',
+      CORS_ORIGIN: 'http://localhost:5173',
+      JWT_SECRET: VALID_JWT_SECRET,
+      ...VALID_OAUTH_ENV,
+    };
+
+    it('applies defaults for TRUST_PROXY and every RATE_LIMIT_* var when omitted', () => {
+      const config = parseEnv(baseEnv);
+
+      expect(config.TRUST_PROXY).toBe(0);
+      expect(config.RATE_LIMIT_AUTH_WINDOW_SECONDS).toBe(900);
+      expect(config.RATE_LIMIT_AUTH_MAX).toBe(5);
+      expect(config.RATE_LIMIT_UNLOCK_WINDOW_SECONDS).toBe(60);
+      expect(config.RATE_LIMIT_UNLOCK_MAX).toBe(5);
+      expect(config.RATE_LIMIT_LINKS_WINDOW_SECONDS).toBe(60);
+      expect(config.RATE_LIMIT_LINKS_MAX).toBe(20);
+    });
+
+    it('coerces TRUST_PROXY from a string', () => {
+      const config = parseEnv({ ...baseEnv, TRUST_PROXY: '1' });
+      expect(config.TRUST_PROXY).toBe(1);
+    });
+
+    it('rejects a negative TRUST_PROXY', () => {
+      expect(() => parseEnv({ ...baseEnv, TRUST_PROXY: '-1' })).toThrow(EnvValidationError);
+    });
+
+    it('rejects a non-integer RATE_LIMIT_AUTH_MAX', () => {
+      expect(() => parseEnv({ ...baseEnv, RATE_LIMIT_AUTH_MAX: '2.5' })).toThrow(
+        EnvValidationError,
+      );
+    });
   });
 
   it('rejects a configuration missing the required DATABASE_URL', () => {

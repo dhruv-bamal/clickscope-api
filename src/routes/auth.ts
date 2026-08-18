@@ -4,6 +4,7 @@ import { config } from '../config/index.js';
 import { badRequest, unauthorized } from '../lib/errors.js';
 import { consumeState, generateState, storeState } from '../lib/oauthState.js';
 import { requireAuth } from '../middleware/auth.js';
+import { loginLimiter, signupLimiter } from '../middleware/rateLimit.js';
 import { validateBody, validateQuery } from '../middleware/validate.js';
 import { findOrCreateOAuthUser, getUserById, login, signup } from '../services/authService.js';
 import { buildGoogleAuthUrl, exchangeCodeForIdentity } from '../services/oauthService.js';
@@ -30,13 +31,13 @@ const loginSchema = z.object({
   password: z.string().min(1, 'Password is required'),
 });
 
-authRouter.post('/signup', validateBody(signupSchema), async (req, res) => {
+authRouter.post('/signup', signupLimiter, validateBody(signupSchema), async (req, res) => {
   const { email, password } = signupSchema.parse(req.validated?.body);
   const { user, token } = await signup(email, password);
   res.status(201).json({ user, token });
 });
 
-authRouter.post('/login', validateBody(loginSchema), async (req, res) => {
+authRouter.post('/login', loginLimiter, validateBody(loginSchema), async (req, res) => {
   const { email, password } = loginSchema.parse(req.validated?.body);
   const { user, token } = await login(email, password);
   res.status(200).json({ user, token });
@@ -58,59 +59,55 @@ authRouter.get('/google', async (_req, res) => {
   res.redirect(buildGoogleAuthUrl(state));
 });
 
-authRouter.get(
-  '/google/callback',
-  validateQuery(googleCallbackQuerySchema),
-  async (req, res) => {
-    const { state, code, error } = googleCallbackQuerySchema.parse(req.validated?.query);
+authRouter.get('/google/callback', validateQuery(googleCallbackQuerySchema), async (req, res) => {
+  const { state, code, error } = googleCallbackQuerySchema.parse(req.validated?.query);
 
-    // State is validated FIRST, before even looking at `error` — an
-    // attacker forging a callback URL with error=access_denied and no
-    // valid state must not be treated as a legitimate denial, and must
-    // not reach the code-exchange step below either.
-    const stateValid = await consumeState(state);
-    if (!stateValid) {
-      throw badRequest('Invalid or expired OAuth state');
-    }
+  // State is validated FIRST, before even looking at `error` — an
+  // attacker forging a callback URL with error=access_denied and no
+  // valid state must not be treated as a legitimate denial, and must
+  // not reach the code-exchange step below either.
+  const stateValid = await consumeState(state);
+  if (!stateValid) {
+    throw badRequest('Invalid or expired OAuth state');
+  }
 
-    // The user denying consent (or another provider-side error) is a
-    // normal outcome, not a server error — send them back to the
-    // frontend rather than throwing.
-    if (error) {
-      req.log.warn({ error }, 'Google OAuth callback returned an error');
-      res.redirect(`${config.FRONTEND_URL}?error=oauth_denied`);
-      return;
-    }
+  // The user denying consent (or another provider-side error) is a
+  // normal outcome, not a server error — send them back to the
+  // frontend rather than throwing.
+  if (error) {
+    req.log.warn({ error }, 'Google OAuth callback returned an error');
+    res.redirect(`${config.FRONTEND_URL}?error=oauth_denied`);
+    return;
+  }
 
-    if (!code) {
-      throw badRequest('Missing authorization code');
-    }
+  if (!code) {
+    throw badRequest('Missing authorization code');
+  }
 
-    // Server-side only: the authorization code and Google's tokens never
-    // reach the browser, only the verified identity extracted from them.
-    const identity = await exchangeCodeForIdentity(code);
+  // Server-side only: the authorization code and Google's tokens never
+  // reach the browser, only the verified identity extracted from them.
+  const identity = await exchangeCodeForIdentity(code);
 
-    // Throws 409 if this email already belongs to a password account —
-    // see authService.findOrCreateOAuthUser for why we reject rather
-    // than auto-link.
-    const { token } = await findOrCreateOAuthUser(
-      'google',
-      identity.googleId,
-      identity.email,
-      identity.emailVerified,
-    );
+  // Throws 409 if this email already belongs to a password account —
+  // see authService.findOrCreateOAuthUser for why we reject rather
+  // than auto-link.
+  const { token } = await findOrCreateOAuthUser(
+    'google',
+    identity.googleId,
+    identity.email,
+    identity.emailVerified,
+  );
 
-    // The token goes in the URL FRAGMENT, not a query parameter — a
-    // fragment is never sent by the browser to any server (ours, a CDN,
-    // or a proxy in between), so it can't leak into access logs or a
-    // Referer header the way a query string would. The frontend reads it
-    // from window.location.hash and should scrub it immediately with
-    // history.replaceState (see Notes.md Phase 5 for the full tradeoff,
-    // including the residual browser-history exposure this doesn't
-    // eliminate, and more robust alternatives for later).
-    res.redirect(`${config.FRONTEND_URL}#token=${encodeURIComponent(token)}`);
-  },
-);
+  // The token goes in the URL FRAGMENT, not a query parameter — a
+  // fragment is never sent by the browser to any server (ours, a CDN,
+  // or a proxy in between), so it can't leak into access logs or a
+  // Referer header the way a query string would. The frontend reads it
+  // from window.location.hash and should scrub it immediately with
+  // history.replaceState (see Notes.md Phase 5 for the full tradeoff,
+  // including the residual browser-history exposure this doesn't
+  // eliminate, and more robust alternatives for later).
+  res.redirect(`${config.FRONTEND_URL}#token=${encodeURIComponent(token)}`);
+});
 
 authRouter.get('/me', requireAuth, async (req, res) => {
   const user = await getUserById(req.userId!);

@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { notFound } from '../lib/errors.js';
 import { customAliasSchema } from '../lib/shortCode.js';
 import { requireAuth } from '../middleware/auth.js';
+import { linksCreateLimiter } from '../middleware/rateLimit.js';
 import { validateBody, validateParams, validateQuery } from '../middleware/validate.js';
 import {
   type CreateLinkInput,
@@ -59,7 +60,12 @@ const updateLinkSchema = z
   .object({
     destinationUrl: destinationUrlSchema.optional(),
     expiresAt: futureDateSchema.nullable().optional(),
-    maxClicks: z.number().int().positive('maxClicks must be a positive integer').nullable().optional(),
+    maxClicks: z
+      .number()
+      .int()
+      .positive('maxClicks must be a positive integer')
+      .nullable()
+      .optional(),
     isActive: z.boolean().optional(),
     password: linkPasswordSchema.nullable().optional(),
   })
@@ -69,22 +75,32 @@ const MAX_PAGE_SIZE = 100;
 const DEFAULT_PAGE_SIZE = 20;
 
 const listLinksQuerySchema = z.object({
-  limit: z.coerce.number().int().positive('limit must be a positive integer').default(DEFAULT_PAGE_SIZE),
+  limit: z.coerce
+    .number()
+    .int()
+    .positive('limit must be a positive integer')
+    .default(DEFAULT_PAGE_SIZE),
   offset: z.coerce.number().int().nonnegative('offset must be 0 or greater').default(0),
 });
 
-linksRouter.post('/', requireAuth, validateBody(createLinkSchema), async (req, res) => {
-  const parsed = createLinkSchema.parse(req.validated?.body);
+linksRouter.post(
+  '/',
+  requireAuth,
+  linksCreateLimiter,
+  validateBody(createLinkSchema),
+  async (req, res) => {
+    const parsed = createLinkSchema.parse(req.validated?.body);
 
-  const input: CreateLinkInput = { destinationUrl: parsed.destinationUrl };
-  if (parsed.customAlias !== undefined) input.customAlias = parsed.customAlias;
-  if (parsed.expiresAt !== undefined) input.expiresAt = parsed.expiresAt;
-  if (parsed.maxClicks !== undefined) input.maxClicks = parsed.maxClicks;
-  if (parsed.password !== undefined) input.password = parsed.password;
+    const input: CreateLinkInput = { destinationUrl: parsed.destinationUrl };
+    if (parsed.customAlias !== undefined) input.customAlias = parsed.customAlias;
+    if (parsed.expiresAt !== undefined) input.expiresAt = parsed.expiresAt;
+    if (parsed.maxClicks !== undefined) input.maxClicks = parsed.maxClicks;
+    if (parsed.password !== undefined) input.password = parsed.password;
 
-  const link = await createLink(req.userId!, input);
-  res.status(201).json({ link });
-});
+    const link = await createLink(req.userId!, input);
+    res.status(201).json({ link });
+  },
+);
 
 linksRouter.get('/', requireAuth, validateQuery(listLinksQuerySchema), async (req, res) => {
   const { limit: requestedLimit, offset } = listLinksQuerySchema.parse(req.validated?.query);

@@ -2644,9 +2644,9 @@ client and `checkRedisHealth()`; `src/db/pool.ts` for the analogous
 `ioredis` was chosen here for connection-only health checking rather
 than a different, perhaps simpler, client: it's the one client this
 codebase will need again regardless, so introducing it now means the
-worker phase reuses this exact *library* rather than adding a second
+worker phase reuses this exact _library_ rather than adding a second
 Redis client to the dependency tree later. (Phase 9, once it arrives,
-turns out to *not* reuse this exact client *instance* for BullMQ —
+turns out to _not_ reuse this exact client _instance_ for BullMQ —
 `maxRetriesPerRequest: 1` here is incompatible with BullMQ's `Worker`,
 which requires `maxRetriesPerRequest: null`. See Notes.md, "Phase 9:
 Background Jobs" for the dedicated-connection reasoning; the shared
@@ -3604,7 +3604,7 @@ the `OAuth2Client` instance and all three calls. `nock` is used only in
   explicitly in `oauthService.ts`; only the JWKS-fetch/signature-verify
   internals of `verifyIdToken` are actually opaque.
 - Mocking `verifyIdToken`'s return value in tests without also asserting
-  what it was *called with* — a stub returns the same canned payload no
+  what it was _called with_ — a stub returns the same canned payload no
   matter its arguments, so a regression that dropped the `audience`
   check would pass silently. See the testing subsection below.
 - Forgetting that `getToken`/`verifyIdToken` are genuine network calls —
@@ -3648,28 +3648,28 @@ knows at each point:
 1. Browser hits `GET /api/auth/google`. Our API generates a random
    `state`, stores it in Redis, and redirects the browser to Google's
    consent screen with `client_id`, `redirect_uri`, `scope`, `state`, and
-   `response_type=code` in the URL. *Our API knows:* the state it just
-   issued. *The browser knows:* nothing new yet, just a URL to follow.
-   *Google knows:* nothing yet — this is the first request it sees.
+   `response_type=code` in the URL. _Our API knows:_ the state it just
+   issued. _The browser knows:_ nothing new yet, just a URL to follow.
+   _Google knows:_ nothing yet — this is the first request it sees.
 2. Browser lands on Google's real consent screen, authenticates with
    Google directly (our server is never involved in or shown the
    password), and approves or denies.
 3. Google redirects the browser back to `GOOGLE_REDIRECT_URI` — i.e.
    `GET /api/auth/google/callback` — with `code` and the same `state` it
-   was given (or `error` if denied). *The browser knows:* an
-   authorization code, but not what it's worth. *Google knows:* it just
+   was given (or `error` if denied). _The browser knows:_ an
+   authorization code, but not what it's worth. _Google knows:_ it just
    authenticated this user and issued a short-lived code tied to that.
 4. Our API validates `state` (see the next subsection), then calls
    Google's token endpoint **server-to-server** — the browser is not
    involved in this exchange — sending `code` plus `GOOGLE_CLIENT_SECRET`
    to prove it's really our registered server. Google responds with
    tokens, including an `id_token` (a signed JWT asserting identity).
-   *Our API now knows:* a verified Google identity (sub, email,
-   email_verified). *Google knows:* it just handed identity/access
+   _Our API now knows:_ a verified Google identity (sub, email,
+   email_verified). _Google knows:_ it just handed identity/access
    tokens to whoever holds the client secret.
 5. Our API verifies the `id_token`, finds or creates a local user, signs
    **our own** JWT, and redirects the browser to `FRONTEND_URL?token=...`.
-   *The browser now knows:* our own session token — never Google's.
+   _The browser now knows:_ our own session token — never Google's.
 
 **Where it lives in the codebase.** `src/routes/auth.ts` (`GET /google`,
 `GET /google/callback`); `src/services/oauthService.ts` (steps 4-5's
@@ -3704,7 +3704,7 @@ Google's access token or our client secret.
 
 ### Why the browser gets a code, not a token; why the implicit flow is deprecated
 
-**What it is.** The authorization code flow hands the *browser* only a
+**What it is.** The authorization code flow hands the _browser_ only a
 short-lived `code`, which is worthless without the client secret. The
 now-deprecated OAuth "implicit flow" instead put an access token
 directly in the redirect URL's fragment, for JavaScript to read.
@@ -3739,7 +3739,7 @@ returns Google's raw tokens to its caller (only a verified `GoogleIdentity`).
   the flow, via `?token=` on the `FRONTEND_URL` redirect.
 - Assuming "server-side" is automatically enough — the code exchange
   being server-to-server is necessary but not sufficient; it's only safe
-  *because* it also requires the client secret, which the implicit flow
+  _because_ it also requires the client secret, which the implicit flow
   had no equivalent for.
 
 **Production considerations.** The implicit flow is formally deprecated
@@ -3768,15 +3768,15 @@ generates before redirecting to Google, and requires back — unchanged —
 on the callback.
 
 **Why it exists in this project.** Without it, `GET
-/api/auth/google/callback?code=...` would accept *any* code sent to it,
+/api/auth/google/callback?code=...` would accept _any_ code sent to it,
 from anywhere. That's exploitable: an attacker can complete their own
-Google login, capture the `code` Google issues *them*, and trick a
+Google login, capture the `code` Google issues _them_, and trick a
 victim's browser into visiting `/api/auth/google/callback?code=<attacker's
 code>` (an `<img>` tag, a crafted link, anything that makes the victim's
 browser issue that GET). The victim's browser has no way to know this
 code doesn't belong to them — it's just a URL. Our server would exchange
-the attacker's code, find-or-create (or log into) the *attacker's*
-Google-linked account, and hand the *victim's* browser a valid session
+the attacker's code, find-or-create (or log into) the _attacker's_
+Google-linked account, and hand the _victim's_ browser a valid session
 token for the attacker's account. The victim is now unknowingly logged
 in as the attacker — and anything the victim subsequently does (saving
 links, connecting data) happens inside the attacker's account, which the
@@ -3791,7 +3791,7 @@ The callback's very first action, before even inspecting `error` or
 `code`, is `consumeState()` — validate-and-delete in one atomic Redis
 `GETDEL`. If the state doesn't exist (never issued, expired, or already
 used), the callback throws `400` immediately and touches nothing else.
-Because the attacker in the scenario above was never issued *our*
+Because the attacker in the scenario above was never issued _our_
 `state` value for the victim's browser to carry, their forged callback
 URL either omits `state` or guesses at one — and guessing 32 random
 bytes is infeasible.
@@ -3803,7 +3803,7 @@ bytes is infeasible.
 
 **Common pitfalls.**
 
-- Validating `state` *after* checking `error` or exchanging `code` —
+- Validating `state` _after_ checking `error` or exchanging `code` —
   this project deliberately checks state first, specifically so a forged
   callback carrying `error=access_denied` and no valid state can't be
   treated as a legitimate denial (see the "handling denied consent"
@@ -3824,7 +3824,7 @@ expiring mid-flow, short enough that a leaked or intercepted callback
 URL stops being useful quickly.
 
 **Interview answer.** The state parameter defeats login CSRF — an
-attacker tricking a victim's browser into completing *the attacker's*
+attacker tricking a victim's browser into completing _the attacker's_
 OAuth login, which would otherwise log the victim into the attacker's
 account without either of them realizing it. It works because we
 generate a random, single-use, short-lived value before redirecting to
@@ -3838,7 +3838,7 @@ bypassed by an attacker probing other paths through the handler first.
 
 ### Redis as an ephemeral state store, and why not a signed cookie or the database
 
-**What it is.** The choice of *where* to keep `state` between issuing it
+**What it is.** The choice of _where_ to keep `state` between issuing it
 (`GET /google`) and checking it (`GET /google/callback`) — this project
 picked Redis over the two other obvious options.
 
@@ -3851,7 +3851,7 @@ records.
 **How it works mechanically / the alternatives.** A signed cookie set on
 `GET /google` and read back on the callback was the main alternative
 considered. It would work for the simple case, but ties the state's
-validity to *the same browser* completing the round trip, and Google's
+validity to _the same browser_ completing the round trip, and Google's
 own redirect back to our callback is itself a cross-site navigation from
 the browser's perspective — some browsers' cookie `SameSite` defaults
 can drop cookies across exactly this kind of redirect chain, which would
@@ -3895,10 +3895,10 @@ permanent table like `users`.
 
 ### OpenID Connect vs. plain OAuth 2.0: what the id_token adds
 
-**What it is.** OAuth 2.0 on its own is an *authorization* protocol — it
+**What it is.** OAuth 2.0 on its own is an _authorization_ protocol — it
 answers "does this app have permission to act on the user's behalf /
 access this resource," via an access token. OpenID Connect (OIDC) is a
-thin identity layer on top of OAuth 2.0 that adds *authentication* —
+thin identity layer on top of OAuth 2.0 that adds _authentication_ —
 "who is this user" — via a new artifact, the `id_token`, a signed JWT.
 
 **Why it exists in this project.** This phase needs authentication (who
@@ -3907,7 +3907,7 @@ user's behalf (we never call the Gmail or Drive APIs). Requesting the
 `openid` scope is exactly what turns a plain OAuth request into an OIDC
 request and makes Google return an `id_token` at all — without it,
 Google's token response would only contain an access token, and this
-codebase would have no signed, verifiable claim about *who* just
+codebase would have no signed, verifiable claim about _who_ just
 authenticated, only a token that's the wrong tool for identity (access
 tokens are opaque-by-design and meant for calling APIs, not for a
 relying party to parse and trust as identity).
@@ -3930,7 +3930,7 @@ Google's access token.
 
 **Common pitfalls.**
 
-- Treating the OAuth *access token* as proof of identity — it isn't; it
+- Treating the OAuth _access token_ as proof of identity — it isn't; it
   proves the bearer has some permission Google granted, not who they
   are. Only the `id_token` is meant to be parsed as an identity claim.
 - Forgetting the `openid` scope and being confused when Google's
@@ -3963,19 +3963,20 @@ token's intended recipient) matches our `GOOGLE_CLIENT_ID`, that `iss`
 passed.
 
 **Why it exists in this project.** A signature check alone proves "some
-real Google-issued token," not "a token meant for *this application*" or
+real Google-issued token," not "a token meant for _this application_" or
 "a token that's still current" — the other two checks close gaps a
 signature check leaves open.
 
 **How it works mechanically.**
+
 - **Audience (`aud`)** must equal `GOOGLE_CLIENT_ID`
   (`exchangeCodeForIdentity` passes `audience: config.GOOGLE_CLIENT_ID`
   explicitly). This prevents **token substitution**: Google issues
   `id_token`s to many different registered applications; without an
-  audience check, a token legitimately issued to some *other*
+  audience check, a token legitimately issued to some _other_
   application (which a malicious or compromised app could relay to us)
   would pass a bare signature check just as well as one issued to us —
-  the signature only proves "Google signed this for *someone*," not
+  the signature only proves "Google signed this for _someone_," not
   "for us."
 - **Issuer (`iss`)** must be one of Google's known issuer strings. This
   prevents accepting a **correctly-signed token from the wrong
@@ -3998,7 +3999,7 @@ call rather than hand-rolling it (see the dependencies subsection above).
 
 - Skipping the audience check (or passing the wrong value) — this is the
   single most dangerous mistake here, since a missing audience check is
-  invisible in normal testing (a real token from *your own* app still
+  invisible in normal testing (a real token from _your own_ app still
   verifies fine) and only becomes exploitable if something ever presents
   a token minted for a different client.
 - Assuming signature verification alone is "identity verification" — it
@@ -4012,8 +4013,8 @@ array of valid client IDs, not a single hardcoded one — `verifyIdToken`'s
 `audience` option already accepts an array for this reason.
 
 **Interview answer.** Signature verification alone only proves "Google
-genuinely signed this token for *someone*" — it doesn't prove the token
-was meant for *this* application, or that it's still current. The
+genuinely signed this token for _someone_" — it doesn't prove the token
+was meant for _this_ application, or that it's still current. The
 audience check closes the first gap: it prevents a token minted for a
 different Google-registered app from being accepted here. The issuer
 check pins verification to Google specifically, and the expiry check
@@ -4031,9 +4032,9 @@ own.
 `access_token` or `id_token` to the browser as a session credential.
 
 **Why it exists in this project.** Google's tokens describe a
-relationship with *Google* (this access token can call Google's APIs;
+relationship with _Google_ (this access token can call Google's APIs;
 this id_token asserts a Google identity, valid until Google's own
-expiry). They say nothing about a *Click Scope* user id, and nothing
+expiry). They say nothing about a _Click Scope_ user id, and nothing
 downstream in this app (`requireAuth`, `GET /me`, any future link-CRUD
 route) should need to know or care whether a request came from a
 password login or a Google login — it should see one consistent kind of
@@ -4096,7 +4097,7 @@ request URL is — and a security review of the diff caught it.
 **Why it exists in this project.** A query string is part of the actual
 HTTP request line the browser sends. That means it can end up in: this
 server's own access logs, any reverse proxy or CDN sitting in front of
-it, and the `Referer` header of any *subsequent* outbound request the
+it, and the `Referer` header of any _subsequent_ outbound request the
 landing page makes (an analytics beacon, a font/CDN fetch, an ad
 script) — none of which should ever see a live bearer token for this
 app's session. A URL fragment (everything after `#`) is fundamentally
@@ -4104,19 +4105,15 @@ different: it's a client-side-only construct. Browsers never include it
 in the request line sent to a server, so none of those log/Referer
 leakage paths apply to it at all.
 
-**How it works mechanically.** `res.redirect(\`${config.FRONTEND_URL}#token=${encodeURIComponent(token)}\`)`
-— from the server's perspective this looks almost identical to the
-query-string version, but the browser treats everything after `#`
-specially: it's available to client-side JavaScript via
-`window.location.hash`, but is stripped before the browser ever
+**How it works mechanically.** `res.redirect(\`${config.FRONTEND_URL}#token=${encodeURIComponent(token)}\`)`— from the server's perspective this looks almost identical to the
+query-string version, but the browser treats everything after`#`specially: it's available to client-side JavaScript via`window.location.hash`, but is stripped before the browser ever
 constructs the actual GET request line for that navigation (and for any
 same-origin requests the page subsequently makes, since fragments aren't
-part of what gets echoed into `Referer` either). The frontend (out of
+part of what gets echoed into `Referer`either). The frontend (out of
 scope for this phase, but worth stating for whoever builds it) should
-read `window.location.hash` once, then immediately call
-`history.replaceState(null, '', window.location.pathname)` to scrub the
+read`window.location.hash`once, then immediately call`history.replaceState(null, '', window.location.pathname)` to scrub the
 token out of the visible URL and browser history entry — the fragment
-approach avoids *transmission* leakage, not persistence in history.
+approach avoids _transmission_ leakage, not persistence in history.
 
 **Where it lives in the codebase.** The final `res.redirect(...)` in the
 `/google/callback` handler, `src/routes/auth.ts`. The `?error=oauth_denied`
@@ -4142,7 +4139,7 @@ API-only, no frontend): setting the JWT as an `HttpOnly`, `Secure`,
 `SameSite=Lax` cookie directly in the redirect response (eliminates
 client-side JS exposure entirely, but requires the API and frontend to
 share a registrable domain or accept cross-site cookie complexity), or
-redirecting with a short-lived, single-use *exchange code* that the
+redirecting with a short-lived, single-use _exchange code_ that the
 frontend immediately POSTs to a dedicated token-exchange endpoint
 (keeps the real JWT out of any URL at all, at the cost of one more
 endpoint and one more round trip). Both are meaningfully bigger design
@@ -4169,7 +4166,7 @@ build against.
 ### Account linking: the takeover vulnerability, the email_verified claim, and the rejection policy
 
 **What it is.** The policy decision in `findOrCreateOAuthUser`: if a
-Google login's email matches an *existing password account*, reject with
+Google login's email matches an _existing password account_, reject with
 409 rather than silently attaching the Google identity to that account
 ("auto-linking").
 
@@ -4179,13 +4176,13 @@ with `victim@example.com` and a password, but never verifies that email
 (if this app ever adds email verification) — or more simply, consider
 any system where email ownership isn't cryptographically tied to the
 account. An attacker who does not own `victim@example.com` can still
-often create a *Google* account using that same address as a recovery/
+often create a _Google_ account using that same address as a recovery/
 contact email, or — more directly relevant here — if this app ever
-trusted an *unverified* email claim from any provider, an attacker could
+trusted an _unverified_ email claim from any provider, an attacker could
 register anywhere with `victim@example.com` and get auto-linked into the
 victim's existing account, gaining full access to it. The
 `email_verified` claim in Google's `id_token` is what would make
-auto-linking *conditionally* safe: Google only sets it `true` after
+auto-linking _conditionally_ safe: Google only sets it `true` after
 Google itself confirmed the user controls that mailbox (via Google's own
 signup/verification flow), so an auto-link gated strictly on
 `email_verified === true` is a meaningfully different, much safer claim
@@ -4194,7 +4191,7 @@ reject the match entirely, regardless of `email_verified`, rather than
 build and reason carefully about a conditional auto-link now.
 
 **How it works mechanically.** In `findOrCreateOAuthUser`, the
-`(oauth_provider, oauth_id)` lookup runs *first*; if it misses, a second
+`(oauth_provider, oauth_id)` lookup runs _first_; if it misses, a second
 lookup by `lower(email)` checks for a password account. A hit there is
 necessarily a password account (an OAuth match would have already
 returned above), so it throws `conflict('An account with this email
@@ -4212,7 +4209,7 @@ below for the contrast).
 
 **Common pitfalls.**
 
-- Auto-linking on *any* email match without checking `email_verified` —
+- Auto-linking on _any_ email match without checking `email_verified` —
   this is the exact takeover vector described above; even a
   conditional auto-link needs that claim as its gate, and this phase
   chose not to build the conditional version at all yet.
@@ -4241,7 +4238,7 @@ account just because the email string matches is an account-takeover
 vector — an attacker who can get any provider to hand them a token
 claiming a victim's email would be silently merged into the victim's
 account. The `email_verified` claim is what makes a conditional version
-of auto-linking safe, because it means the *provider* already confirmed
+of auto-linking safe, because it means the _provider_ already confirmed
 mailbox ownership, not just that a string matches. For this phase I
 chose to reject the match outright rather than build that conditional
 path — a password-account owner trying Google sign-in gets a clear 409
@@ -4257,12 +4254,12 @@ about a linking feature's edge cases before it's actually needed.
 account email is not verified')` if `emailVerified` is `false`, before
 running either of its two `SELECT`s or its `INSERT` — a check added
 after the initial implementation, once a security review pointed out the
-account-linking rejection policy above only covers *linking to an
-existing account*, not *creating a new one*.
+account-linking rejection policy above only covers _linking to an
+existing account_, not _creating a new one_.
 
 **Why it exists in this project.** The account-linking subsection above
-explains why `email_verified` is the gate that makes *linking* safe —
-but the same claim matters just as much for plain account *creation*,
+explains why `email_verified` is the gate that makes _linking_ safe —
+but the same claim matters just as much for plain account _creation_,
 for a different reason: `users_email_lower_unique_idx` (Phase 2) makes
 email globally unique across every user, OAuth or password. If this
 function created an OAuth account for an email Google itself hasn't
@@ -4281,7 +4278,7 @@ to someone Google itself has confirmed controls that mailbox.
 `findOrCreateOAuthUser`, before even the `(oauth_provider, oauth_id)`
 lookup — so an unverified identity is rejected without a single query
 running, not just before the `INSERT`. This is stricter than "only check
-before creating a new row": it also means a *returning* OAuth user would
+before creating a new row": it also means a _returning_ OAuth user would
 be rejected on a login where Google's response reports `email_verified:
 false`, which in practice shouldn't happen for an account that was
 already created (creation itself now requires `true`), but keeps the
@@ -4297,9 +4294,9 @@ HTTP callback).
 
 **Common pitfalls.**
 
-- Checking `email_verified` only at the account-*linking* branch (the
+- Checking `email_verified` only at the account-_linking_ branch (the
   email-collision `SELECT`) and assuming that's sufficient — it isn't;
-  the squatting risk exists purely from *creating* a row, with no
+  the squatting risk exists purely from _creating_ a row, with no
   existing account required for an attacker to cause harm.
 - Defaulting `emailVerified` to `true` anywhere upstream "to keep things
   simple" — `oauthService.ts`'s `exchangeCodeForIdentity` already
@@ -4317,8 +4314,8 @@ configuration.
 
 **Interview answer.** The account-linking rejection policy stops an
 attacker from attaching an unverified Google identity to someone else's
-*existing* password account, but that alone doesn't stop them from
-*creating* a brand-new account with someone else's unverified email —
+_existing_ password account, but that alone doesn't stop them from
+_creating_ a brand-new account with someone else's unverified email —
 which would squat on this app's globally-unique email slot and lock the
 real owner out of ever signing up with their own address. So
 `findOrCreateOAuthUser` now rejects any Google identity with
@@ -4343,9 +4340,9 @@ any time. If this app keyed OAuth users on email instead, a user who
 changes their Google email would look, on their next login, like a
 brand-new person — either creating a duplicate account (losing access to
 their links/history under the old identity) or, worse, silently landing
-on whatever *other* account currently holds that new email string,
+on whatever _other_ account currently holds that new email string,
 depending on how such a system were built. Keying on `(provider,
-oauth_id)` first sidesteps both failure modes: the *same* Google account
+oauth_id)` first sidesteps both failure modes: the _same_ Google account
 is always recognized as the same Click Scope user, regardless of what
 email it currently reports.
 
@@ -4372,7 +4369,7 @@ application logic.
   reintroduces the email-instability bug this ordering exists to avoid,
   even if both checks are eventually present.
 - Assuming `provider` alone is enough — `oauth_id` (Google's `sub`) is
-  only unique *within* a provider; the composite `(provider, oauth_id)`
+  only unique _within_ a provider; the composite `(provider, oauth_id)`
   is the actual identity key, which is why `users_oauth_identity_unique`
   is a two-column constraint, not a unique index on `oauth_id` alone.
 
@@ -4388,7 +4385,7 @@ either gets treated as a new signup, losing their existing account, or
 in a worse design, lands on whatever account currently owns that new
 email string. The provider's subject id is the actual identity; email is
 just contact information that happens to also be useful for detecting a
-collision with a *different* signup method, which is a separate check
+collision with a _different_ signup method, which is a separate check
 run only when the identity lookup misses.
 
 ---
@@ -4433,7 +4430,7 @@ whose `INSERT` column lists are each other's complement.
 - Writing an `INSERT` that explicitly sets `password_hash = NULL` for an
   OAuth user instead of simply omitting the column — functionally
   identical (the column defaults to `NULL` either way), but omission
-  makes the two `INSERT` statements' *shapes* visibly mirror the XOR
+  makes the two `INSERT` statements' _shapes_ visibly mirror the XOR
   rule itself; explicitly writing `NULL` obscures that symmetry for a
   future reader.
 
@@ -4461,7 +4458,7 @@ path in either function that could even attempt to violate the rule.
 **What it is.** When a user clicks "Cancel" on Google's consent screen,
 Google redirects back with `?error=access_denied` (and no `code`) rather
 than failing to redirect at all. The callback handler checks for this
-*after* validating `state` but *before* attempting anything that assumes
+_after_ validating `state` but _before_ attempting anything that assumes
 a `code` exists, and responds with a redirect, not a thrown `AppError`.
 
 **Why it exists in this project.** A user declining to sign in with
@@ -4535,7 +4532,7 @@ Postgres/Redis, exactly like every other test in this codebase.
 
 **Why it exists in this project.** This is the first genuine external-
 network dependency in the test suite — every other test hits a real
-*local* instance of its dependency (Postgres, Redis), which this project
+_local_ instance of its dependency (Postgres, Redis), which this project
 can spin up in Docker Compose; there is no equivalent "real local
 Google." Hitting the actual Google API from tests would be slow, flaky
 in CI, and explicitly out of scope for this phase.
@@ -4549,7 +4546,7 @@ identity result — constructed as a real `LoginTicket` instance (from
 an ad hoc object shape. Critically, one test asserts
 `expect(spy).toHaveBeenCalledWith(expect.objectContaining({ idToken:
 'fake-id-token', audience: clientId }))` — because `verifyIdToken` is
-fully stubbed, every *other* test in the file would still pass even if
+fully stubbed, every _other_ test in the file would still pass even if
 the real code stopped passing the correct `audience`; the mock returns
 its canned payload regardless of what it's called with. That one
 assertion is what stands between "we call `verifyIdToken` correctly" and
@@ -4569,8 +4566,8 @@ audience-assertion test); `tests/services/authService.test.ts`'s
 
 **Common pitfalls.**
 
-- Mocking a verification call's *output* without ever asserting its
-  *input* — see the audience-assertion point above; this is the specific
+- Mocking a verification call's _output_ without ever asserting its
+  _input_ — see the audience-assertion point above; this is the specific
   gap flagged during this phase's planning, not a hypothetical.
 - Mocking more than necessary — `buildGoogleAuthUrl` is pure and
   network-free, so mocking it too (rather than letting the `/google`
@@ -4580,17 +4577,17 @@ audience-assertion test); `tests/services/authService.test.ts`'s
   — it doesn't, and the next subsection is explicit about that gap.
 
 **Production considerations — the residual gap.** Signature verification
-*correctness itself* — does `verifyIdToken` actually reject a forged
+_correctness itself_ — does `verifyIdToken` actually reject a forged
 token, an expired one, one with the wrong audience — is trusted entirely
 to `google-auth-library`'s own test suite, not exercised by this
 project's. This project's tests only prove two things: that our code
 calls `verifyIdToken` with the right arguments, and that our code
-handles its output correctly. They cannot catch a bug *inside* the
+handles its output correctly. They cannot catch a bug _inside_ the
 library. In a system where that residual risk mattered more — handling
 financial transactions, or a security-sensitive multi-tenant boundary —
 the right mitigation wouldn't be hand-rolling JWKS verification in-house
 just to make it testable; it would be adding a small number of
-integration tests that run against Google's *real* token endpoint in CI,
+integration tests that run against Google's _real_ token endpoint in CI,
 using a real, low-privilege test Google Cloud OAuth client, kept on a
 separate, slower CI tier from the fast mocked unit suite — specifically
 to catch the case where a `google-auth-library` upgrade or a config
@@ -4600,10 +4597,10 @@ reveal.
 **Interview answer.** I mock the one real network call (`nock` on
 Google's token endpoint) and stub `verifyIdToken`'s return value
 directly, rather than hitting the real Google API from tests. The
-important detail is that mocking `verifyIdToken`'s *output* alone leaves
+important detail is that mocking `verifyIdToken`'s _output_ alone leaves
 a blind spot — since the mock returns the same canned result regardless
 of input, a regression that broke the `audience` argument would pass
-silently — so I added a test asserting `verifyIdToken` is *called with*
+silently — so I added a test asserting `verifyIdToken` is _called with_
 our `GOOGLE_CLIENT_ID`. Even so, this test suite can't prove Google's own
 signature-verification logic is correct — that's trusted to the
 library's own tests. If that residual risk mattered more, the fix
@@ -4654,7 +4651,7 @@ would produce.
   an ID, not a password" — the whole point of Phase 4's CSPRNG-vs-`Math.random()`
   reasoning for tokens applies just as much to an identifier that gates
   access to a resource.
-- Using nanoid's *default* alphabet (which includes `-` and `_`) instead
+- Using nanoid's _default_ alphabet (which includes `-` and `_`) instead
   of `customAlphabet` with an explicit set — this project's alphabet is a
   deliberate, separate decision from "whatever nanoid ships with", see
   the alias-charset discussion below.
@@ -4688,13 +4685,13 @@ still not authorized (that user doesn't own the link they're asking to
 delete).
 
 **Why it exists in this project.** Every route through Phase 5 only
-needed authentication: `GET /api/auth/me` returns *the caller's own*
+needed authentication: `GET /api/auth/me` returns _the caller's own_
 data by construction (it reads `req.userId`, there's no other id
 involved). Link routes are the first place a request names a resource
 that might belong to someone else — `GET /api/links/:id` takes an `id`
 from the URL that has no necessary relationship to `req.userId` at all.
-Proving the token is valid says nothing about whether *this* token's
-owner is allowed to see *that* particular row.
+Proving the token is valid says nothing about whether _this_ token's
+owner is allowed to see _that_ particular row.
 
 **How it works mechanically.** `requireAuth` (unchanged from Phase 4)
 handles authentication only — it populates `req.userId` and nothing
@@ -4718,7 +4715,7 @@ constraining what data that identity's queries can touch.
   every route in `src/routes/links.ts` needs both.
 - Checking authorization in the route/controller layer with an
   `if (link.userId !== req.userId)` after an unscoped fetch — technically
-  achieves the same *result* as this phase's approach in the common case,
+  achieves the same _result_ as this phase's approach in the common case,
   but is structurally weaker; see the next section for why.
 
 **Production considerations.** At larger scale this often grows into a
@@ -4790,13 +4787,13 @@ whether to hand it back.
 **Common pitfalls.**
 
 - The single most common real-world version of this bug: `SELECT * FROM
-  links WHERE id = $1`, then `if (link.user_id !== req.userId) throw
-  forbidden()` — works fine until someone adds a second call site to the
+links WHERE id = $1`, then `if (link.user_id !== req.userId) throw
+forbidden()` — works fine until someone adds a second call site to the
   unscoped fetch and forgets the check, or a refactor moves the check
   above the fetch instead of after it.
 - Believing input validation (checking `id` is a well-formed UUID) has
   anything to do with authorization — a syntactically valid UUID that
-  belongs to another user is a perfectly valid *request*, just not an
+  belongs to another user is a perfectly valid _request_, just not an
   authorized one. Validation and authorization are separate concerns
   addressed by separate mechanisms in this codebase (Zod for the former,
   the SQL WHERE clause for the latter).
@@ -4846,7 +4843,7 @@ still passing `requireAuth` with a perfectly valid token. This is
 exactly the gap authentication alone cannot close.
 
 **How it works mechanically.** IDOR isn't a single bug pattern to grep
-for — it's a category defined by what's *missing*: an authorization
+for — it's a category defined by what's _missing_: an authorization
 check between "the request named a resource" and "the resource was
 acted on." In this codebase specifically, it would look like a route or
 service function that took an `id` and ran a query against it without
@@ -4870,7 +4867,7 @@ just its features' happy paths.
   protection has to hold even when the attacker already has a real id in
   hand, not just against blind enumeration.
 - Testing only the happy path (owner can CRUD their own link) and never
-  writing the negative case (a second user *cannot*) — a route can look
+  writing the negative case (a second user _cannot_) — a route can look
   completely correct and still be an IDOR if nobody ever tried to break
   it from the outside. This is exactly why this phase's test suite makes
   the cross-user attempt-and-verify-unchanged pattern mandatory for every
@@ -4881,7 +4878,7 @@ common vulnerability classes found in real-world bug bounty reports,
 precisely because it's easy to introduce (one missing WHERE clause) and
 easy to miss in review (the code "looks" like ordinary CRUD). The
 mitigation that scales is the one used here: make the authorized path
-the *only* path a query can take, rather than relying on every reviewer
+the _only_ path a query can take, rather than relying on every reviewer
 to notice a missing check in every new endpoint forever.
 
 **Interview answer.** Broken access control — specifically IDOR, insecure
@@ -4905,7 +4902,7 @@ user A, the server has (at least) two honest-sounding response options:
 ("nothing here"). This project returns 404.
 
 **Why it exists in this project.** A 403 response, on its own,
-*confirms* that the id refers to a real resource — it tells the caller
+_confirms_ that the id refers to a real resource — it tells the caller
 "you found something, you're just not allowed to see it." For a resource
 whose id space an attacker could iterate or guess pieces of, that's an
 information leak: a 403/404 split lets someone map out which ids
@@ -4941,9 +4938,9 @@ and `DELETE /:id`).
 
 **Common pitfalls.**
 
-- Implementing the ownership check as a separate step *after* an
+- Implementing the ownership check as a separate step _after_ an
   existence check — `if (!link) throw notFound(); if (link.userId !==
-  req.userId) throw forbidden();` — which reintroduces exactly the
+req.userId) throw forbidden();` — which reintroduces exactly the
   distinguishable-response problem this design avoids, even if each
   individual check looks reasonable in isolation.
 - Assuming 404-for-both is free — it does cost something, covered next.
@@ -4956,7 +4953,7 @@ id wrong, or do I not have access?"). That cost is accepted here because
 the alternative — a clearer error for legitimate callers — hands the
 same clarity to an attacker probing the id space. Systems with a strong
 audit-logging story sometimes split the difference: return 404 to the
-client in both cases, but log the *actual* reason (not found vs.
+client in both cases, but log the _actual_ reason (not found vs.
 forbidden) server-side, so operators retain the diagnostic signal
 without exposing it externally.
 
@@ -4980,7 +4977,7 @@ space.
 (CSPRNG) produces output that's computationally infeasible to predict
 even if an attacker has seen previous outputs and knows the algorithm.
 `Math.random()`, in V8, is backed by xorshift128+ — fast and
-statistically well-distributed, but *not* designed to resist prediction;
+statistically well-distributed, but _not_ designed to resist prediction;
 its internal state has been reconstructed from as few as a handful of
 observed outputs in published research.
 
@@ -5014,9 +5011,9 @@ own CSPRNG-backed randomness internally, from Phase 4).
   attacker able to predict outputs can access something they shouldn't,
   regardless of what the value is called.
 - Assuming length alone solves this — a long, predictable identifier is
-  still predictable. Unpredictability comes from the *source* of
+  still predictable. Unpredictability comes from the _source_ of
   randomness, not the string's length; length only affects how many
-  outputs an attacker would have to enumerate if they *were* forced to
+  outputs an attacker would have to enumerate if they _were_ forced to
   guess blindly, which is a separate concern (see collision probability
   below).
 
@@ -5055,9 +5052,9 @@ handles it as a normal, expected (if rare) outcome via retry.
 
 **How it works mechanically.** Two independent layers work together, and
 it matters that they're not the same thing: the birthday-paradox math
-above says a *specific pair* of generated codes colliding is rare, which
+above says a _specific pair_ of generated codes colliding is rare, which
 justifies why a small, fixed retry budget (5 attempts) is enough in
-practice — but the actual *correctness* guarantee that a collision is
+practice — but the actual _correctness_ guarantee that a collision is
 ever caught at all is the database's `UNIQUE` constraint on
 `links.short_code`, enforced unconditionally by Postgres regardless of
 how the application arrived at a duplicate value:
@@ -5092,11 +5089,11 @@ column, declared `unique: true`.
   codes impossible. Delete the retry loop and the system is merely less
   convenient on the rare occasion of a real collision (one client gets a
   409/500 it has to retry); delete the `UNIQUE` constraint and the system
-  is *broken* — two links could silently share a short code, and
+  is _broken_ — two links could silently share a short code, and
   whichever route Phase 7 resolves that code to would be ambiguous or
   simply wrong.
 - Under-provisioning retry attempts relative to actual expected
-  collision rates at a *much* larger scale than this project targets —
+  collision rates at a _much_ larger scale than this project targets —
   worth revisiting the math (or the code length) if link volume ever
   approaches a meaningful fraction of 62⁷.
 
@@ -5118,7 +5115,7 @@ tries a fresh code, up to 5 times, and if it ever exhausts those
 attempts, that's actually stronger evidence of a code regression (a
 shrunk alphabet, a broken generator) than of bad luck — which is exactly
 why there's a dedicated test asserting the generator's actual character
-set and length, not just spot-checking that it returns *a* string.
+set and length, not just spot-checking that it returns _a_ string.
 
 ---
 
@@ -5140,7 +5137,7 @@ variant that re-fetches on conflict to distinguish "the same actor raced
 itself" (not an error) from "a genuine competing claim" (a real 409).
 Third, here: `createLink`'s custom-alias path pre-checks `SELECT id FROM
 links WHERE short_code = $1` before inserting. Two concurrent requests
-for the *same* custom alias can both pass that `SELECT` — finding no
+for the _same_ custom alias can both pass that `SELECT` — finding no
 existing row — before either has committed an `INSERT`. Recognizing the
 same pattern for a third time is the point: this isn't a one-off
 gotcha, it's a systemic property of any "check uniqueness, then write"
@@ -5149,7 +5146,7 @@ sequence that isn't wrapped in additional protection.
 **How it works mechanically.** The fix pattern established in Phase 4
 and reused verbatim here: the pre-check `SELECT` stays, purely to give
 the common, non-racing case a fast, friendly 409 without a wasted round
-trip to the database's constraint machinery — but it is explicitly *not*
+trip to the database's constraint machinery — but it is explicitly _not_
 what makes the outcome correct. The `INSERT` itself is wrapped in a
 try/catch for Postgres error `23505` (unique_violation), and losing that
 race converts cleanly into the same `conflict()` a sequential duplicate
@@ -5170,7 +5167,7 @@ if (!row) {
 }
 ```
 
-Notably, the *generated*-code path in the same function has no pre-check
+Notably, the _generated_-code path in the same function has no pre-check
 `SELECT` at all — see the collision-probability section above for why a
 pre-check there would be actively pointless rather than merely
 redundant.
@@ -5183,12 +5180,12 @@ redundant.
 **Common pitfalls.**
 
 - Treating the pre-check `SELECT` as sufficient on its own, because "the
-  window is really small" — the window's *size* is irrelevant to
+  window is really small" — the window's _size_ is irrelevant to
   whether the race is real; under real production concurrency (a
   double-submitted form, a retried request, a deliberate attacker firing
   two requests simultaneously) small windows get hit often enough to
   matter.
-- Forgetting the 23505 catch when writing a *new* uniqueness check in the
+- Forgetting the 23505 catch when writing a _new_ uniqueness check in the
   future, because the pre-check `SELECT` alone "looks" like it already
   solved the problem in testing (where concurrent requests are rare by
   accident, not by design).
@@ -5223,9 +5220,9 @@ literal, specific path segment (like `/api/health`) collides with a
 wildcard or parameterized route (like `/:shortCode`) that would also
 match that exact string.
 
-**Why it exists in this project.** It doesn't apply *yet*, in the
+**Why it exists in this project.** It doesn't apply _yet_, in the
 literal sense — this phase deliberately builds no public redirect route
-at all. But the alias a user picks *today* determines the value stored
+at all. But the alias a user picks _today_ determines the value stored
 in `short_code` forever (aliases are immutable after creation, by this
 phase's design), and Phase 7 will mount a route shaped like `GET
 /:shortCode` at the application root to resolve any code to its
@@ -5295,7 +5292,7 @@ attempts to read from the local filesystem.
 
 **Why it exists in this project.** `destinationUrl` is exactly the kind
 of field where scheme matters enormously and is easy to overlook,
-because "is this a valid URL" and "is this a *safe* URL to redirect a
+because "is this a valid URL" and "is this a _safe_ URL to redirect a
 browser to" are different questions — `new URL('javascript:alert(1)')`
 parses without error; it's a syntactically perfectly valid URL, just an
 extremely dangerous one to redirect to. Once Phase 7's redirect route
@@ -5385,7 +5382,7 @@ three-way distinction: unchanged, set-to-a-value, or explicitly-cleared.
 **Why it exists in this project.** `expiresAt` and `maxClicks` are
 nullable columns where `null` is a meaningful, intentional value ("this
 link never expires" / "unlimited clicks"), not the absence of one. A
-client that wants to *remove* an expiration needs a way to say "set
+client that wants to _remove_ an expiration needs a way to say "set
 `expiresAt` to null" that's distinguishable from "I didn't mention
 `expiresAt`, don't touch it." Collapsing those two into one case (e.g. if
 the update handler treated any falsy/undefined `expiresAt` as "clear it")
@@ -5393,20 +5390,20 @@ would make it impossible to send a partial update that touches
 `destinationUrl` alone without accidentally wiping `expiresAt` too.
 
 **How it works mechanically.** The mechanism has two layers, and the
-important part is *where* the absent-vs-null information actually lives
+important part is _where_ the absent-vs-null information actually lives
 after Zod parsing. Verified directly against this project's installed
 Zod (3.x):
 
 ```js
-z.object({ expiresAt: z.string().nullable().optional() }).safeParse({}).data
+z.object({ expiresAt: z.string().nullable().optional() }).safeParse({}).data;
 // → {}                          ('expiresAt' in data → false)
-z.object({ expiresAt: z.string().nullable().optional() }).safeParse({ expiresAt: null }).data
+z.object({ expiresAt: z.string().nullable().optional() }).safeParse({ expiresAt: null }).data;
 // → { expiresAt: null }         ('expiresAt' in data → true, value null)
 ```
 
 Zod does **not** backfill an absent optional key onto its parsed output
 — so `'expiresAt' in parsedBody` is a reliable way to ask "did the
-client mention this field at all," entirely from the *parsed* Zod
+client mention this field at all," entirely from the _parsed_ Zod
 output, with no need to separately inspect the raw, pre-validation
 `req.body`. The route handler in `src/routes/links.ts` uses exactly that
 check to build a service-layer input object with only the keys the
@@ -5447,17 +5444,17 @@ construction: `src/services/linkService.ts`, `updateLink`.
 
 - Using `??` (nullish coalescing) directly on `req.body.field` without
   first checking presence — `undefined ?? someDefault` and `null ??
-  someDefault` both evaluate the same way, silently erasing the
+someDefault` both evaluate the same way, silently erasing the
   distinction this whole mechanism exists to preserve.
-- Assuming Zod backfills absent optional keys as `undefined` *properties*
+- Assuming Zod backfills absent optional keys as `undefined` _properties_
   on the output object — it doesn't (per the verified REPL output
   above); the key is simply missing, which is exactly what makes the
   `'key' in parsedBody` check meaningful rather than redundant.
 - Forgetting that TypeScript's control-flow narrowing on `'key' in body`
-  doesn't transfer to a *different* object (`parsed`) typed independently
+  doesn't transfer to a _different_ object (`parsed`) typed independently
   — `exactOptionalPropertyTypes` will correctly flag `input.field =
-  parsed.field` as potentially assigning `undefined` even inside an `if
-  ('field' in body)` block, because TS has no way to know the two objects'
+parsed.field` as potentially assigning `undefined` even inside an `if
+('field' in body)` block, because TS has no way to know the two objects'
   presence conditions are linked; this project resolves it by checking
   `parsed.field !== undefined` directly wherever that's equivalent (see
   above), rather than suppressing the type error.
@@ -5471,7 +5468,7 @@ mechanism needed, just the same three lines repeated per field.
 untouched, set to a value, and explicitly cleared — PUT only has two,
 because it assumes every field is always present. I encode that with
 Zod's `.nullable().optional()` and read presence directly off the
-*parsed* output using `'field' in body`, which I verified doesn't get
+_parsed_ output using `'field' in body`, which I verified doesn't get
 backfilled for absent optional keys — so `safeParse({})` genuinely omits
 the key, while `safeParse({ field: null })` includes it with a `null`
 value. That distinction flows into a service function that only writes a
@@ -5492,7 +5489,7 @@ jumping to an arbitrary page number, but it doesn't degrade as the
 offset grows the way `OFFSET` does, and it stays correct even if rows
 are inserted or deleted between page requests.
 
-**Why it exists in this project.** `GET /api/links` needed *some*
+**Why it exists in this project.** `GET /api/links` needed _some_
 pagination scheme — returning every link a user has ever created in one
 response doesn't scale and is exactly the kind of unbounded-response
 risk covered below. This phase chose offset pagination deliberately, not
@@ -5530,7 +5527,7 @@ differently between two page requests, corrupting pagination results in
 a way that's hard to notice and harder to reproduce.
 
 The `limit` query parameter itself is validated as a positive integer,
-but a value **above** `MAX_PAGE_SIZE` (100) is deliberately *clamped*,
+but a value **above** `MAX_PAGE_SIZE` (100) is deliberately _clamped_,
 not rejected with 400:
 
 ```ts
@@ -5544,7 +5541,7 @@ caller who requested more than the maximum can tell what they actually
 got back. This is a deliberate choice over strict rejection: `limit` is
 a hint about how much the client wants, not a semantic assertion about
 the request's validity the way a malformed UUID is (which genuinely
-*can't* be satisfied, making 400 correct there). An oversized `limit` is
+_can't_ be satisfied, making 400 correct there). An oversized `limit` is
 trivially and safely satisfiable by capping it, and well-regarded APIs
 (GitHub, Stripe) clamp for exactly this reason — turning an innocent,
 slightly-too-eager `?limit=200` into a hard client-facing failure serves
@@ -5568,7 +5565,7 @@ constants live alongside the schema.
   just what `.max()` does."
 - Confusing "malformed" with "oversized": a non-numeric, negative, or
   zero `limit` genuinely cannot be satisfied and correctly stays a 400;
-  only the *upper* bound is clamped rather than rejected.
+  only the _upper_ bound is clamped rather than rejected.
 
 **Production considerations — what would change this decision.** Offset
 pagination's known weakness is that `OFFSET` doesn't skip rows for free —
@@ -5668,8 +5665,7 @@ in the app does.
 ### 301 vs. 302 vs. 307/308 — the caching trap
 
 **What it is.** HTTP defines several redirect status codes that differ in
-two independent dimensions: whether the redirect is *permanent* (301,
-308) or *temporary* (302, 307), and whether the client is required to
+two independent dimensions: whether the redirect is _permanent_ (301, 308) or _temporary_ (302, 307), and whether the client is required to
 preserve the original request method/body (307, 308) or allowed to
 switch to GET (301, 302 — in practice, universally switched to GET by
 real browsers regardless of what the spec technically permits).
@@ -5683,7 +5679,7 @@ non-cacheable by default.
 
 **How it works mechanically.** Every state check this route performs —
 `is_active`, `expires_at`, `max_clicks` vs. `click_count`, the password
-gate — runs on *every single request*, because nothing about a 302
+gate — runs on _every single request_, because nothing about a 302
 tells the browser it may skip asking the server next time. Click
 recording (`recordClick`) likewise runs on every request. If this route
 returned 301 instead, the first browser to follow a given short link
@@ -5695,10 +5691,10 @@ expires or hits its click limit. The browser already has what it thinks
 is the permanent answer and has no reason to ask again. Concretely, this
 means: click counts silently stop incrementing for that visitor forever;
 `is_active: false` and `expires_at` become unenforceable for anyone who
-already clicked once; a password gate added *after* someone already
+already clicked once; a password gate added _after_ someone already
 unlocked-and-cached a 301 response is simply bypassed on every future
 click; and editing `destinationUrl` has no effect for that visitor. The
-link *looks* like it's working — the visitor's browser still lands
+link _looks_ like it's working — the visitor's browser still lands
 somewhere — while every dynamic feature of the system silently stops
 applying to that specific visitor, and there is no way to reverse it
 server-side: a cache the server never sees again cannot be busted by
@@ -5755,7 +5751,7 @@ gets solved, now that `redirectRouter` exists.
 **Why it exists in this project.** `redirectRouter`'s `GET /:shortCode`
 is a single-segment wildcard: Express (via path-to-regexp) matches
 `:shortCode` against exactly one path segment, never spanning a `/`. That
-means it can only ever collide with other *single-segment* routes —
+means it can only ever collide with other _single-segment_ routes —
 `/health` today, a bare `/api` if ever requested with nothing after it —
 and never with multi-segment routes like `/api/auth/login` or
 `/api/links/:id`, which always win on their own more specific prefix
@@ -5765,25 +5761,25 @@ match regardless of where `redirectRouter` is mounted.
 this, and they protect against different failure modes:
 
 1. **Write-time (Phase 6):** `RESERVED_SHORT_CODES` in
-   `src/lib/shortCode.ts` stops anyone from ever *creating* a link whose
+   `src/lib/shortCode.ts` stops anyone from ever _creating_ a link whose
    short code is `health`, `api`, `auth`, etc. — `customAliasSchema`'s
    `.refine()` rejects it with 400 before the row can exist.
 2. **Runtime (this phase):** `src/app.ts` mounts `app.use(redirectRouter)`
-   *after* `rootRouter`, `healthRouter`, `/api/auth`, and `/api/links` —
+   _after_ `rootRouter`, `healthRouter`, `/api/auth`, and `/api/links` —
    and before the catch-all 404. Express matches middleware/routes in
    registration order and stops at the first match, so `/health` is
    handled by the real `healthRouter` before `redirectRouter` ever sees
    the request, regardless of what row (if any) exists at `short_code =
-   'health'`.
+'health'`.
 
 The second layer matters even though the first, in isolation, already
 guarantees no such row can exist — because the two layers guard against
-different failures. Layer 1 is a guarantee about *data*: no row can ever
-impersonate a real path. Layer 2 is a guarantee about *request handling*:
+different failures. Layer 1 is a guarantee about _data_: no row can ever
+impersonate a real path. Layer 2 is a guarantee about _request handling_:
 even if that data guarantee were ever violated (a bug in the `.refine()`,
 a direct DB write bypassing the API, a future reserved word added after
 existing links were created), correct mount order still means the
-`/health` *request* reaches the real health check first — `redirectRouter`
+`/health` _request_ reaches the real health check first — `redirectRouter`
 would simply never be consulted for that literal path. Relying on either
 layer alone leaves a gap; both together close it from two independent
 directions.
@@ -5795,8 +5791,8 @@ carried over from Phase 6).
 **Common pitfalls.**
 
 - Mounting `redirectRouter` early "since it's simple" or alongside
-  `rootRouter` — the *content* of the route doesn't change based on
-  mount position, but *which requests it ever gets a chance to handle*
+  `rootRouter` — the _content_ of the route doesn't change based on
+  mount position, but _which requests it ever gets a chance to handle_
   does. A route mounted first always wins ties against a route mounted
   later, for any request shape both could match.
 - Believing the reserved-word list alone is sufficient and skipping the
@@ -5818,7 +5814,7 @@ so it can only ever collide with other single-segment routes like
 `/health` — never with `/api/auth/*` or `/api/links/*`, which always win
 on their own more specific prefix regardless of mount order. Two
 independent layers guard the single-segment case: `RESERVED_SHORT_CODES`
-stops a link from ever being *created* at a real path like `health`
+stops a link from ever being _created_ at a real path like `health`
 (a write-time guarantee), and mounting the redirect router last in
 `src/app.ts` means the real `/health` handler always gets first refusal
 on that literal request (a runtime guarantee). I keep both because they
@@ -5838,10 +5834,9 @@ representation... or is not willing to disclose that one exists."
 **Why it exists in this project.** `src/routes/redirect.ts`'s
 `deadStateError` returns 410 for three cases: `is_active: false`,
 `expires_at` in the past, and `click_count >= max_clicks`. All three
-describe a link the server *knows about* and is *declining to serve on
-purpose* — a materially different claim than "no idea what this could
-ever refer to," which is what a genuinely nonexistent short code (still
-404) means.
+describe a link the server _knows about_ and is _declining to serve on
+purpose_ — a materially different claim than "no idea what this could
+ever refer to," which is what a genuinely nonexistent short code (still 404) means.
 
 **How it works mechanically.** `deadStateError` in `src/routes/redirect.ts`
 checks all three conditions, in order, against the row `getLinkByShortCode`
@@ -5899,8 +5894,8 @@ expired rows regardless of whether anyone reads them.
 
 **Why it exists in this project.** `deadStateError` in
 `src/routes/redirect.ts` is lazy-only, by design, for this phase: it
-compares `expires_at`/`click_count` against the current time/limit *at
-request time* and returns 410 if they've passed, but never `UPDATE`s or
+compares `expires_at`/`click_count` against the current time/limit _at
+request time_ and returns 410 if they've passed, but never `UPDATE`s or
 `DELETE`s the row to reflect that. An expired link's row looks identical
 in the database the instant after it expires and a year later — nothing
 proactively marks it.
@@ -5926,7 +5921,7 @@ expiry only... Phase 9 adds the sweep."
 - Assuming a scheduled sweep alone is sufficient — between sweep runs,
   a link can be technically expired but still lazily unaware of it until
   the next sweep tick if nothing else checks in between. Lazy expiry is
-  what closes *that* gap: correctness the instant a request arrives,
+  what closes _that_ gap: correctness the instant a request arrives,
   not just eventually on the sweep's schedule.
 
 **Production considerations.** This is exactly why production systems
@@ -5955,9 +5950,9 @@ stop repeatedly re-evaluating rows that are already known to be dead.
 ### Per-link passwords as a distinct auth problem from user sessions
 
 **What it is.** `tokenService.ts`'s JWTs (`TokenPayload { sub, iat, exp }`)
-authenticate a *user* of Click Scope — someone with a row in `users`,
+authenticate a _user_ of Click Scope — someone with a row in `users`,
 logging in to manage their own links. A password on an individual link
-authenticates a *visitor's knowledge of that one link's password* — an
+authenticates a _visitor's knowledge of that one link's password_ — an
 entirely different subject, with no user row behind it at all.
 
 **Why it exists in this project.** A visitor unlocking a
@@ -5978,7 +5973,7 @@ separate, small module — `signUnlockToken(linkId)` /
 '30m'`, vs. `tokenService`'s 7-day default). It reuses
 `config.JWT_SECRET` rather than adding a second secret (see "Scoped,
 short-lived grants" below for why that's still safe), but the `typ`
-discriminator keeps the two token *shapes* non-interchangeable — a real
+discriminator keeps the two token _shapes_ non-interchangeable — a real
 user session token has no `linkId`/`typ` claim, so `verifyUnlockToken`
 rejects it even though `jwt.verify()` would happily validate its
 signature.
@@ -6035,8 +6030,8 @@ requirement this phase names explicitly, and it's what
 **How it works mechanically.** Two layers, doing two different jobs:
 
 1. **Cookie naming** — `link_unlock_<shortCode>`, plus `path:
-   /${shortCode}` on the cookie itself — means a browser won't even
-   *attach* link A's cookie to a request for link B under normal
+/${shortCode}` on the cookie itself — means a browser won't even
+   _attach_ link A's cookie to a request for link B under normal
    operation. This is a convenience/defense-in-depth layer, not the
    actual security boundary: it's just a naming convention a client could
    ignore or a request could be crafted to bypass.
@@ -6049,7 +6044,7 @@ requirement this phase names explicitly, and it's what
    check against link B's actual id fails — the interstitial is served
    again, not a redirect.
 
-The grant names the specific link *inside the signed payload*, not just
+The grant names the specific link _inside the signed payload_, not just
 in an external convention like a cookie name, precisely so that the
 enforcement doesn't depend on any client behaving cooperatively.
 
@@ -6063,10 +6058,10 @@ enforcement doesn't depend on any client behaving cooperatively.
 
 - Relying on cookie-name scoping alone and skipping the payload
   comparison — this is exactly the bug the CRITICAL test is designed to
-  catch: a forged or misdirected cookie with the *right name* but the
-  *wrong linkId inside it* would silently succeed without the equality
+  catch: a forged or misdirected cookie with the _right name_ but the
+  _wrong linkId inside it_ would silently succeed without the equality
   check.
-- A grant that names "a link was unlocked" (a boolean) instead of *which*
+- A grant that names "a link was unlocked" (a boolean) instead of _which_
   link — the CRITICAL requirement is unenforceable without the specific
   id being part of what's verified, since there'd be nothing to compare
   against.
@@ -6085,7 +6080,7 @@ comparison in `src/routes/redirect.ts` is the real enforcement. The
 per-link cookie name is a second, independent layer that stops a browser
 from even sending the wrong cookie under normal use, but it's not what
 actually prevents the attack; I wrote a test that forges a
-correctly-named cookie carrying a *different* link's signed token
+correctly-named cookie carrying a _different_ link's signed token
 specifically to prove the payload check, not the naming convention, is
 what closes the gap.
 
@@ -6123,7 +6118,7 @@ function that writes both).
 
 **Common pitfalls.**
 
-- Forgetting that a denormalized value needs *every* write path that
+- Forgetting that a denormalized value needs _every_ write path that
   affects the underlying data to also update it — `recordClick` is
   currently the only place clicks are recorded, so this isn't an issue
   yet, but a future feature that inserts into `clicks` through any other
@@ -6299,10 +6294,10 @@ flip this cost/benefit calculation.
   what a single atomic statement (or the actual consistency
   requirements) already provides — "two writes that are related" is not
   automatically "two writes that need ACID atomicity together."
-- Benchmarking on localhost and assuming the *relative* cost transfers
+- Benchmarking on localhost and assuming the _relative_ cost transfers
   unchanged to production — the ratio (roughly 2x round trips for the
   transactional version: `BEGIN`+`INSERT`+`UPDATE`+`COMMIT` vs.
-  `INSERT`+`UPDATE`) is what should transfer; the *absolute* added
+  `INSERT`+`UPDATE`) is what should transfer; the _absolute_ added
   latency should be expected to grow, not shrink, once real network RTT
   to a production database (e.g., via Supabase's Supavisor pooler) replaces
   near-zero local loopback latency.
@@ -6344,7 +6339,7 @@ secret, `req.signedCookies`), and can help construct `Set-Cookie` values.
 **Why it wasn't added.** Two things this phase needs from cookies —
 setting one, and reading one specific, known-named one back — need
 either nothing or a few lines, respectively. `res.cookie(...)` is built
-into Express itself; no middleware is required to *set* a cookie, only
+into Express itself; no middleware is required to _set_ a cookie, only
 to parse incoming ones. And the unlock grant is already a signed JWT
 (`unlockTokenService.ts`) — tamper-evidence is already handled there, so
 `cookie-parser`'s own signed-cookie feature would be a second, redundant
@@ -6354,7 +6349,7 @@ signing mechanism layered on top of the first.
 name)` splits the raw `Cookie` header on `;`, finds the segment whose
 name matches, and returns its decoded value — a handful of lines that
 cover exactly the one thing this phase needs (look up one named cookie),
-without pulling in `cookie-parser`'s broader feature set: parsing *every*
+without pulling in `cookie-parser`'s broader feature set: parsing _every_
 cookie into `req.cookies` regardless of whether anything reads it, JSON
 cookie support, and its own independent signing scheme.
 
@@ -6367,9 +6362,9 @@ read back).
 - Adding a well-known middleware reflexively because "that's what you use
   for cookies in Express" without checking what this specific use case
   actually needs — CLAUDE.md's "never add a dependency silently, name it,
-  justify it, note the alternative" applies just as much to a *decision
-  not to add one*, which is why this section exists.
-- Hand-rolling cookie *signing* as well as parsing — not needed here,
+  justify it, note the alternative" applies just as much to a _decision
+  not to add one_, which is why this section exists.
+- Hand-rolling cookie _signing_ as well as parsing — not needed here,
   since the unlock token is already a signed JWT; a hand-rolled signing
   scheme on top would be actively worse than either using
   `cookie-parser`'s signing or (as done here) not needing cookie-level
@@ -6496,7 +6491,7 @@ not just a mechanical "wrap it in Redis" exercise:
 - `destination_url`, `password_hash`, `expires_at`, `is_active` — change
   only via an explicit owner action, invalidated explicitly on write (see
   "Invalidation ordering" below). Good caching candidates.
-- `click_count` — changes on *every single click*, with no invalidation
+- `click_count` — changes on _every single click_, with no invalidation
   hook at all (see "The click_count problem" below). A bad caching
   candidate in the naive sense; this phase caches it anyway but bounds the
   damage with a much shorter TTL specifically because of this.
@@ -6514,7 +6509,7 @@ not just a mechanical "wrap it in Redis" exercise:
   `click_count` inside `RedirectLink` is exactly this trap, and is the
   reason this phase can't just be "cache the SELECT."
 - Assuming a low read-to-write ratio disqualifies something from caching
-  entirely, rather than asking whether a *shorter* TTL still captures most
+  entirely, rather than asking whether a _shorter_ TTL still captures most
   of the benefit — see the click_count decision below.
 
 **Production considerations.** As the app grows, other read-heavy,
@@ -6549,7 +6544,7 @@ implies infrastructure this project doesn't have:
   would be infrastructure with no other use here.
 - **Write-through** — every write goes to the cache first, which
   synchronously writes through to the source of truth. This makes the
-  cache sit *in front of* Postgres for writes, adding Redis to the
+  cache sit _in front of_ Postgres for writes, adding Redis to the
   critical path of every `PATCH`/`DELETE` even though those are already
   low-volume and not latency-sensitive — no benefit to justify the added
   dependency on that path.
@@ -6571,7 +6566,7 @@ authoritative and reachable independent of Redis — which is exactly the
 2. On a miss, `SELECT ... FROM links WHERE short_code = $1` against
    Postgres, same query as before this phase.
 3. The result (found or not) is written back to Redis with an appropriate
-   TTL, so the *next* read is a cache hit.
+   TTL, so the _next_ read is a cache hit.
 4. `updateLink`/`deleteLink`/`createLink`'s custom-alias branch explicitly
    evict the entry on a write, rather than waiting for the TTL (see
    "Invalidation ordering" below) — the "aside" part of cache-aside: the
@@ -6601,7 +6596,7 @@ four core caching patterns that keeps Redis purely optional on the read
 path — Postgres stays fully authoritative and reachable with Redis
 completely absent, which is what let me build graceful degradation as a
 first-class requirement rather than an afterthought. Read-through and
-write-through both need Redis to sit *in* a critical path (a smart loader,
+write-through both need Redis to sit _in_ a critical path (a smart loader,
 or the write path itself); write-behind trades durability for write
 latency this app doesn't need, since writes here are already fast and rare.
 
@@ -6619,20 +6614,20 @@ cached `click_count` is frozen for the entire life of its TTL.
 **Why it exists in this project.** Four options were on the table, with
 very different worst-case behavior:
 
-| Option | Worst-case overshoot past `maxClicks` | Caching benefit for capped links |
-|---|---|---|
-| (a) never cache `click_count`; read it separately from Postgres on every request | none | none — still a DB read every request |
-| (b) cache the whole row with the normal 300s TTL | unbounded by however much traffic arrives within 300s | full |
-| (c) never cache links that have `maxClicks` set at all | none | none |
-| (d) cache capped links too, but with a much shorter TTL | bounded by however much traffic arrives within that short TTL | most of it |
+| Option                                                                           | Worst-case overshoot past `maxClicks`                         | Caching benefit for capped links     |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------- | ------------------------------------ |
+| (a) never cache `click_count`; read it separately from Postgres on every request | none                                                          | none — still a DB read every request |
+| (b) cache the whole row with the normal 300s TTL                                 | unbounded by however much traffic arrives within 300s         | full                                 |
+| (c) never cache links that have `maxClicks` set at all                           | none                                                          | none                                 |
+| (d) cache capped links too, but with a much shorter TTL                          | bounded by however much traffic arrives within that short TTL | most of it                           |
 
 (c) was the first instinct — exclude the risky case entirely — but it's
-the wrong trade: a link only *has* a click cap because its owner expects
+the wrong trade: a link only _has_ a click cap because its owner expects
 meaningful volume, so (c) excludes from caching exactly the links most
 likely to be hot. (d) was chosen instead: capped links are cached like any
 other link, but with `LINK_CACHE_CAPPED_TTL_SECONDS = 5` instead of the
 usual 300. This isn't really a "concurrency race" — it's structural: a
-cache entry is always written with the `click_count` read *before* that
+cache entry is always written with the `click_count` read _before_ that
 same request's own `recordClick` call runs, so even a single next request
 landing within the 5s window sees a value that doesn't yet reflect the
 request(s) already served since. A 5-second window bounds that overshoot
@@ -6702,7 +6697,7 @@ and they are not equivalent.
 Postgres and need `link:<shortCode>` gone from Redis afterward.
 Invalidate-then-write has a real race: a concurrent `GET /:shortCode`
 landing between the delete and the write finds no cache entry, reads
-Postgres (still the *old* value, since the write hasn't landed yet), and
+Postgres (still the _old_ value, since the write hasn't landed yet), and
 re-populates the cache with that old value — and nothing will ever
 invalidate it again until its own TTL expires naturally. That's strictly
 worse than doing nothing: a stale entry that outlives the very fix meant
@@ -6724,7 +6719,7 @@ applied.
 `updateLink`, `deleteLink`, and `invalidateLinkCache`'s doc comment, which
 spells out the race being avoided. Proven in
 `tests/routes/redirect.test.ts`: the PATCH/DELETE invalidation tests
-assert `redis.get` is `null` *immediately* after the write, not just that
+assert `redis.get` is `null` _immediately_ after the write, not just that
 a later request happens to see fresh data.
 
 **Common pitfalls.**
@@ -6737,7 +6732,7 @@ a later request happens to see fresh data.
   concurrent traffic, which this app's own redirect volume is specifically
   expected to have.
 
-**Production considerations.** At higher write concurrency on the *same*
+**Production considerations.** At higher write concurrency on the _same_
 link (multiple simultaneous edits), the invalidation call itself is still
 just a `DEL` — idempotent and order-independent between concurrent
 writers, so this doesn't need additional locking even then.
@@ -6808,7 +6803,7 @@ things get on the specific path where invalidation itself failed.
 
 ### Negative caching
 
-**What it is.** Caching the *absence* of a resource — a nonexistent short
+**What it is.** Caching the _absence_ of a resource — a nonexistent short
 code — so a repeated lookup for the same missing key doesn't hit Postgres
 every time either.
 
@@ -6818,7 +6813,7 @@ enumerating or guessing short codes. Without negative caching, every
 single guess — valid or not — costs a Postgres round trip. With it, only
 the first guess for a given code does.
 
-**How it works mechanically.** A miss is stored at the *same* key
+**How it works mechanically.** A miss is stored at the _same_ key
 (`link:<shortCode>`) as a hit would use, with the sentinel value
 `'__MISS__'` instead of a serialized link — one `GET` distinguishes all
 three states (absent from cache / negative hit / positive hit) with no
@@ -6844,7 +6839,7 @@ call inside `createLink`'s custom-alias branch.
 **Common pitfalls.**
 
 - Giving negative entries the same TTL as positive ones — a nonexistent
-  code is much more likely to *become* real (via creation) than an
+  code is much more likely to _become_ real (via creation) than an
   existing link's destination is to silently change without going through
   `PATCH`, so the tolerable staleness window is genuinely different.
 - Assuming the negative-cache TTL alone is sufficient and skipping the
@@ -6855,7 +6850,7 @@ call inside `createLink`'s custom-alias branch.
 
 **Production considerations.** At real scale, negative caching also
 meaningfully reduces the load a scanning/enumeration attempt puts on
-Postgres — the *first* request for a given nonexistent code still pays a
+Postgres — the _first_ request for a given nonexistent code still pays a
 full lookup, but a sustained scan of the same handful of codes doesn't
 repeat that cost.
 
@@ -6880,7 +6875,7 @@ request.
 **Why it exists in this project.** A cache is, by definition, an optional
 accelerant over a source of truth that already works on its own. If a
 caching layer's failure could fail requests that would have succeeded
-without it, adding the cache would have made the system *less* reliable
+without it, adding the cache would have made the system _less_ reliable
 than having no cache at all — trading a fast path that sometimes helps for
 a new way the whole system can go down. That's the opposite of what
 caching is supposed to buy.
@@ -6897,7 +6892,7 @@ catch block logs via `logger.error` so a real Redis outage is visible in
 aggregate, even though no individual request fails because of it.
 
 This is a deliberate divergence from `oauthState.ts`'s `storeState`/
-`consumeState`, which do *not* catch Redis errors — and that's correct
+`consumeState`, which do _not_ catch Redis errors — and that's correct
 there, not an oversight here. Redis is the actual source of truth for
 OAuth state (there's no Postgres fallback for "is this CSRF token valid");
 a failed state store or lookup should fail that request, because
@@ -6936,7 +6931,7 @@ request — because a cache is supposed to be optional, and a cache that can
 take down an already-working code path on a transient failure would make
 the system less reliable than having no cache at all. I deliberately did
 this differently from the existing `oauthState.ts` module, which lets
-Redis errors propagate — that's correct there because Redis *is* the
+Redis errors propagate — that's correct there because Redis _is_ the
 source of truth for OAuth state with no fallback, so a failure there
 should fail the request. Here Redis is purely a performance layer over a
 Postgres query that's already correct on its own, so the two modules have
@@ -6956,8 +6951,8 @@ mitigation (single-flight locking, probabilistic early expiration,
 stale-while-revalidate) is implemented this phase. At this app's actual
 scale — a single API process talking directly to a local/managed Postgres
 instance that comfortably handles individual lookups — the failure mode a
-stampede protects against (many *simultaneous* first-touch requests for
-the *same* key, arriving in the same instant a TTL lapses) isn't a
+stampede protects against (many _simultaneous_ first-touch requests for
+the _same_ key, arriving in the same instant a TTL lapses) isn't a
 realistic problem yet. Adding locking or coordination for a scenario that
 isn't happening would be complexity with no measured benefit.
 
@@ -7005,7 +7000,7 @@ would be complexity without a problem to justify it.
 with `oauth:state:<state>`.
 
 **Why it exists in this project.** `getLinkByShortCode` is deliberately
-the one *unscoped* lookup in `linkService.ts` (Phase 7) — there's no
+the one _unscoped_ lookup in `linkService.ts` (Phase 7) — there's no
 authenticated user to scope it by, since the redirect route is public.
 `link:<shortCode>` mirrors that: no user id in the key, because the data
 behind it isn't user-scoped either.
@@ -7017,12 +7012,12 @@ behind it isn't user-scoped either.
 `linkCacheKey` and `LINK_CACHE_PREFIX`.
 
 **Common pitfalls — and the rule this sets up for later.** The critical
-rule for *any future cache over user-owned data* is that the user id must
+rule for _any future cache over user-owned data_ is that the user id must
 be part of the key, not just a filter applied after reading a shared
 cache entry. Concretely: if a future phase caches `getLink(userId,
 linkId)` (the owner-scoped lookup, distinct from this one) and keys it as
 just `link-by-id:<linkId>` — omitting `userId` — then user A's request for
-`linkId` populates a cache entry that user B's request for the *same*
+`linkId` populates a cache entry that user B's request for the _same_
 `linkId` (if B ever guessed or was given that id) would also read, because
 nothing about the key itself encodes whose request it was. The fix isn't
 an application-level ownership check after the cache read (that's exactly
@@ -7044,7 +7039,7 @@ just `link:<shortCode>` — because the function it caches,
 `getLinkByShortCode`, is itself the one deliberately public, unscoped
 lookup in this codebase; there's no user id to include because there's no
 authenticated user in the request at all. But that's specifically because
-this data has no owner-scoping requirement to begin with — any *future*
+this data has no owner-scoping requirement to begin with — any _future_
 cache over owner-scoped data would need the user id baked directly into
 the key, not checked after the fact, for the same reason every Postgres
 query in this codebase scopes ownership in the `WHERE` clause instead of
@@ -7077,21 +7072,21 @@ call a cache hit).
 
 **Results, against local Postgres and local Redis over loopback:**
 
-| Path | Median latency (n=300) |
-|---|---|
-| Cold (cache miss: Postgres read + cache populate) | **~0.569ms** |
-| Warm (cache hit: single Redis `GET`) | **~0.169ms** |
+| Path                                              | Median latency (n=300) |
+| ------------------------------------------------- | ---------------------- |
+| Cold (cache miss: Postgres read + cache populate) | **~0.569ms**           |
+| Warm (cache hit: single Redis `GET`)              | **~0.169ms**           |
 
 A warm lookup is roughly **3.4x faster** than a cold one locally — a
 ~0.4ms absolute improvement on top of Phase 7's ~1.7ms measured end-to-end
 redirect baseline. That's real, but it understates the production case
 significantly: `links.short_code` is already a unique, indexed column, so
-the *local* Postgres lookup this replaces is already about as cheap as a
+the _local_ Postgres lookup this replaces is already about as cheap as a
 single-row indexed read gets, over near-zero loopback latency. Against a
 network-attached production database (real round-trip time replacing
 loopback), the Postgres side of that comparison gets meaningfully more
 expensive while the Redis side — typically also network-attached, but a
-simpler single-key `GET` — stays comparatively cheap; the *relative*
+simpler single-key `GET` — stays comparatively cheap; the _relative_
 benefit of a cache hit should be expected to grow, not shrink, once real
 network RTT is involved on both sides.
 
@@ -7116,7 +7111,7 @@ script. The debug logging lives in `getCachedLink` in
 - Keeping a one-off benchmark script around as permanent infrastructure
   nothing else calls, rather than recording its output and deleting it.
 
-**Production considerations.** A *low* hit rate in production logs would
+**Production considerations.** A _low_ hit rate in production logs would
 mean one of a few things worth investigating in order: TTLs set too short
 for actual traffic patterns (unlikely here given 300s for the common
 case), traffic spread across a very large number of distinct, rarely
@@ -7168,7 +7163,7 @@ have:
    in-memory call stack of the process running it. A crash, a redeploy, or
    an unhandled rejection between "fired" and "written" loses the click
    silently — nothing persisted it anywhere first. A BullMQ job is written
-   to Redis *before* anything attempts to process it; a crash after that
+   to Redis _before_ anything attempts to process it; a crash after that
    point loses nothing, because the job is still sitting in Redis for
    whichever worker comes back online to pick up.
 2. **Retries.** An unawaited promise that throws just throws — into an
@@ -7185,8 +7180,8 @@ have:
    volume, each holding its own connection attempt, with no visibility
    into how far behind the system has fallen until something falls over
    (connection pool exhaustion, memory pressure from accumulated promises).
-   A queue makes the backlog a first-class, inspectable number — *queue
-   depth* (see "Observability" below) — and the worker's own bounded
+   A queue makes the backlog a first-class, inspectable number — _queue
+   depth_ (see "Observability" below) — and the worker's own bounded
    concurrency (see "Bounded concurrency" below) means a traffic spike
    grows the queue, not the number of concurrent Postgres connections the
    worker attempts to open.
@@ -7206,7 +7201,7 @@ index.ts` (wires the `Worker` that calls it).
 
 **Common pitfalls.**
 
-- Reaching for a queue by default for *any* background work, without
+- Reaching for a queue by default for _any_ background work, without
   asking whether the three properties above actually matter for this
   specific task — a queue is real infrastructure (Redis as a dependency,
   a second deployable, retry/idempotency design work) and isn't free just
@@ -7268,7 +7263,7 @@ drift apart.
 
 A naive homemade queue — `LPUSH` to add a job, `BRPOP` to consume one, off
 a single plain Redis list — has none of this. `BRPOP` popping a job off
-the list *is* the only record that job ever existed; there's no separate
+the list _is_ the only record that job ever existed; there's no separate
 "active" bookkeeping, no lock, nothing to expire or detect an orphan
 against. If the consumer process crashes between the `BRPOP` returning and
 the job's effects being durably applied, the job is simply gone — nothing
@@ -7288,8 +7283,8 @@ these Redis structures directly. `src/queues/clickQueue.ts`,
   Redis is already a dependency — it's simple precisely because it skips
   the atomic state-tracking that makes crash recovery possible.
 - Assuming a job's presence in Redis alone guarantees it'll be processed
-  — durability against a *producer* crash (the job was written before the
-  producer could fail) is different from safety against a *consumer*
+  — durability against a _producer_ crash (the job was written before the
+  producer could fail) is different from safety against a _consumer_
   crash mid-processing, which is what the atomic `wait`→`active`
   transition and stalled-job detection specifically provide.
 
@@ -7345,7 +7340,7 @@ own config, logger, Postgres pool, Redis connection) is built fresh under
   for the same single thread as every HTTP request — a slow or blocked
   click-processing tick adds latency to concurrent requests, and vice
   versa, exactly the coupling Phase 7's synchronous-recording decision was
-  trying to *measure*, not accept permanently.
+  trying to _measure_, not accept permanently.
 - A Node `worker_thread` shares the process's memory and crash domain —
   an unhandled error or a runaway job could take the HTTP server down
   with it, and it still shares the process's resource limits (one event
@@ -7369,8 +7364,8 @@ own config, logger, Postgres pool, Redis connection) is built fresh under
   this once" for convenience — every such import re-couples a deployable
   that's supposed to be independent, and the coupling is easy to add and
   easy to forget was added.
-- Assuming a queue alone gives process isolation — it's the *separate
-  process* that gives crash/resource isolation; the queue is what lets two
+- Assuming a queue alone gives process isolation — it's the _separate
+  process_ that gives crash/resource isolation; the queue is what lets two
   isolated processes communicate without directly depending on each
   other.
 
@@ -7426,7 +7421,7 @@ with `maxRetriesPerRequest: null`:
   below for the analogous concern on the worker side).
 - `worker/redis.ts` — `workerRedis`, shared by every `Worker` instance in
   the worker process (click processor, cleanup processor). Sharing one
-  connection across multiple `Worker`s *within the same process* is
+  connection across multiple `Worker`s _within the same process_ is
   explicitly fine per BullMQ's guidance — the concern that ruled out
   reusing `src/lib/redis.ts`'s client was specifically about coupling
   across the API's HTTP-lifecycle connection and BullMQ's requirements,
@@ -7484,7 +7479,7 @@ Redis there is load-bearing. The click queue sits with `linkService.ts`,
 not `oauthState.ts`, but for a slightly different reason than "it's a
 cache": it isn't caching anything, and a lost click is a genuinely lost
 write, not a stale read that self-heals. What makes it "accelerant"-
-classified anyway is that the thing it's an accelerant *for* is the
+classified anyway is that the thing it's an accelerant _for_ is the
 redirect itself, not click accuracy — the redirect's job is getting the
 visitor to `destinationUrl`, and click recording is a side effect of
 that, not a precondition for it. Losing a click on a Redis outage is a
@@ -7520,7 +7515,7 @@ file).
 **Production considerations.** A sustained Redis outage means every click
 during that window is silently lost, with only server-side logs
 recording it — there is no retry or backlog for enqueue failures
-specifically (only *processing* failures get BullMQ's retry/backoff, once
+specifically (only _processing_ failures get BullMQ's retry/backoff, once
 a job has actually been enqueued). This is the deliberate trade: an
 enqueue-retry-with-backoff scheme would either block the redirect while
 retrying (defeating the entire point) or need its own separate durable
@@ -7535,7 +7530,7 @@ codebase already classifies its Redis cache (log and fall through, never
 fail the request) rather than the way it classifies OAuth state in Redis
 (a hard dependency whose failures propagate), even though a lost click
 isn't really a "cache miss" the way a lookup is — the reasoning that
-carries over is about what the failure is *for*: a Redis blip should cost
+carries over is about what the failure is _for_: a Redis blip should cost
 this system one click, not the entire redirect path.
 
 ---
@@ -7556,21 +7551,21 @@ compare against rather than an assumption.
 
 **How it works mechanically, and what the measurement showed.** Rather
 than reusing Phase 8's backward-cited "~1.7ms end-to-end" figure as
-"before" (that number was a citation *in* Phase 8, not something Phase 7
+"before" (that number was a citation _in_ Phase 8, not something Phase 7
 documented with its own iteration count/warmup — see Phase 7's own
 "Synchronous side effects" section), this phase re-measured both "before"
 and "after" freshly, under the same methodology, so the comparison is
 apples-to-apples rather than reusing an unaudited older number. "Before"
 was reconstructed by temporarily substituting the exact two-statement
 write `recordClick` used to run in place of the real `clickQueue.add`
-call, so the *same* route handler code path was exercised either way —
+call, so the _same_ route handler code path was exercised either way —
 only the click-recording primitive underneath it changed, which is
 exactly what this phase changed architecturally.
 
-| Measurement | Before (n=300) | After (n=300) |
-|---|---|---|
-| Isolated write vs. enqueue | **~0.517ms** | **~0.222ms** |
-| End-to-end `GET /:shortCode`, warm cache | **~0.989ms** | **~0.595ms** |
+| Measurement                              | Before (n=300) | After (n=300) |
+| ---------------------------------------- | -------------- | ------------- |
+| Isolated write vs. enqueue               | **~0.517ms**   | **~0.222ms**  |
+| End-to-end `GET /:shortCode`, warm cache | **~0.989ms**   | **~0.595ms**  |
 
 The isolated-write number (~0.517ms) lines up closely with Phase 7's own
 original benchmark (~0.5ms), which is a useful sanity check that this
@@ -7606,7 +7601,7 @@ same as Phase 8's `benchmarkLinkCache.ts`.
 benefit for the same reason Phase 8's cache-latency numbers did: over
 loopback, Postgres's two round trips and Redis's one round trip are both
 close to their respective floors; against a network-attached production
-database and Redis instance, the *relative* gap should be expected to
+database and Redis instance, the _relative_ gap should be expected to
 hold or grow, not shrink, since replacing two remote round trips with one
 scales favorably as round-trip time increases.
 
@@ -7703,9 +7698,9 @@ analyzed properly, not hand-waved, so here are the four options actually
 weighed:
 
 - **(a) A deterministic BullMQ `jobId` alone.** Deduplicates repeated
-  *enqueue* attempts — `.add()` called twice with the same `jobId` is a
+  _enqueue_ attempts — `.add()` called twice with the same `jobId` is a
   no-op while the original job's record still exists in Redis. It does
-  **not** protect against duplicate *processing* of a job that was only
+  **not** protect against duplicate _processing_ of a job that was only
   ever enqueued once, which is the actual practical risk described above.
   Necessary, not sufficient.
 - **(b) A natural key / unique constraint alone.** There's no natural key
@@ -7727,7 +7722,7 @@ weighed:
   accepted.
 - **(d) Combine (a) and (b) — chosen.** `redirect.ts` generates `clickId`
   once, at enqueue time, and reuses it as both the BullMQ `jobId`
-  (enqueue-level dedup) *and* a new `clicks.job_id` column with a `UNIQUE`
+  (enqueue-level dedup) _and_ a new `clicks.job_id` column with a `UNIQUE`
   constraint (processing-level dedup), via
   `INSERT ... ON CONFLICT (job_id) DO NOTHING`. The `click_count`
   increment is conditioned on whether that insert actually inserted a row
@@ -7757,13 +7752,13 @@ conflicts against pre-existing rows; every row written going forward
 supplies its own value explicitly.
 
 **Exact residual risk, stated precisely.** This design protects against
-any duplicate *processing* of a job carrying a given `clickId` — a
+any duplicate _processing_ of a job carrying a given `clickId` — a
 stalled lock, a lost-ack retry, a crash mid-job all leave `clicks` and
 `click_count` consistent, because the second attempt's insert safely
 no-ops and the conditional update never fires for it, enforced by
 Postgres itself regardless of how the two attempts race. It does **not**,
 and cannot, protect against a producer-side bug that generates two
-*different* `clickId`s for what a human would consider one physical click
+_different_ `clickId`s for what a human would consider one physical click
 — neither BullMQ nor Postgres has any way to know two distinct UUIDs
 refer to "the same" real-world event; the dedup key is only as
 trustworthy as the code that generates it. Also worth being precise
@@ -7790,9 +7785,9 @@ second time").
   time-bounded optimization (bounded by job retention), not an
   unconditional one; the Postgres constraint is what actually closes the
   gap.
-- Generating the idempotency key inside the *worker* instead of the
-  *producer* — if the worker generated its own key per processing
-  attempt, every retry of the same logical click would get a *different*
+- Generating the idempotency key inside the _worker_ instead of the
+  _producer_ — if the worker generated its own key per processing
+  attempt, every retry of the same logical click would get a _different_
   key, and the whole scheme would protect against nothing. The key has to
   be generated exactly once, at the point the "same click" is first
   identified as such — which is enqueue time, in the producer.
@@ -7835,15 +7830,15 @@ Phase 7 built to benchmark `recordClick`, then deliberately deleted from
 `src/db/pool.ts` once that benchmark concluded it wasn't worth keeping on
 the redirect's hot path.
 
-**Why it exists in this project.** Phase 7's rejection was about *cost
-relative to benefit on that specific path* — a ~50% latency tax on the
+**Why it exists in this project.** Phase 7's rejection was about _cost
+relative to benefit on that specific path_ — a ~50% latency tax on the
 single hottest path in the system, in exchange for a guarantee (`clicks`
 and `click_count` never disagreeing across a crash) that only bought
 protection against a rare, small, self-limiting undercount. Nothing about
 that reasoning transfers unchanged to the worker: the worker isn't on any
 request's critical path at all, so the same ~0.25ms extra round-trip
 cost that was a real tax there is a complete non-issue here. What
-*changed* the calculus isn't the cost side, it's the benefit side —
+_changed_ the calculus isn't the cost side, it's the benefit side —
 idempotency (see previous section) genuinely needs the insert and the
 conditional update to commit or roll back together, or a crash between
 them could leave a click permanently under-counted despite having "run"
@@ -7870,7 +7865,7 @@ caller).
 - Duplicating the transaction helper into `src/db/pool.ts` "just in case"
   instead of keeping it exactly where its one caller lives — the same
   "don't keep unused infrastructure around" principle that got it deleted
-  the first time still applies to *where* it lives, not just *whether* it
+  the first time still applies to _where_ it lives, not just _whether_ it
   exists.
 
 **Production considerations.** None — this is a settled, low-cost
@@ -7941,7 +7936,7 @@ retry" from "landed in failed" — see "Observability" below).
   is a slow, easy-to-miss memory leak in Redis, not a safety margin.
 - Treating a job that landed in `failed` as equivalent to "lost forever"
   — it's inspectable and (with BullMQ's retry-from-failed tooling)
-  re-triggerable; the retention count bounds *how long* it stays
+  re-triggerable; the retention count bounds _how long_ it stays
   inspectable, not whether it's recoverable at all before that.
 
 **Production considerations.** These are starting points, matching this
@@ -7978,10 +7973,10 @@ request. That premise no longer holds.
 varying lag sources stacked on top of each other, not one:
 
 1. **Cache lag** (unchanged from Phase 8): up to `LINK_CACHE_CAPPED_TTL_
-   SECONDS`, fixed and bounded at 5 seconds.
+SECONDS`, fixed and bounded at 5 seconds.
 2. **Queue-processing lag** (new this phase): the time between a click
    being enqueued and the worker's transaction committing the increment —
-   normally sub-second, but *not* fixed. It grows with queue depth,
+   normally sub-second, but _not_ fixed. It grows with queue depth,
    worsens under retry/backoff (a job that fails and retries can take
    30+ seconds to resolve before either succeeding or landing in
    `failed` and never incrementing at all), and if the worker process is
@@ -8024,8 +8019,8 @@ into the queue-lag term).
 
 **Common pitfalls.**
 
-- Assuming the 5-second cache TTL is still *the* bound on overshoot,
-  rather than *one of two* — this was true before this phase and isn't
+- Assuming the 5-second cache TTL is still _the_ bound on overshoot,
+  rather than _one of two_ — this was true before this phase and isn't
   anymore.
 - "Fixing" this by shortening the cache TTL further — it doesn't touch
   the term that actually dominates once the worker falls behind.
@@ -8098,7 +8093,7 @@ explicitly out of scope for this phase).
 checks three conditions in priority order — `is_active`, `expires_at`,
 then `click_count >= maxClicks` — each returning a different message for
 the same 410 status. If the sweep also flipped `is_active` for a link
-that's dead *only* because it's click-exhausted, the next request would
+that's dead _only_ because it's click-exhausted, the next request would
 hit the `is_active` branch first and return "This link has been
 deactivated" instead of "This link has reached its click limit" — a real
 message change the sweep has no business causing. So the sweep touches
@@ -8112,7 +8107,7 @@ still-`is_active=true` link, `deadStateError` falls through to the
 processes that row, a later request hits the now-flipped `is_active`
 check first and returns "This link has been deactivated" instead. This
 is an expected consequence of introducing scheduled expiry, not a
-regression — arguably it's *more* correct after the sweep, since the row
+regression — arguably it's _more_ correct after the sweep, since the row
 genuinely is deactivated now, mechanically — but it's an observable
 message-text change a client would see, so it's captured as an explicit
 test assertion (`tests/routes/redirect.test.ts`, "an expired link reads
@@ -8120,7 +8115,7 @@ test assertion (`tests/routes/redirect.test.ts`, "an expired link reads
 surprise.
 
 **No new index.** The sweep's `WHERE` clause touches `is_active`/
-`expires_at`, both explicitly *not* indexed per the `links` migration's
+`expires_at`, both explicitly _not_ indexed per the `links` migration's
 own comment — deferred to "Phase 12," a dedicated, measurement-driven
 indexing pass. This phase doesn't add one either, for the same reason:
 this is a low-frequency, schedule-driven scan, not a per-request hot
@@ -8138,7 +8133,7 @@ message-transition test).
 
 **Common pitfalls.**
 
-- Scoping the sweep to *every* dead-state condition "for consistency,"
+- Scoping the sweep to _every_ dead-state condition "for consistency,"
   rather than only the one (`expires_at`) that scheduled expiry is
   actually meant to address — `max_clicks` exhaustion isn't a storage-
   reclamation problem the way time-based expiry is; there's no equivalent
@@ -8187,7 +8182,7 @@ already relied on) is a worse time to discover a gap.
 
 1. **`upsertJobScheduler`'s own idempotent registration.** BullMQ v5+'s
    `Queue.upsertJobScheduler(schedulerId, ...)` is explicitly designed to
-   *upsert* the schedule definition keyed on `schedulerId`, not create a
+   _upsert_ the schedule definition keyed on `schedulerId`, not create a
    new one each call. `worker/scheduler.ts` calls this unconditionally
    from every worker instance at boot — if N replicas all start up and
    all register with the same `schedulerId` and pattern, the result is
@@ -8199,16 +8194,16 @@ already relied on) is a worse time to discover a gap.
 2. **The sweep SQL's own idempotence, independent of (1).** Even in a
    hypothetical world where the scheduler-level dedup somehow has an edge
    case (or someone runs an ad hoc extra cleanup by accident), `UPDATE ...
-   WHERE is_active = true AND expires_at <= now()` converges to the same
+WHERE is_active = true AND expires_at <= now()` converges to the same
    end state no matter how many times or how concurrently it runs — a row
    that's already `is_active = false` simply doesn't match the `WHERE`
    clause on a later run, and Postgres's row-level locking serializes any
    genuinely concurrent execution against the same rows.
 
 Both are used deliberately, not as redundant belt-and-suspenders for its
-own sake: (1) is what avoids *wasted, redundant scheduling* (multiple
+own sake: (1) is what avoids _wasted, redundant scheduling_ (multiple
 timers firing the same sweep more often than intended); (2) is what
-actually guarantees the *outcome* is correct even if (1) somehow failed —
+actually guarantees the _outcome_ is correct even if (1) somehow failed —
 they protect against different failure classes, at very low incremental
 cost to build both.
 
@@ -8223,13 +8218,13 @@ without error or double effect").
 
 - Relying on only the scheduler-level dedup and assuming the underlying
   operation is therefore safe under concurrency — dedup at the scheduling
-  layer says nothing about whether the *work itself* is safe if it
+  layer says nothing about whether the _work itself_ is safe if it
   somehow ran twice; that has to be true independently.
-- Writing a sweep operation that *isn't* naturally idempotent (e.g. one
+- Writing a sweep operation that _isn't_ naturally idempotent (e.g. one
   that appends an audit-log row per link deactivated, rather than a
   pure state-flip) without separately guarding against duplicate
   execution — the `UPDATE`'s idempotence here is a property of what it
-  *does* (flip a flag to a fixed value), not something guaranteed for
+  _does_ (flip a flag to a fixed value), not something guaranteed for
   every possible sweep operation.
 
 **Production considerations.** This is exactly what makes horizontal
@@ -8264,8 +8259,8 @@ pool, and its Redis connection, in that order.
 `src/server.ts` already has (a container orchestrator sends `SIGTERM`,
 then `SIGKILL` after a grace period; Node's default `SIGTERM` behavior is
 to terminate immediately, abandoning whatever was in flight) — but the
-unit of in-flight work is different. The API drains in-flight *HTTP
-requests*; the worker has no requests at all, only in-flight *jobs*.
+unit of in-flight work is different. The API drains in-flight _HTTP
+requests_; the worker has no requests at all, only in-flight _jobs_.
 
 **How it works mechanically.** `Worker.close()` (called with no `force`
 argument — i.e. `force: false`) waits for any currently-active job to
@@ -8278,7 +8273,7 @@ or concurrently with it. `worker/index.ts` wires this to both `SIGTERM`
 and `SIGINT`, with the same kind of unref'd force-exit timeout `server.
 ts` uses as a safety net if a job never finishes draining.
 `gracefulShutdown` is exported as a standalone function specifically so
-the shutdown *logic* is unit-testable by calling it directly, without
+the shutdown _logic_ is unit-testable by calling it directly, without
 needing a real process/signal for every test — real signal handling still
 needs an actual child process to test end-to-end (see "What changed in
 the test suite" below), but that cost is paid once, for the one test that
@@ -8292,14 +8287,14 @@ force-exit timeout).
 
 - Copying `src/server.ts`'s shutdown function directly into the worker —
   it calls `server.close()`, which has no meaning in a process with no
-  HTTP server; the *ordering principle* transfers, the specific code
+  HTTP server; the _ordering principle_ transfers, the specific code
   doesn't.
 - Closing the Postgres pool or Redis connection before every `Worker` has
   actually closed — an in-flight job could still be mid-transaction; the
   ordering matters for exactly the same reason it matters in `server.ts`.
 - Testing graceful shutdown by calling the shutdown function directly
   and never exercising a real `SIGTERM` at all — that proves the shutdown
-  *logic* works, not that the process's actual signal handler is wired up
+  _logic_ works, not that the process's actual signal handler is wired up
   correctly, which is a distinct thing to get wrong (e.g. registering the
   handler after the point where a signal could already have arrived).
 
@@ -8487,8 +8482,8 @@ consuming jobs on behalf of.
 immediately after `await request(app).get(...)` was implicitly relying on
 `recordClick` having already run synchronously inside that same request —
 true before this phase, false after. Making these tests still pass
-without becoming slow or flaky meant changing *what* they assert and, in
-some cases, *how* click processing gets triggered inside the test itself,
+without becoming slow or flaky meant changing _what_ they assert and, in
+some cases, _how_ click processing gets triggered inside the test itself,
 not just updating expected values.
 
 **How it works mechanically.**
@@ -8503,11 +8498,11 @@ not just updating expected values.
   `click_count` increments under concurrency) split into two, at the two
   different layers where two different guarantees now live: a
   **producer-side** test in `redirect.test.ts` (20 concurrent redirects
-  enqueue 20 jobs with 20 *distinct* `clickId`s — added specifically
+  enqueue 20 jobs with 20 _distinct_ `clickId`s — added specifically
   because idempotency's entire design keys on that uniqueness holding;
   see "Idempotency" above for why this needed its own test, separate from
   processing-correctness), and a **worker-side** test in `tests/worker/
-  clickProcessor.test.ts` (20 concurrently-processed jobs, with already-
+clickProcessor.test.ts` (20 concurrently-processed jobs, with already-
   distinct `clickId`s, never lose an increment — the direct descendant of
   the original test, just now exercised at the layer where the write
   actually happens).
@@ -8517,7 +8512,7 @@ not just updating expected values.
   captures the job BullMQ would have received (via the same `add` spy),
   and immediately calls `processClickJob` directly against it, standing in
   for the worker. The 5-second cache-TTL wait these tests already had
-  (Phase 8) is unchanged; what changed is that click *processing* is now
+  (Phase 8) is unchanged; what changed is that click _processing_ is now
   driven explicitly rather than assumed to have already happened
   synchronously.
 - **A new test for the sweep's message-text transition** (see "Scheduled
@@ -8552,7 +8547,7 @@ test.ts`; `tests/db/migrations.test.ts` (the `count: 4` fix).
 **Common pitfalls.**
 
 - Updating a synchronous test's expected values without questioning
-  whether the test's *timing assumption* still holds at all — a test that
+  whether the test's _timing assumption_ still holds at all — a test that
   happened to pass by accident (because processing was fast enough to
   finish before the assertion ran) is a flaky test waiting to surface
   later under different timing, not a correct one.
@@ -8587,3 +8582,822 @@ exposed — a test hardcoding "3 migrations" that broke the moment a fourth
 one existed — which is exactly the kind of thing a full test-suite run
 after a schema change is supposed to catch.
 
+## Phase 10: Rate Limiting
+
+### Why rate limit auth at all: bcrypt and the event loop
+
+**What it is.** `POST /api/auth/signup` and `POST /api/auth/login` are now
+rate limited (`signupLimiter`/`loginLimiter` in
+`src/middleware/rateLimit.ts`) — strict limits, keyed per IP, before this
+phase had zero throttling on either.
+
+**Why it exists in this project.** It would be easy to justify this as
+generic "security best practice" and stop there, but the specific
+mechanism matters. `passwordService.ts` uses `bcryptjs`, a pure-JavaScript
+implementation of bcrypt — not a native binding that can run its hashing
+loop on a separate thread. Every `hashPassword`/`verifyPassword` call (and
+`login`'s dummy-hash comparison on the "no such user" path — see Phase 4,
+"Timing attacks on login") runs bcrypt's cost-factor loop synchronously on
+Node's single event-loop thread. That loop is deliberately slow — that's
+the whole point of a work factor — which means it's also deliberately
+_blocking_.
+
+A burst of concurrent login attempts doesn't just risk a successful guess;
+each one occupies the event loop for the full cost-factor duration
+(`BCRYPT_COST=12` in production, tuned for ~200-300ms/hash). Enough
+concurrent attempts and the event loop is saturated doing bcrypt work,
+unable to service _any_ other request on this process — including
+`GET /:shortCode`, the redirect path Phases 8 and 9 spent real effort
+optimizing. An attacker doesn't need to guess a single password correctly
+to hurt this app; they only need to send enough concurrent login/signup
+requests to starve the event loop. That's a denial-of-service angle
+bcrypt's cost factor makes _worse_, not better, without something bounding
+how many of these expensive requests can arrive at once — which is what a
+rate limiter, not bcrypt's own cost tuning, has to provide.
+
+**How it works mechanically.** See "Fixed window, sliding log, sliding
+counter, token bucket" below for the counting algorithm itself. The
+limiter middleware runs _before_ `validateBody` on both routes (see
+`src/routes/auth.ts`), specifically so a request over budget is rejected
+before it reaches the schema parse — and therefore well before it could
+ever reach `hashPassword`/`verifyPassword`. Rejecting late (after the
+expensive work already ran) would defeat the entire point.
+
+**Where it lives in the codebase.** `src/middleware/rateLimit.ts`
+(`signupLimiter`, `loginLimiter`); wired in `src/routes/auth.ts`. Proven in
+`tests/routes/auth.test.ts`'s `describe('rate limiting')` block.
+
+**Common pitfalls.**
+
+- Treating "rate limit auth because security" as sufficient justification
+  without naming the actual mechanism — the _specific_ reason this app
+  needs it is that bcryptjs's cost factor is CPU-bound, synchronous, and
+  shared with every other request this process handles, not just "brute
+  force is bad in general."
+- Rate limiting only login and not signup — signup calls `hashPassword`
+  too (see `authService.signup`), so it's exactly as capable of
+  saturating the event loop as login is.
+
+**Production considerations.** A cost factor increase (say, moving
+`BCRYPT_COST` from 12 to 14 for a stronger security posture) makes this
+DoS angle _worse_, not just slower per-guess — each concurrent request now
+blocks the event loop for longer. Rate limiting and cost-factor tuning
+have to be considered together, not independently.
+
+**Interview answer.** bcrypt's cost factor slows down each individual
+guess, but it doesn't bound how many guesses can be in flight at once —
+and because `bcryptjs` is pure JS running synchronously on the event loop,
+a burst of concurrent login or signup attempts doesn't just risk a
+successful brute-force, it can stall every other request this process is
+handling, including unrelated endpoints like the redirect path. That's
+the strongest argument for rate limiting these two routes specifically: a
+rate limiter bounds concurrent expensive work, which is a problem bcrypt's
+own cost tuning can't solve and actually makes worse the stronger it's
+configured.
+
+---
+
+### Fixed window, sliding log, sliding counter, token bucket — and which one we're using
+
+**What it is.** Four ways to implement "no more than N requests per client
+per time period," each with a different accuracy/cost tradeoff:
+
+- **Fixed window** — a counter per key, reset every `windowMs`. Cheap (one
+  counter, one TTL), but a client can send `max` requests at the very end
+  of one window and `max` more at the very start of the next, getting up
+  to `2×max` through in a span much shorter than one window — "boundary
+  bursting."
+- **Sliding window log** — store a timestamp per request, count how many
+  fall within the trailing window on each check. Exact, no boundary
+  bursting, but storage grows with request volume (one entry per request,
+  not per key) and every check has to scan/prune that log.
+- **Sliding window counter** — approximate the sliding log by weighting
+  the previous fixed window's count by how much of it still overlaps the
+  trailing window, plus the current window's count. Close to exact
+  accuracy at fixed-window's storage cost (two counters, not a growing
+  log), which is why it's a common middle ground.
+- **Token bucket** — a bucket holds up to some number of tokens, refilled
+  at a steady rate; each request consumes one token, and a request with no
+  tokens available is rejected (or queued). Naturally allows a burst up to
+  the bucket's capacity while still bounding the long-run average rate —
+  the closest of the four to modeling "occasional bursts are fine, sustained
+  abuse isn't."
+
+**Why it exists in this project.** `express-rate-limit`'s default store
+(and `rate-limit-redis`, its Redis-backed counterpart — see Step 2 below)
+both implement **fixed window** counting: a hit count per key, reset when
+`windowMs` elapses since that key's first hit in the current window. That
+was a deliberate choice to accept, not work around — see below.
+
+**How it works mechanically.** Each `buildLimiter(...)` call in
+`src/middleware/rateLimit.ts` sets `windowMs` and `limit`; the store
+increments a counter for whatever `keyGenerator` returns and compares it
+against `limit` on every request, resetting the counter once `windowMs`
+has elapsed since the window began for that key.
+
+Boundary bursting is a real weakness of this algorithm, and it's not
+mitigated here — but it doesn't matter for what these four limiters are
+actually defending. The auth limiters exist to bound a _sustained_ event-
+loop-starving burst (see the section above); a client managing to briefly
+double their rate across one window boundary doesn't come close to
+starving the event loop the way an unthrottled sustained attack would. The
+unlock limiter exists to bound _sustained_ password-guessing throughput
+against one link; a brief doubling at a window edge barely changes the
+expected number of guesses needed to find a real password. None of this
+app's actual threat models care about a short-lived 2x at a boundary the
+way, say, a strict per-second API quota for billing purposes would.
+
+**Where it lives in the codebase.** `express-rate-limit`'s and
+`rate-limit-redis`'s internal store implementations — not something this
+project implements itself (see the dependency-justification note in the
+"Dependencies" discussion below: rate limiting's edge cases are better
+left to an audited library than reimplemented for the sake of using a
+different algorithm).
+
+**Common pitfalls.**
+
+- Assuming "fixed window" means imprecise or unsafe in general — its
+  weakness is boundary bursting specifically, and whether that matters is
+  a judgment call about the actual threat model, not a universal defect.
+- Reaching for a more complex algorithm (sliding log, token bucket)
+  without first asking whether boundary bursting is actually a problem for
+  the thing being protected — added complexity needs a concrete failure
+  mode to justify it, the same reasoning Phase 8's "Cache stampede"
+  section already applied to a different piece of infrastructure.
+
+**Production considerations.** If this app ever added a strict, revenue-
+or SLA-relevant per-second quota (e.g. metering paid API usage), boundary
+bursting could matter enough to justify a sliding window counter or token
+bucket instead — that's a different problem than the abuse this phase's
+four limiters defend against.
+
+**Interview answer.** There are four common approaches — fixed window,
+sliding window log, sliding window counter, and token bucket — trading
+off accuracy against storage/compute cost. I used express-rate-limit's
+default, which is fixed-window counting: cheap, but it allows a brief
+doubling of throughput across a window boundary. I judged that
+acceptable here because every limiter in this phase defends against a
+_sustained_ abuse pattern — an event-loop-starving login burst, sustained
+password brute-forcing against one link — where a momentary boundary
+burst doesn't meaningfully change the outcome. I'd reach for a sliding
+window counter or token bucket if this app ever needed a strict,
+consequential per-second quota, where that boundary effect would actually
+matter.
+
+---
+
+### In-memory state and the silent N-instance multiplication problem
+
+**What it is.** Step 1 of this phase used `express-rate-limit`'s default
+store: an in-memory `Map` living inside the API process, counting hits
+per key. Correct as long as exactly one process handles all traffic;
+silently wrong the moment there's more than one.
+
+**Why it exists in this project — as a deliberate, temporary step.** The
+in-memory store was implemented and run first, on purpose, specifically
+to observe this failure mode directly rather than only read about it
+before immediately fixing it in Step 2 with a shared Redis-backed store.
+
+**How it works mechanically.** Running two instances of this API on
+different ports (`PORT=3001 npm run dev` and `PORT=3002 npm run dev`,
+sharing the same `.env` otherwise — Node's `--env-file` doesn't override a
+variable already set in the process environment, so the shell-prefixed
+`PORT=` wins) and hammering `/api/auth/login` past
+`RATE_LIMIT_AUTH_MAX` against instance A produces the expected 429 with
+`RateLimit-Remaining: 0` — but a single follow-up request against instance
+B, from the same client, in the same window, returns a normal 401 instead
+of 429. Instance B's in-memory `Map` has never seen a request from this
+run; its own counter is still at zero.
+
+Confirmed exactly this way against this app: instance A returned `401` on
+requests 1-5 and `429` on request 6 (`RATE_LIMIT_AUTH_MAX=5`), with
+`RateLimit-Policy: 5;w=900`, `RateLimit-Remaining: 0`, and `Retry-After:
+873` on the blocked response; a single follow-up request against instance
+B, same client, same instant, returned a plain `401` — proving instance
+B's counter had never been touched. After Step 2's Redis-backed store
+replaced the in-memory one, repeating the identical exercise made
+instance B also return `429` immediately, with `RateLimit-Remaining: 0`,
+because both processes' `RedisStore`s now increment the same key in the
+one shared Redis.
+
+The configured policy is "N requests per window." What's actually
+enforced, once there's more than one process, is "N requests per window
+_per process_" — for a fleet of `k` instances behind a load balancer
+distributing traffic round-robin (or by any method not itself aware of
+this limiter's keys), the real effective limit an attacker experiences is
+up to `k × N`, not `N`. Nothing about this is loud: no error is thrown,
+no log line flags a discrepancy, no metric diverges from what a single-
+instance deployment would show — the only way to _see_ it is to do
+exactly what this exercise did: drive traffic at two processes counting
+independently and compare. A single-process local dev environment and a
+single-process test run (`npm test`) never exercise more than one
+instance, so this bug has no natural trigger to surface it outside a
+multi-instance deployment — which is exactly the environment where it
+matters.
+
+**Where it lives in the codebase.** `src/middleware/rateLimit.ts`'s
+`buildLimiter`, before Step 2 added a `store` option — express-rate-
+limit's default in-memory `MemoryStore`, used implicitly whenever no
+`store` is configured.
+
+**Common pitfalls.**
+
+- Assuming a rate limiter "works" because it correctly rejects the Nth
+  request in local dev or in a single-process test run — that's exactly
+  the condition under which the in-memory store's real limitation stays
+  invisible.
+- Discovering this in production, from a symptom (an operator seeing
+  users get rate-limited far less often than the configured policy
+  implies, or - worse - an actual credential-stuffing run succeeding at
+  `k×N` the rate the policy was meant to cap) rather than from a
+  deliberate, controlled multi-instance test like this one.
+
+**Production considerations.** Any deployment that runs more than one
+instance of this API behind a load balancer — which any real production
+deployment eventually does, for redundancy or scale — needs a shared
+store, not the default in-memory one. That's exactly what Step 2 below
+adds.
+
+Fixing this introduces the mirror-image problem in the test suite itself:
+`tests/routes/auth.test.ts`, `redirect.test.ts`, `links.test.ts`, and
+`googleAuth.test.ts` all issue `POST /api/auth/signup`/`login` through
+supertest, which all share one loopback IP. Under Step 1's in-memory
+store that was harmless — each test _file_ ran in its own process with
+its own private `Map`, so one file's signup volume never touched
+another's. Once Step 2 makes that state real and shared, `npm test`
+running every file back-to-back in one `vitest` run (per
+`vitest.config.ts`'s `fileParallelism: false`) means a later file inherits
+whatever budget an earlier file already spent, within the same 3-second
+test window (`RATE_LIMIT_AUTH_WINDOW_SECONDS` in `.env.test`) — exactly
+the shared-state property this phase spent Step 1 demonstrating the
+_absence_ of. Each of those four files' `beforeAll` now flushes the
+`rl:auth-*` keys before its own tests run, the same category of fix
+`tests/globalSetup.ts` already applies to Postgres via a dedicated test
+database — a deliberately shared external resource needs deliberate
+per-test-boundary isolation, whichever store backs it.
+
+**Interview answer.** I ran two instances of the API on different ports
+sharing everything else, and drove one past its rate limit on
+purpose. The other instance let the very next request through with a
+normal 401, not a 429, because express-rate-limit's default store is an
+in-memory `Map` scoped to that one process — each instance keeps its own
+independent count. The configured policy said "N requests per window";
+what was actually enforced, once there were two processes, was "N per
+window per instance," so the real effective limit across a k-instance
+fleet is k×N, silently. Nothing errors or logs a divergence — it only
+shows up if you specifically drive traffic at more than one instance and
+compare, which is exactly why I wanted to reproduce it deliberately before
+fixing it with a shared Redis-backed store, rather than only describing
+the failure mode in the abstract.
+
+---
+
+### `trust proxy`: `req.ip` is a policy decision, not a fact
+
+**What it is.** `app.set('trust proxy', config.TRUST_PROXY)` in
+`src/app.ts` tells Express how many hops of the `X-Forwarded-For` header
+chain to trust when computing `req.ip` — the value every IP-keyed rate
+limiter in this phase reads. `TRUST_PROXY` defaults to `0` ("trust
+nothing but the real TCP socket"), correct for local dev and this test
+suite, where nothing sits in front of the app.
+
+**Why it exists in this project.** Every rate limiter that matters for
+public traffic (`signupLimiter`, `loginLimiter`, `unlockLimiter`) is keyed
+by IP. `req.ip`'s correctness is a _precondition_ for any of them meaning
+what their configuration says they mean — get it wrong in either
+direction and the limiter still runs, still returns 200s and 429s, and
+gives no indication anything is wrong; it just isn't protecting what it
+appears to be protecting.
+
+**How it works mechanically.** Two distinct failure modes, both silent to
+this app's own logic (nothing throws or looks unusual in either case,
+which is exactly why the header comment in `src/app.ts` and the startup
+warning below exist):
+
+- **Unset, behind a real load balancer.** Every request Express sees comes
+  from one TCP connection: the load balancer's. `req.ip` resolves to the
+  LB's address for every client behind it. Every IP-keyed limiter
+  collapses onto a single bucket shared by _all_ real users — one
+  legitimate user's login attempts count against the same budget as every
+  other user's, and a single user with unusually high traffic can
+  exhaust the whole app's login budget for everyone else. The rate
+  limiter is still "working" in the sense that it enforces some limit;
+  it's just not enforcing it per-user anymore.
+- **Trusting the whole `X-Forwarded-For` chain blindly** (e.g. setting
+  `TRUST_PROXY` far higher than the real number of hops, or naively
+  reading the header directly instead of through `app.set('trust
+proxy', ...)`). `X-Forwarded-For` is a plain, client-settable HTTP
+  header — nothing stops a request from arriving with an attacker-chosen
+  value already in it. If Express is configured to trust hops that don't
+  actually exist, an attacker can simply set the header themselves,
+  handing this app whatever "client IP" they want on every request —
+  a fresh one each time, bypassing every IP-keyed limiter in the app
+  entirely. Trusting more than the real proxy topology warrants is worse
+  than trusting nothing: unset, everyone shares one bucket (unfair, but
+  not bypassable); over-trusted, the limiter can be defeated outright.
+
+Express's `trust proxy` setting is the correct middle ground: a hop count
+(`1` for a single load balancer) tells Express exactly how many
+`X-Forwarded-For` entries, counted from the right, to trust as real
+proxies — anything beyond that count is presumed attacker-controlled and
+ignored.
+
+**Where it lives in the codebase.** `src/config/env.ts` (`TRUST_PROXY`,
+`.default(0)`); `src/app.ts` (`app.set('trust proxy', config.TRUST_PROXY)`,
+plus the production startup warning below); every `keyGenerator` in
+`src/middleware/rateLimit.ts` that reads `req.ip`.
+
+A direct-to-internet deployment (`TRUST_PROXY=0`) is legitimate, not an
+error — but a production deployment sitting behind an unconfigured load
+balancer, with the symptom being real users getting 429s they didn't
+individually earn, points nowhere near `TRUST_PROXY` as the cause. `src/
+app.ts` logs a `warn` at startup whenever `NODE_ENV === 'production' &&
+TRUST_PROXY === 0`, naming the consequence explicitly, so this
+misconfiguration is loud in logs even though it's silent in behavior.
+**Deployment checklist for Phase 15** (moving this API behind Render's
+load balancer): `TRUST_PROXY` must be set to `1` in that environment's
+configuration, or every user collapses onto one shared rate-limit bucket
+— this is exactly the failure this startup warning exists to catch before
+it's a production incident.
+
+**Common pitfalls.**
+
+- Defaulting `TRUST_PROXY` to `1` "to be safe" in this repo's own
+  defaults — that would mean trusting a proxy hop that doesn't exist in
+  local dev or in this test suite, silently opening the spoofing hole
+  described above in exactly the environments where nobody would think to
+  look for it.
+- Treating "requests still get rate limited" as evidence `trust proxy` is
+  configured correctly — both failure modes above still produce working-
+  looking 429s; the bug is in _who_ the limit applies to, not whether a
+  limit applies at all.
+
+**Production considerations.** The hop count must match the real proxy
+topology exactly — one load balancer in front means `1`; a CDN in front of
+a load balancer means `2`; guessing high "to be safe" is the over-trust
+failure mode above, not a safe margin.
+
+**Interview answer.** `trust proxy` controls how many `X-Forwarded-For`
+hops Express trusts when computing `req.ip`, and getting it wrong in
+either direction breaks IP-based rate limiting silently, not loudly.
+Leaving it unset behind a real load balancer makes every user's traffic
+look like it's coming from the load balancer's one address, so all users
+share one limiter bucket. Overcorrecting by trusting the header blindly
+is worse, not safer: `X-Forwarded-For` is a plain client-settable header,
+so an attacker can simply forge whatever "IP" they want and get a fresh
+rate-limit bucket on every request. The fix is a hop count matching the
+real proxy topology — one for a single load balancer — which tells
+Express exactly where to stop trusting the chain. Because this
+misconfiguration produces no errors, I added a startup warning that fires
+whenever the app is in production with `TRUST_PROXY` still at its
+0 default, so the failure is loud in logs even though it's silent in
+behavior.
+
+---
+
+### Keying strategies: IP, IP+resource, and the email-keying tradeoff not taken
+
+**What it is.** Each of this phase's four limiters keys its counter
+differently, deliberately: `signupLimiter`/`loginLimiter` by IP,
+`unlockLimiter` by IP _and_ the shortCode being attacked, `linksCreateLimiter`
+by authenticated user ID.
+
+**Why it exists in this project.** "Rate limit by IP" is the default
+instinct, but it's the right choice for some of these routes and
+observably wrong for others.
+
+IP keying has real false positives and false negatives. **False
+positives:** corporate NAT and CGNAT (carrier-grade NAT, common on mobile
+networks) put many real, unrelated users behind one apparent IP address —
+an IP-keyed limiter can't distinguish "one attacker" from "an office full
+of legitimate users," so a busy office or campus network can trip a limit
+meant for a single bad actor. **False negatives:** a botnet or a pool of
+rotating proxies gives an attacker as many distinct apparent IPs as they
+want, so a per-IP limit caps each individual IP's rate without capping
+the attacker's _aggregate_ rate across all of them at all.
+
+`unlockLimiter`'s IP-alone gap is the concrete case Phase 7 flagged and
+this phase closes: a per-IP-only limit on `/unlock` would let an attacker
+exhaust their budget brute-forcing link A's password, then immediately
+have a fresh, unthrottled budget against link B from the very same
+address — the thing actually being protected (one link's password) has
+nothing to do with a global-per-IP counter. Keying by IP _and_ shortCode
+(`` `${ipKeyGenerator(req.ip)}:${shortCode}` ``) makes the budget specific
+to "this client attacking this link," which is what the threat model
+actually is.
+
+Email-based keying for login — counting failed attempts against the
+_account_ being targeted, regardless of source IP — was considered and
+deliberately not implemented. It would close the aggregate-botnet gap IP
+keying leaves open for credential stuffing (many IPs, one targeted
+account), but it opens a different, arguably worse hole: anyone who knows
+or guesses a victim's email can lock that account out of login entirely,
+from anywhere, without ever needing to control the victim's IP or guess
+their password — a pure availability attack with no credential-guessing
+skill required. Not implementing it is the deliberate choice this phase
+makes, not an oversight; a future phase pairing email-based throttling
+with something like progressive backoff, a CAPTCHA challenge after N
+failures, or account-lockout notifications would be how to get the
+credential-stuffing defense without handing out a free lockout button.
+
+**How it works mechanically.** See `src/middleware/rateLimit.ts` —
+`keyGenerator` on each `buildLimiter(...)` call. `signupLimiter`/
+`loginLimiter` omit `keyGenerator` entirely, falling through to express-
+rate-limit's IP-based default. `unlockLimiter`'s composite key truncates
+`shortCode` to `MAX_ALIAS_LENGTH` before folding it in, bounding how much
+keyspace an attacker could otherwise inflate by sending an arbitrarily
+long path segment. `linksCreateLimiter` keys on `req.userId` (available
+because it's mounted after `requireAuth`), falling back to IP only in the
+case where `req.userId` is somehow unset.
+
+**Where it lives in the codebase.** `src/middleware/rateLimit.ts`. Proven
+per-link isolation: `tests/routes/redirect.test.ts`'s `describe('rate
+limiting (unlock)')`. Proven per-user isolation:
+`tests/routes/links.test.ts`'s `describe('rate limiting')`.
+
+**Common pitfalls.**
+
+- Keying a resource-specific limiter (like unlock) by IP alone and
+  assuming "it's rate limited" is the same claim as "brute-forcing any
+  one link is bounded" — those are different guarantees, and Phase 7's
+  original gap is exactly this confusion.
+- Adding email-based keying as a strict improvement over IP-based keying
+  without naming the account-lockout DoS it introduces — it trades one
+  gap for a different one, not a strict upgrade.
+
+**Production considerations.** `linksCreateLimiter`'s per-user keying has
+its own honest gap: an attacker who creates a fresh account for every
+burst of link creation sidesteps a per-user limit entirely. That's
+bounded by `signupLimiter` instead (a different limiter, a different
+resource) — account-creation abuse and link-creation-rate abuse are
+different problems, and this phase deliberately doesn't conflate them
+into one limiter.
+
+**Interview answer.** I keyed each limiter to match what it's actually
+protecting, not by defaulting to IP everywhere. Auth stays IP-keyed,
+which has real false positives (CGNAT, corporate NAT — many real users,
+one apparent address) and false negatives (a botnet spreads real load
+across many addresses, defeating a per-IP cap on aggregate rate) — I
+considered email-based keying for login specifically to close that
+botnet gap, but rejected it because it trades credential-stuffing
+resistance for a trivial account-lockout attack: anyone can lock out a
+real user's login by guessing their email, not their password. The
+unlock endpoint gets a composite IP-plus-shortCode key, because the
+actual gap there — brute-forcing one link's password shouldn't spend a
+different link's budget — is a resource-scoping problem IP alone can't
+solve regardless of which IP-based tradeoffs you accept.
+
+---
+
+### Rate limiting a public, viral-by-design endpoint without breaking the product
+
+**What it is.** `GET /:shortCode` — the actual redirect, this app's core
+product surface — has no rate limiter, and that's a deliberate decision
+this phase makes explicitly, not an oversight.
+
+**Why it exists in this project.** A URL shortener's redirect endpoint is
+supposed to receive large, legitimate bursts — that's what "a link goes
+viral" means in product terms. The single worst failure mode a rate
+limiter could introduce here is blocking that exact traffic pattern,
+which would make the product actively worse at the one thing it exists to
+do. Before adding any limiter here, it's worth asking specifically what
+abuse it would stop, because "requests per IP" doesn't automatically map
+onto every abuse vector this endpoint could face:
+
+- **Short-code enumeration** (trying many short codes hoping to find a
+  live one) is already cheap to absorb without a rate limiter: Phase 8's
+  negative cache (the `__MISS__` sentinel) turns a repeated miss into a
+  single Redis `GET`, not a Postgres query, after the first attempt per
+  code. There's no expensive-resource-exhaustion problem here for a
+  limiter to add value against.
+- **`maxClicks` exhaustion** — a bot deliberately burning through a
+  capped link's click budget to deny it to real visitors — is a real,
+  distinct abuse vector, but a per-IP limit on this endpoint doesn't
+  actually solve it: a distributed source (a botnet, rotating proxies —
+  the same false-negative class discussed above) defeats a per-IP cap on
+  the exact endpoint that most needs to stay open to bursts. Adding a
+  limiter here would cost real risk (blocking a viral link's real
+  traffic) for a defense that doesn't hold up against the realistic
+  version of the attack it would be aimed at.
+
+This mirrors Phase 8's "Cache stampede" section's own shape: no
+mitigation, a stated reason grounded in this app's actual scale and
+threat model, and an explicit trigger for revisiting the decision, rather
+than either implementing speculative protection or ignoring the question
+entirely.
+
+**How it works mechanically.** Nothing — no limiter middleware is mounted
+on this route. `tests/routes/redirect.test.ts`'s `describe('GET
+/:shortCode is not rate limited (Phase 10 decision)')` fires a burst of
+concurrent requests at one link and asserts every single one succeeds,
+as a positive assertion that this is deliberate, not something nobody
+thought to test.
+
+**Where it lives in the codebase.** `src/routes/redirect.ts` — the
+comment directly above the `GET /:shortCode` handler states the decision
+and points here.
+
+**Common pitfalls.**
+
+- Rate limiting a public product's hottest, most-viral-by-design path
+  "because every public endpoint should have a rate limiter" — a rate
+  limiter is a tool for a specific abuse pattern, not a default hygiene
+  step every route needs regardless of what it actually protects against.
+- Believing a per-IP limiter here would meaningfully bound `maxClicks`
+  abuse — it wouldn't, against a distributed source, which is the
+  realistic shape of that attack.
+
+**Production considerations.** The trigger that would change this
+decision: `maxClicks` abuse or redirect bandwidth cost becoming a
+_measured_ problem, not a theoretical one. At that point, a targeted,
+generous, per-link mechanism — closer to limiting only on a cache miss
+(since Phase 8's negative cache already absorbs cheap enumeration, a
+miss-only limiter would target genuinely expensive lookups specifically)
+than a blanket per-IP cap on every request — would be the next step, not
+a limiter on this route as it stands today.
+
+**Interview answer.** I deliberately didn't rate limit the redirect
+route, because it's this product's core, intentionally-viral path, and
+the worst thing a rate limiter could do here is block a legitimate traffic
+spike — exactly the scenario "going viral" describes. The abuse vectors
+that sound like they'd justify one don't actually hold up: enumeration is
+already cheap because of Phase 8's negative cache, and `maxClicks`
+exhaustion via a botnet defeats a per-IP limit anyway since it's
+distributed by design. I'd revisit this the moment `maxClicks` abuse or
+bandwidth cost becomes a measured problem, with a narrower, per-link
+mechanism — not a blanket limiter on this route as a precaution against a
+theoretical attack it wouldn't actually stop.
+
+---
+
+### A third dedicated Redis connection, and why its settings differ from the queue's
+
+**What it is.** `src/lib/rateLimitRedis.ts` exports
+`rateLimitRedisConnection`, a third standalone `ioredis` connection used
+for exactly one thing: backing `rate-limit-redis`'s `RedisStore` in
+`src/middleware/rateLimit.ts`. It is neither the shared cache client
+(`src/lib/redis.ts`) nor BullMQ's queue connection
+(`src/queues/connection.ts`).
+
+**Why it exists in this project.** Phase 9 already established the rule
+this connection follows: one dedicated `ioredis` instance per consumer
+with distinct reliability requirements, rather than reusing a connection
+built for a different purpose (see "The `maxRetriesPerRequest` conflict").
+BullMQ's `Worker` needs `maxRetriesPerRequest: null` because it issues
+blocking commands that must not race ioredis's own retry logic — nothing
+about rate limiting does that, so this connection doesn't inherit that
+constraint. What it _does_ need is the cache client's shape: fail fast,
+fail open, never let a Redis hiccup add unbounded latency to a request
+that's supposed to be cheap.
+
+**How it works mechanically.** `rateLimitRedisConnection` is built with
+`lazyConnect: true` (no import-time socket, matching `src/lib/redis.ts`'s
+reasoning) and `maxRetriesPerRequest: 1` (a single retry before a command
+gives up, bounding how long a request can be stuck waiting on a struggling
+connection). `rate-limit-redis`'s `sendCommand` option is wired to
+`rateLimitRedisConnection.call(...)`, prefixed per limiter (`rl:auth-signup:`,
+`rl:auth-login:`, `rl:redirect-unlock:`, `rl:links-create:`) so each
+limiter's keys are visibly namespaced in Redis and can never collide with
+each other or with Phase 8's `link:` cache keys.
+
+One setting deliberately does _not_ appear here, and the reason is a real
+bug this phase hit, not a hypothetical: `enableOfflineQueue: false` looks
+like the right choice for a fail-open limiter — reject immediately while
+disconnected instead of silently queueing — but paired with
+`lazyConnect: true` it's actively broken. The very first command ever
+issued on a lazy connection always arrives before the socket has finished
+connecting (`connect()` is fired but hasn't resolved yet), so with the
+offline queue disabled that first command _always_ rejects, even against
+a perfectly healthy Redis. That first command is `rate-limit-redis`'s
+`SCRIPT LOAD`, issued synchronously inside `rateLimit()`'s `store.init()`
+the moment each limiter is constructed (at module load, before the app
+even starts listening) — and `RedisStore` caches that load's result as a
+single promise it never retries on anything other than a `NOSCRIPT` error.
+One failed cold start, from this timing race alone, would silently and
+_permanently_ neutralize that limiter for the rest of the process's life —
+every later `increment()` call would keep hitting the same cached
+rejection, and `passOnStoreError` would keep quietly waving every request
+through. Leaving the offline queue enabled (ioredis's default) instead
+lets that first command simply wait for the connection, bounded by
+`connectTimeout` and `maxRetriesPerRequest` — exactly the tradeoff
+`src/lib/redis.ts` already makes for the cache client.
+
+**Where it lives in the codebase.** `src/lib/rateLimitRedis.ts`
+(the connection); `src/middleware/rateLimit.ts` (`sendCommand`, the
+`RedisStore` construction). Health surfacing follows `src/services/
+health.ts`'s existing pattern if this connection is ever added to the
+`/health` report, though this phase doesn't add it there — a rate limiter
+failing open is designed to be invisible to callers by construction,
+unlike the database/cache dependencies `/health` already reports on.
+
+**Common pitfalls.**
+
+- Pairing `enableOfflineQueue: false` with `lazyConnect: true` on any
+  fresh ioredis connection, not just this one — the combination guarantees
+  the first command after every cold start races a socket that hasn't
+  connected yet, and loses.
+- Assuming a rejected `store.init()` promise is retried automatically —
+  `rate-limit-redis` only retries a `NOSCRIPT` error (the script existing
+  but having been evicted from Redis's script cache); any other failure,
+  including a timing race like the one above, is cached and rethrown
+  forever.
+- Reusing the shared cache client (`redis`) for this store because "it's
+  already fail-open, why build another connection" — it is fail-open for
+  its own purpose, but sharing one connection's health/shutdown lifecycle
+  across two unrelated consumers is exactly the coupling Phase 9 already
+  rejected for the queue.
+
+**Production considerations.** If this app ever needs to observe rate-
+limiter health directly (e.g. alerting specifically on sustained
+`passOnStoreError` fallbacks rather than inferring them from a drop in 429
+volume), that's a metric to add at the `sendCommand` wrapper in
+`src/middleware/rateLimit.ts`, not a reason to change this connection's
+settings.
+
+**Interview answer.** I gave rate limiting its own dedicated Redis
+connection rather than reusing the cache client or the BullMQ queue
+connection, following the same "one connection per consumer" rule Phase 9
+already established — this one's failure mode should look like the
+cache's, not the queue's, since nothing here issues blocking commands.
+While building it I actually hit a real bug from combining
+`enableOfflineQueue: false` with `lazyConnect: true`: the first command on
+a lazy connection always races an unfinished socket connection and loses,
+and because `rate-limit-redis` caches its script-load promise forever on
+any non-`NOSCRIPT` failure, that one race would have silently and
+permanently disabled every limiter using this connection for the rest of
+the process's life. Leaving the offline queue enabled — mirroring the
+cache client's own settings — fixed it: the first command just waits for
+the connection instead of failing immediately.
+
+---
+
+### Fail-open, again — extending Phase 8's graceful-degradation precedent
+
+**What it is.** `passOnStoreError: true` on every limiter in
+`src/middleware/rateLimit.ts`: if the Redis command backing a rate-limit
+check fails, express-rate-limit skips incrementing that key, skips setting
+rate-limit headers, logs the error, and calls `next()` — the request
+proceeds exactly as if no limiter were mounted on that route at all.
+
+**Why it exists in this project.** This is the same argument Phase 8 made
+for the link-lookup cache, applied to a new layer: a rate limiter is, like
+a cache, an optional layer sitting on top of a request that would have
+succeeded without it. If a rate limiter's own failure could fail the
+request it's supposed to be protecting, adding rate limiting would make
+the app _less_ reliable than having none at all — a Redis blip would
+become a full auth/unlock/link-creation outage, which is a strictly worse
+outcome than briefly, accidentally running unlimited. See Notes.md, "Phase
+8: Caching the Redirect Path" / "Graceful degradation" for the original
+statement of this principle; this section extends it, not restates it from
+scratch.
+
+**How it works mechanically.** Unlike Phase 8's cache, which implements
+fail-open by hand (a `try`/`catch` around each Redis call in
+`linkService.ts`), this phase uses a first-class option express-rate-limit
+already ships: `passOnStoreError`. The library's own `increment()` call is
+wrapped in a `try`/`catch` internally; on a caught error, with the option
+set, it logs via the configured `logger` (here, `pinoAdapterLogger` in
+`src/middleware/rateLimit.ts` — routed through this app's structured Pino
+logger rather than the library's `console`-based default, matching
+CLAUDE.md's "no console.log" rule for a dependency's internal logging just
+as much as for code written here) and calls `next()` directly, never
+throwing into the route.
+
+This is also, still, exactly the same divergence from `oauthState.ts`'s
+fail-_closed_ `storeState`/`consumeState` that Phase 8 already drew: Redis
+is the actual source of truth for OAuth CSRF state, so a failure there
+must fail the request, because proceeding without checking it would mean
+skipping a real security check. A rate limit, by contrast, is a
+performance/abuse-shaping layer over routes that already have their own
+correct authorization and validation independent of it — bcrypt still
+verifies the password, `requireAuth` still checks the token, either way.
+Losing the rate limit temporarily during a Redis outage means losing a
+_mitigation_, not the underlying protection; losing OAuth state validation
+would mean losing the protection itself.
+
+**Where it lives in the codebase.** `src/middleware/rateLimit.ts`
+(`passOnStoreError: true`, `pinoAdapterLogger`). Proven in
+`tests/routes/auth.test.ts`'s `describe('fail-open when the rate-limit
+Redis connection is unavailable')`, which mocks
+`rateLimitRedisConnection.call` to reject once and asserts the login
+route's real handler still runs (a normal 401, not a 500 or a 429) —
+mirroring `tests/routes/redirect.test.ts`'s existing `vi.spyOn(redis,
+'get'|'set'|'del').mockRejectedValueOnce` pattern for the cache.
+
+**Common pitfalls.**
+
+- Assuming `passOnStoreError`'s default (`false`) is a reasonable starting
+  point "because rate limiting should be strict" — the strictness that
+  matters is bounding a _working_ Redis's abuse budget, not turning an
+  _unavailable_ Redis into an outage for every route a limiter touches.
+- Forgetting to point the library's own internal logger at this app's
+  structured logger — without `pinoAdapterLogger`, every fail-open event
+  (and every other internal warning/error express-rate-limit logs) writes
+  to `console.error`/`console.warn` instead of the aggregated,
+  structured log stream everything else in this app uses.
+
+**Production considerations.** A sustained Redis outage under this design
+degrades to "every rate-limited route runs completely unthrottled" — worse
+exposure to the abuse each limiter exists to bound, but a fully functional
+system, which is the same tradeoff Phase 8 already accepted for the cache
+and the right one for the same reason: an optional layer's failure should
+degrade the thing it protects, not delete it.
+
+**Interview answer.** I extended Phase 8's fail-open principle to rate
+limiting: if the Redis command a rate-limit check depends on fails, the
+request should proceed as if that limiter weren't mounted, not fail with a
+500 or a false 429. Unlike the cache, which implements this by hand with
+try/catch, I used express-rate-limit's own `passOnStoreError` option,
+since it's a first-class mechanism for exactly this. I also made sure the
+library's internal logging goes through this app's Pino logger instead of
+its `console`-based default, so a fail-open event is visible in the same
+structured log stream as everything else, not silently separate. And I
+kept the same contrast Phase 8 already drew with `oauthState.ts`: that
+module fails closed because Redis is the actual source of truth for OAuth
+state with no fallback, while a rate limit sits on top of routes that stay
+correctly authorized and validated on their own — losing the limit
+temporarily during an outage means losing a mitigation, not the
+underlying protection.
+
+---
+
+### What a 429 actually communicates, and the headers that back it up
+
+**What it is.** Every limiter in this phase responds to an over-budget
+request with `429 Too Many Requests`, using the existing `tooManyRequests`
+factory from `src/lib/errors.ts`, plus a `Retry-After` header and the
+`RateLimit-Limit`/`RateLimit-Remaining`/`RateLimit-Reset`/`RateLimit-Policy`
+headers (via `standardHeaders: 'draft-6'`) on every response, allowed or
+blocked.
+
+**Why it exists in this project.** 429 says something 401 and 403 don't:
+_retriability_. A 401 ("who are you, really") or 403 ("I know who you are
+and you can't do this") describe the caller's identity or permissions —
+retrying the identical request changes nothing until the caller's
+credentials or access change. A 429 describes _timing_, not identity or
+permission: the exact same request, from the exact same caller, will
+succeed later, once the window resets. Collapsing that distinction into a
+401/403 would tell a well-behaved client "you're unauthorized" when the
+honest answer is "you're fine, just not right now" — a client that
+respects HTTP semantics would have no reason to retry a 401, but every
+reason to back off and retry after a 429's `Retry-After`.
+
+**How it works mechanically.** `standardHeaders: 'draft-6'` was chosen
+over `express-rate-limit`'s newer `'draft-7'` option specifically because
+draft-6 emits separate, individually-named `RateLimit-Limit`/
+`RateLimit-Remaining`/`RateLimit-Reset` headers, while draft-7 combines
+them into one opaque `RateLimit: limit=…, remaining=…, reset=…` header —
+harder for a client (or a test) to read a single value out of without
+parsing that combined string. `Retry-After` is set automatically by
+express-rate-limit only on the blocked (429) response, computed from the
+same window/reset-time bookkeeping already backing the other headers.
+
+Each limiter's `handler` option (in `buildLimiter`,
+`src/middleware/rateLimit.ts`) reads that already-computed `Retry-After`
+value back off `res` — `Number(res.getHeader('Retry-After'))` — rather
+than recomputing it, so there's one source of truth for the number, and
+passes it into `tooManyRequests('Too many requests. Please try again
+later.', { retryAfterSeconds })`. `AppError.details` already accepts
+`unknown` (see Phase 3, "Operational vs programmer errors"), so this
+needed no signature change to `tooManyRequests` or to the error
+middleware — `{ retryAfterSeconds }` flows straight through the existing
+`...(isAppError && err.details !== null ? { details: err.details } : {})`
+line in `createErrorHandler`, giving a 429 the exact same
+`{ error: { code, message, requestId, details } }` envelope every other
+error in this API already has, with the header carrying the same value
+for anything that reads HTTP semantics rather than the JSON body.
+
+**Where it lives in the codebase.** `src/middleware/rateLimit.ts`
+(`buildLimiter`'s shared `handler`); `src/lib/errors.ts`
+(`tooManyRequests`, unchanged). Proven in `tests/routes/auth.test.ts`,
+`tests/routes/redirect.test.ts`, and `tests/routes/links.test.ts`'s
+respective `describe('rate limiting'...)` blocks.
+
+**Common pitfalls.**
+
+- Writing a custom `handler` that builds its own plain-text or ad hoc JSON
+  response — express-rate-limit's default `handler` does exactly this,
+  which is precisely why this phase overrides it: bypassing
+  `createErrorHandler` would give 429s a different shape than every other
+  error this API returns.
+- Recomputing `Retry-After` independently from the `RateLimit-Reset`
+  value already on the response — two calculations of the same "when can
+  you retry" answer are two chances for them to disagree.
+
+**Production considerations.** A well-behaved client (or a future
+frontend) should treat `Retry-After` as authoritative for backoff timing,
+not implement its own retry/backoff heuristic against a 429 with no
+`Retry-After` — which is exactly why every limiter in this phase sets it.
+
+**Interview answer.** 429 communicates something 401 and 403 can't:
+that the _same_ request will succeed later, purely as a matter of timing,
+not identity or permission — which is why it needs `Retry-After` and the
+`RateLimit-*` headers to actually be useful to a well-behaved client,
+where a 401 doesn't invite a retry at all. I used express-rate-limit's
+draft-6 header set specifically because it emits separate, individually
+named headers rather than draft-7's one combined header, and routed the
+actual 429 response through the same `tooManyRequests` AppError factory
+and error middleware every other error in this API uses, reading
+`Retry-After` back off the response rather than computing it a second
+time — so a rate-limit error looks, to any client of this API, like every
+other error it already knows how to parse.

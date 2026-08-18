@@ -1,9 +1,11 @@
 import type { Express } from 'express';
 import request from 'supertest';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import type { Config } from '../../src/config/env.js';
 import type { ClickJobData } from '../../src/queues/contracts.js';
 
 let app: Express;
+let config: Config;
 let query: typeof import('../../src/db/pool.js').query;
 let redis: typeof import('../../src/lib/redis.js').redis;
 let clickQueue: typeof import('../../src/queues/clickQueue.js').clickQueue;
@@ -16,11 +18,26 @@ beforeAll(async () => {
   // worker/config.ts has the same requirement for its own (narrower) schema.
   process.loadEnvFile('.env.test');
   ({ app } = await import('../../src/app.js'));
+  ({ config } = await import('../../src/config/index.js'));
   ({ query } = await import('../../src/db/pool.js'));
   ({ redis } = await import('../../src/lib/redis.js'));
   ({ clickQueue } = await import('../../src/queues/clickQueue.js'));
   ({ processClickJob } = await import('../../worker/processors/clickProcessor.js'));
   ({ sweepExpiredLinks } = await import('../../worker/processors/linkCleanupProcessor.js'));
+
+  // See tests/routes/auth.test.ts's beforeAll for why this file-local
+  // flush is necessary now that signupLimiter is backed by real, shared
+  // Redis rather than a per-process in-memory Map: every test file's
+  // supertest requests share one loopback IP, so without this flush this
+  // file's ~25 signupUser() calls could inherit budget already spent by
+  // whichever file ran immediately before it in the same `npm test` run.
+  // (unlockLimiter, tested directly below, is keyed per-link and needs no
+  // such flush — it never collides across files.)
+  const { rateLimitRedisConnection } = await import('../../src/lib/rateLimitRedis.js');
+  const authLimiterKeys = await rateLimitRedisConnection.keys('rl:auth-*');
+  if (authLimiterKeys.length > 0) {
+    await rateLimitRedisConnection.del(...authLimiterKeys);
+  }
 });
 
 afterAll(async () => {
@@ -525,6 +542,76 @@ describe('response caching (Redis)', () => {
     const followUp = await agent.get(`/${link.shortCode}`);
     expect(followUp.status).toBe(302);
     expect(followUp.headers.location).toBe('https://example.com/warm-gated');
+  });
+});
+
+describe('rate limiting (unlock)', () => {
+  it('CRITICAL: exceeding the unlock limit on link A does not block link B from the same client', async () => {
+    const { token } = await signupUser('rl-unlock-isolation');
+    const linkA = await createLink(token, {
+      destinationUrl: 'https://example.com/rl-a',
+      password: 'password-a',
+    });
+    const linkB = await createLink(token, {
+      destinationUrl: 'https://example.com/rl-b',
+      password: 'password-b',
+    });
+
+    // unlockLimiter is keyed by IP + shortCode, so a fresh link per test
+    // (as used here) never shares budget with any other test's link —
+    // this test proves the isolation the composite key exists for, not
+    // just relying on it.
+    let last: request.Response | undefined;
+    for (let i = 0; i < config.RATE_LIMIT_UNLOCK_MAX + 1; i += 1) {
+      last = await request(app)
+        .post(`/${linkA.shortCode}/unlock`)
+        .send({ password: 'wrong-guess' });
+    }
+    expect(last!.status).toBe(429);
+    expect(last!.body.error.code).toBe('TOO_MANY_REQUESTS');
+    expect(Number(last!.headers['retry-after'])).toBeGreaterThan(0);
+
+    const unlockB = await request(app)
+      .post(`/${linkB.shortCode}/unlock`)
+      .send({ password: 'password-b' });
+    expect(unlockB.status).toBe(302);
+  });
+
+  it('RateLimit-* headers are present on both an allowed and a blocked unlock response', async () => {
+    const { token } = await signupUser('rl-unlock-headers');
+    const link = await createLink(token, {
+      destinationUrl: 'https://example.com/rl-headers',
+      password: 'secret',
+    });
+
+    const allowed = await request(app)
+      .post(`/${link.shortCode}/unlock`)
+      .send({ password: 'wrong' });
+    expect(allowed.headers['ratelimit-limit']).toBe(String(config.RATE_LIMIT_UNLOCK_MAX));
+    expect(allowed.headers['ratelimit-remaining']).toBe(String(config.RATE_LIMIT_UNLOCK_MAX - 1));
+
+    let blocked: request.Response | undefined;
+    for (let i = 0; i < config.RATE_LIMIT_UNLOCK_MAX; i += 1) {
+      blocked = await request(app).post(`/${link.shortCode}/unlock`).send({ password: 'wrong' });
+    }
+    expect(blocked!.status).toBe(429);
+    expect(blocked!.headers['ratelimit-remaining']).toBe('0');
+  });
+});
+
+describe('GET /:shortCode is not rate limited (Phase 10 decision)', () => {
+  it('many rapid concurrent requests to one link all succeed, none are 429', async () => {
+    const { token } = await signupUser('rl-redirect-no-limit');
+    const link = await createLink(token, { destinationUrl: 'https://example.com/rl-no-limit' });
+    const CONCURRENCY = config.RATE_LIMIT_UNLOCK_MAX * 5;
+
+    const responses = await Promise.all(
+      Array.from({ length: CONCURRENCY }, () => request(app).get(`/${link.shortCode}`)),
+    );
+
+    for (const res of responses) {
+      expect(res.status).toBe(302);
+    }
   });
 });
 
