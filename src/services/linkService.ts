@@ -531,6 +531,59 @@ export async function getLinkByShortCode(shortCode: string): Promise<RedirectLin
   return link;
 }
 
+export interface LinkClickStats {
+  day: string;
+  clicks: number;
+}
+
+interface ClickStatsRow {
+  day: Date;
+  clicks: number;
+}
+
+/**
+ * Daily click counts for one link, scoped to its owner, within
+ * [sinceDate, now]. Two separately-scoped queries, not one JOIN...GROUP BY:
+ * getLink(userId, linkId) supplies the not-found-vs-not-yours 404 semantics
+ * (a real, owned link with zero clicks in the window must return an empty
+ * array with 200, not a 404 — a single query can't distinguish that from
+ * "link doesn't exist" or "not yours", since all three produce zero rows).
+ * The aggregation query below is ALSO independently scoped by
+ * `l.user_id = $2` in its own WHERE — per this codebase's non-negotiable
+ * "every user-data query scoped to the authenticated user IN THE QUERY, not
+ * in an if-statement" convention, the getLink check above supplies clean
+ * 404 semantics, not the ownership guarantee itself.
+ *
+ * See clicks_link_id_clicked_at_index (migrations/
+ * ..._add-performance-indexes.ts) — link_id leftmost matches the JOIN's
+ * equality predicate, clicked_at second lets the >= $3 range and the
+ * GROUP BY that follows walk an already-narrowed, ordered slice instead of
+ * scanning every click this link has ever recorded.
+ */
+export async function getLinkClickStats(
+  userId: string,
+  linkId: string,
+  sinceDate: Date,
+): Promise<LinkClickStats[] | null> {
+  const link = await getLink(userId, linkId);
+  if (!link) return null;
+
+  const result = await query<ClickStatsRow>(
+    `SELECT date_trunc('day', c.clicked_at) AS day, count(*)::int AS clicks
+     FROM clicks c
+     JOIN links l ON l.id = c.link_id
+     WHERE l.id = $1 AND l.user_id = $2 AND c.clicked_at >= $3
+     GROUP BY day
+     ORDER BY day`,
+    [linkId, userId, sinceDate],
+  );
+
+  return result.rows.map((row) => ({
+    day: row.day.toISOString().slice(0, 10),
+    clicks: row.clicks,
+  }));
+}
+
 export async function deleteLink(userId: string, linkId: string): Promise<boolean> {
   // short_code is selected here purely to invalidate the right cache key —
   // it's never returned to the caller, so this function's public

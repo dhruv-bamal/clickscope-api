@@ -1466,11 +1466,13 @@ deferred, not overlooked.
   (mitigated by `CREATE INDEX CONCURRENTLY`, not needed here since these
   tables start empty).
 
-**Production considerations.** Phase 12 of this project is explicitly
+**Production considerations.** Phase 11 of this project is explicitly
 reserved as a dedicated, measurement-driven indexing pass — once there are
 real routes and real query patterns (and ideally `EXPLAIN ANALYZE` output
 from production-like data volumes), that's when `clicked_at` and similar
-columns get revisited, backed by evidence instead of speculation.
+columns get revisited, backed by evidence instead of speculation. (This
+originally said "Phase 12" — corrected once the indexing pass actually
+landed as Phase 11; see "Phase 11: Database Optimization" below.)
 
 **Interview answer.** Every index speeds up specific reads at the cost of
 slowing down every write to that table, so I only add one when I can name
@@ -5576,7 +5578,14 @@ user's realistic link count, but it would become one at very high
 per-user link volumes or once deep-page access became a common, not
 edge-case, usage pattern — at that point, the fix is cursor pagination
 over a purpose-built `(user_id, created_at, id)` index, which the schema
-comment already flags as a Phase 12 decision, not a Phase 6 one.
+comment already flags as a Phase 11 decision, not a Phase 6 one. (Corrected
+from "Phase 12" — see "Phase 11: Database Optimization" below.) Phase 11
+did add that composite index — `links_user_id_created_at_id_index` — but
+only to remove the `Sort` node from the existing `OFFSET`-based query; it
+did not switch the API to cursor pagination, so the deep-page `OFFSET` cost
+described above is still real and still unaddressed. The index and the
+pagination strategy are separable decisions — this phase resolved the
+former, not the latter.
 
 **Interview answer.** I used offset pagination, not cursor, because
 cursor pagination needs a composite index this table doesn't have yet —
@@ -5915,8 +5924,8 @@ expiry only... Phase 9 adds the sweep."
 - Assuming lazy expiry alone is sufficient in production — it only
   closes the gap for rows someone actually requests. An expired link
   nobody ever clicks again sits in the table forever, invisibly, taking
-  up storage and (once Phase 12's indexing pass adds `expires_at`/
-  `is_active` indexes) still costing index maintenance on every write to
+  up storage and (once Phase 11's indexing pass adds the partial
+  `expires_at` index) still costing index maintenance on every write to
   a table that's silently accumulating dead weight.
 - Assuming a scheduled sweep alone is sufficient — between sweep runs,
   a link can be technically expired but still lazily unaware of it until
@@ -8114,16 +8123,23 @@ test assertion (`tests/routes/redirect.test.ts`, "an expired link reads
 ... before the sweep ... after") rather than left as an implicit
 surprise.
 
-**No new index.** The sweep's `WHERE` clause touches `is_active`/
-`expires_at`, both explicitly _not_ indexed per the `links` migration's
-own comment — deferred to "Phase 12," a dedicated, measurement-driven
-indexing pass. This phase doesn't add one either, for the same reason:
-this is a low-frequency, schedule-driven scan, not a per-request hot
-path, and adding an index now without measurement would repeat the exact
-mistake Phase 7/8's whole methodology has consistently avoided elsewhere.
-Phase 12 now has two consumers who'd benefit from that index (this sweep,
-and any future admin/analytics listing) — which strengthens the case for
-a proper measurement pass later, not for guessing now.
+**No new index (as of this phase).** The sweep's `WHERE` clause touches
+`is_active`/`expires_at`, both explicitly _not_ indexed per the `links`
+migration's own comment — deferred to "Phase 11" (originally written here
+as "Phase 12"; corrected once the indexing pass actually landed under its
+real phase number), a dedicated, measurement-driven indexing pass. This
+phase doesn't add one either, for the same reason: this is a low-frequency,
+schedule-driven scan, not a per-request hot path, and adding an index now
+without measurement would repeat the exact mistake Phase 7/8's whole
+methodology has consistently avoided elsewhere. Phase 11 now has two
+consumers who'd benefit from that index (this sweep, and the click-
+aggregation analytics endpoint it turned out to gain) — which strengthened
+the case for a proper measurement pass later, not for guessing now. **Update
+from Phase 11:** that measurement pass happened — `links_expires_at_active_
+partial_index`, a partial index on `expires_at` scoped to `WHERE is_active =
+true`, now serves this exact query. See "Phase 11: Database Optimization"
+below for the before/after `EXPLAIN ANALYZE` proof (`Seq Scan` over all
+50,000 seeded links → `Bitmap Index Scan` over the ~1,441 matching rows).
 
 **Where it lives in the codebase.** `worker/processors/
 linkCleanupProcessor.ts` (`sweepExpiredLinks`); `worker/scheduler.ts`
@@ -8145,9 +8161,11 @@ message-transition test).
   intentional consequence.
 
 **Production considerations.** As sweep frequency or table size grows,
-this is exactly the kind of scan Phase 12's indexing pass should
+this is exactly the kind of scan Phase 11's indexing pass should
 prioritize first — but only once there's real data on sweep duration and
-frequency to measure against, not before.
+frequency to measure against, not before. (It did — this was, in fact, the
+single largest before/after improvement in Phase 11's measurements: see
+below.)
 
 **Interview answer.** Phase 7 only implemented lazy expiry — checking
 `expires_at` at read time, never writing anything back — specifically so
@@ -9401,3 +9419,800 @@ and error middleware every other error in this API uses, reading
 `Retry-After` back off the response rather than computing it a second
 time — so a rate-limit error looks, to any client of this API, like every
 other error it already knows how to parse.
+
+## Phase 11: Database Optimization
+
+### Why indexing was deferred until this phase
+
+**What it is.** Every migration through Phase 9 deliberately left several
+columns unindexed — `links.expires_at`, `links.is_active`,
+`clicks.clicked_at` — with an explicit comment naming this as a future,
+measurement-driven pass rather than an oversight. This phase is that pass.
+
+**Why it exists in this project.** An index is a bet: it costs write time
+and storage on every row, forever, in exchange for read speed on a
+specific query shape. Placed before a real query exists to measure, that
+bet is made blind — there's no way to know whether the query pattern
+you're guessing at is the one that actually shows up, whether the table
+will be large enough for the index to matter, or whether the column order
+you picked serves the real `WHERE`/`ORDER BY` shape a route ends up using.
+This project's methodology across every phase has been "build the thing,
+measure it, then optimize what the measurement says to" (Phase 7's
+redirect-path latency benchmark, Phase 8's cache-effectiveness numbers,
+Phase 9's queue-depth observability) — deferred indexing is the same
+discipline applied to the database layer specifically.
+
+**How it works mechanically.** Nothing to add here beyond what's already
+true: an index that doesn't exist costs nothing and helps nothing. The
+mechanism worth naming is what "deferred, not skipped" means in practice —
+each unindexed column got an explicit comment in its migration
+(`migrations/..._create-links-table.ts`, `migrations/
+..._create-clicks-table.ts`) naming the decision and what would justify
+revisiting it, so the absence reads as a decision on re-read, not a gap
+nobody noticed.
+
+**Where it lives in the codebase.** The original deferral comments in
+`migrations/20260810111606896_create-links-table.ts` and `migrations/
+20260810111607018_create-clicks-table.ts`; this phase's resolution in
+`migrations/20260818173151020_add-performance-indexes.ts`.
+
+**Common pitfalls.**
+
+- Treating "index it now, it can't hurt" as the safe default — every
+  unnecessary index is unconditional cost (write amplification, storage,
+  one more thing the planner has to consider on every query) for
+  conditional, possibly-never-realized benefit.
+- The opposite mistake: never revisiting a deferral once made, so
+  "deferred" quietly becomes "permanently absent" with nobody ever
+  circling back. Naming the trigger condition in the deferral comment (as
+  these migrations did) is what prevents that.
+
+**Production considerations.** This project seeded realistic volume
+(`scripts/seed-bulk.ts`) specifically because "wait for production traffic
+to reveal the pattern" is the textbook version of this advice but isn't
+available pre-launch — a synthetic-but-realistic dataset is the practical
+substitute when there's no real traffic yet to measure against.
+
+**Interview answer.** I don't index speculatively. Every index in this
+schema exists because a captured `EXPLAIN ANALYZE` plan against realistic
+data showed a specific query doing more work than it needed to — not
+because a column "might get queried later." That's not caution for its own
+sake: an index is a permanent write-time and storage cost paid on every
+row regardless of whether the read pattern it was guessed for ever
+materializes, so the earlier migrations in this project explicitly
+deferred indexing certain columns with a named trigger condition
+("once there's a real query pattern and real data to measure against"),
+and this phase is exactly that trigger firing.
+
+### B-tree indexes and reading EXPLAIN ANALYZE
+
+**What it is.** Postgres's default index type is a B-tree — a balanced,
+sorted tree structure where every leaf is the same distance from the root,
+so a lookup, insert, or range scan is `O(log n)` regardless of which key
+you're looking for. `EXPLAIN ANALYZE` is how you see whether a query
+actually used one: it runs the query for real and reports the plan
+Postgres chose alongside real execution numbers, not just an estimate.
+
+**Why it exists in this project.** Every claim in this phase's
+`docs/performance/before.md` and `after.md` is a captured `EXPLAIN
+(ANALYZE, BUFFERS)` plan, not a guess about what an index "should" do —
+this is the literal mechanism the whole measurement-driven methodology
+runs on.
+
+**How it works mechanically.** A B-tree's `O(log n)` lookup works by
+repeatedly halving the search space: each internal node holds sorted keys
+that partition the tree into ranges, so descending from root to leaf
+compares against roughly `log₂(n)` nodes instead of scanning all `n` rows.
+This is what makes an index lookup on a 50,000-row table (`log₂(50,000) ≈
+16`) fundamentally different from a `Seq Scan`, whose cost is linear in
+table size no matter how selective the predicate is — exactly the gap
+this phase's cleanup-sweep plan showed (`before.md`: `Seq Scan`, all
+50,000 rows visited to find 1,441 matches; `after.md`: `Bitmap Index Scan`
+on the new partial index, touching only the matching subset).
+
+Three scan types show up across this phase's plans:
+
+- **Seq Scan** — reads every row in the table, applying the `WHERE` clause
+  as a row-by-row filter. Cost is linear in table size, independent of
+  selectivity. The cleanup sweep's `before.md` plan.
+- **Index Scan** — walks the B-tree to find matching entries, then fetches
+  each matching row from the table heap to get any column not in the
+  index. The redirect lookup (`links_short_code_key`) throughout.
+- **Index Only Scan** — like an Index Scan, but every column the query
+  needs is already in the index itself, so the heap fetch is skipped
+  entirely (`Heap Fetches: 0` in the plan). `after.md`'s bounded click
+  aggregation query — `clicks_link_id_clicked_at_index` covers `link_id`,
+  `clicked_at`, and (for a `count(*)`) needs nothing else from the row.
+
+Reading a captured plan is done inside-out — the innermost node runs
+first, and its output feeds the node above it. Take `after.md`'s link-list
+plan:
+
+```
+Limit  (cost=0.41..50.88 rows=20 width=105) (actual time=0.041..0.059 rows=20 loops=1)
+  ->  Index Scan using links_user_id_created_at_id_index on links (...)
+        Index Cond: (user_id = '...'::uuid)
+```
+
+Read from the bottom: the `Index Scan` walks
+`links_user_id_created_at_id_index` filtering on `user_id`, in the order
+the index stores rows (`created_at DESC, id DESC` — matching the query's
+`ORDER BY`); the `Limit` above it stops pulling rows from that scan the
+moment 20 have been produced. `cost=X..Y` is the planner's own estimate in
+arbitrary units (startup cost, then total cost, not milliseconds) used to
+compare candidate plans against each other before execution; `rows` next
+to it is the estimated row count. `actual time=X..Y` and the `rows=`/
+`loops=` on the same line are what really happened — this is the entire
+point of `ANALYZE` in `EXPLAIN ANALYZE`: it executes the query for real
+and reports ground truth alongside the estimate, rather than just printing
+the plan the optimizer intends to use. `loops=1` means this node ran once;
+a nested loop's inner side can show `loops > 1` (once per outer row), and
+`actual time` there is reported *per loop*, not summed — a detail worth
+knowing before reading `loops=1058` and multiplying wrong. `BUFFERS`
+(added explicitly via `EXPLAIN (ANALYZE, BUFFERS)`, not the default)
+reports `shared hit` (served from Postgres's buffer cache — no disk
+touched) versus `shared read` (a real page read) — the difference between
+a warm cache and genuine I/O, which raw timing alone can't distinguish.
+
+**Where it lives in the codebase.** `docs/performance/before.md` and
+`after.md` — every plan in this phase is captured this way, not
+paraphrased.
+
+**Common pitfalls.**
+
+- Reading `cost` as if it were milliseconds — it's the planner's own
+  internal, unitless estimate, comparable to other costs in the same plan
+  but not to a wall-clock number.
+- Trusting `EXPLAIN` without `ANALYZE` for anything beyond "what plan would
+  the planner pick" — without `ANALYZE`, nothing actually executes, so
+  there's no `actual time`/`rows`/`loops` to check the estimate against.
+- Running `EXPLAIN ANALYZE` on a write query (`UPDATE`/`DELETE`) without
+  wrapping it in a transaction you intend to roll back — it executes the
+  write for real. `before.md`'s cleanup-sweep capture uses `BEGIN; EXPLAIN
+  (ANALYZE, BUFFERS) UPDATE ...; ROLLBACK;` for exactly this reason (a
+  naive `AND false` guard was tried first and rejected — Postgres
+  constant-folds it into a zero-cost no-op plan that never touches the
+  real predicate at all, defeating the measurement).
+
+**Production considerations.** `EXPLAIN ANALYZE` against a local, possibly
+cold-cache database isn't identical to production behavior under
+concurrent load and a warm cache — it's the right tool for "does this
+index get chosen and does it change the plan shape," not a promise that
+the millisecond numbers transfer unchanged to production traffic.
+
+**Interview answer.** I read a plan inside-out: the innermost node
+executes first and feeds the ones above it. The two numbers that matter
+most are the scan type (`Seq Scan` means linear cost regardless of
+selectivity; `Index Scan`/`Index Only Scan` means logarithmic lookup plus,
+for the "Only" variant, no heap access at all) and whether `actual rows`
+roughly matches `estimated rows` — a big gap there means the planner's
+statistics are stale or can't capture some correlation in the data, which
+is itself diagnostic information, not just a curiosity.
+
+### Why the seed data is non-uniform, on purpose
+
+**What it is. `scripts/seed-bulk.ts` assigns clicks to links using a
+Zipf-law distribution (`weight ∝ 1/rank`), not an even split — the seeded
+data has one link with 45,728 clicks and an average link with about 10.
+
+**Why it exists in this project.** A uniform seed would have actively
+hidden the problem this phase exists to fix. If every link got the same
+~10 clicks, `WHERE link_id = $1` on `clicks` would return roughly the same
+tiny row count for every link, and there would be no case where a `Seq
+Scan` on `clicks` is visibly expensive for one link and trivially cheap
+for another — the exact contrast that makes a captured `EXPLAIN ANALYZE`
+plan meaningful evidence instead of noise. Real click distributions are
+skewed for the same underlying reason city populations, word frequencies,
+and viral content all follow power laws: a small number of items capture
+disproportionate attention. Seeding uniformly wouldn't just be
+unrealistic, it would specifically launder away the one property
+(skew) that makes measuring an index's benefit on a genuinely hot link
+possible at all.
+
+**How it works mechanically.** Each of the 50,000 links gets a shuffled
+rank `1..50,000` (shuffled so "hottest" isn't correlated with insertion
+order or which user owns it); `weight(rank) = (1/rank) / H` where `H` is
+the harmonic sum `Σ 1/k` for `k = 1..50,000`; expected clicks for a rank is
+`totalClicks × weight(rank)`, with ±30% uniform jitter applied before
+rounding so the curve isn't a perfectly deterministic staircase. At
+`totalClicks = 500,000`, rank 1 lands around 43,800 clicks, rank 100
+around 440, rank 10,000 around 4 — the seeded run actually produced a
+hottest link at 45,728 against an average of 9.88, a ratio of roughly
+4,600:1.
+
+**Where it lives in the codebase.** `scripts/seed-bulk.ts`,
+`assignClickCounts`/`zipfWeights`.
+
+**Common pitfalls.**
+
+- Seeding "enough rows" and assuming volume alone makes a benchmark
+  realistic — row *count* and row *distribution* are different axes, and
+  this phase's methodology depends on the second one specifically.
+- Treating the ±30% jitter as if it were statistically rigorous
+  (true Poisson variance around each rank's expectation) — it isn't, and
+  doesn't need to be. The goal is the right qualitative shape (a few very
+  hot links, a long cold tail), not a publishable model of click
+  popularity.
+
+**Production considerations.** Real production click distributions may be
+skewed by a different exponent, or bursty in time rather than only in
+per-link total (a single link going viral within one hour looks different
+from the same total spread evenly over a year) — this seed captures the
+first kind of realism (per-link skew) but not the second (temporal
+burstiness), which is named as an open question in
+`docs/performance/README.md`'s "what to investigate next."
+
+**Interview answer.** I seeded a Zipf distribution instead of an even
+split because uniform test data would have hidden the exact thing I
+needed to measure. If every link had the same click count, there'd be no
+link where a full scan is obviously expensive versus one where it's
+obviously cheap — and that contrast is what makes an `EXPLAIN ANALYZE`
+plan meaningful evidence for an index decision rather than an arbitrary
+number. Real click data is skewed for the same structural reason most
+popularity data is (a small number of items capture most of the volume),
+so a skewed seed isn't just more rigorous, it's closer to what production
+will actually look like.
+
+### Composite indexes, column order, and the leftmost-prefix rule
+
+**What it is.** A composite (multi-column) index stores rows sorted by
+its first column, then by its second column within ties on the first,
+and so on — `links_user_id_created_at_id_index` is `(user_id, created_at
+DESC, id DESC)`. The leftmost-prefix rule follows directly from that
+storage order: the index can serve any query whose filter/sort conditions
+form a *prefix* of the column list, but not one that skips a leading
+column.
+
+**Why it exists in this project.** `listLinks`'s rows query
+(`linkService.ts`) is `WHERE user_id = $1 ORDER BY created_at DESC, id
+DESC` — a single-column index on `user_id` alone can find the matching
+rows efficiently, but can't also hand them back pre-sorted, since it only
+knows *which* rows match, not what order they should come out in for this
+particular `ORDER BY`. `before.md`'s plan shows exactly that gap: a
+`Bitmap Index Scan` on the old `links_user_id_index` finds the 1,058
+matching rows, then a `Sort` node above it re-orders them before the
+`LIMIT 20` can apply.
+
+**How it works mechanically.** `user_id` is leftmost because it's the
+query's *equality* predicate — that's what the leftmost-prefix rule
+requires for the other columns to be useful at all: once the index has
+narrowed down to rows with a specific `user_id`, the remaining entries for
+that user are stored in `created_at DESC, id DESC` order, which now
+exactly matches the query's `ORDER BY`. `after.md`'s plan confirms it: a
+single `Index Scan` (no `Bitmap`, no separate `Sort`) walks the index in
+that pre-sorted order and stops as soon as 20 rows have been produced —
+`~5.4x` faster (0.391ms → 0.072ms) purely from eliminating the sort step.
+`id DESC` as the third key isn't decorative: `created_at` alone can't
+break ties between two links created in the same instant, so without `id`
+as an explicit tiebreaker the sort couldn't be fully eliminated for rows
+sharing a `created_at` value.
+
+What this index *can't* serve: any query whose equality/range predicate
+isn't `user_id` (a bare `WHERE created_at > $1` across all users, for
+instance, gets no help from this index at all — `created_at` isn't
+leftmost), and any `ORDER BY` on `user_id`'s matching rows that isn't
+`created_at DESC, id DESC` specifically (ascending order, or ordering by a
+different column, would need the index scanned backwards or not at all,
+depending on the specific mismatch).
+
+**Where it lives in the codebase.** `migrations/
+20260818173151020_add-performance-indexes.ts`
+(`links_user_id_created_at_id_index`); served query in
+`src/services/linkService.ts`, `listLinks`.
+
+**Common pitfalls.**
+
+- Putting the "most important" or highest-cardinality column first out of
+  habit, rather than the column your actual query's equality predicate
+  filters on — cardinality matters for how selective an index *is*, but
+  the leftmost-prefix rule is about which queries can *use* it at all.
+- Assuming a composite index automatically also serves a query with no
+  filter on the leftmost column — it doesn't; the leftmost-prefix rule is
+  a hard requirement, not a soft preference.
+
+**Production considerations.** Every additional column in a composite
+index widens each index entry, meaning more disk/cache space and slightly
+more write-maintenance cost per row than a narrower index — the third
+column (`id`) here earns its keep only because the query's `ORDER BY`
+genuinely needs a tiebreaker; an index doesn't get a third column "for
+completeness."
+
+**Interview answer.** Column order in a composite index isn't a style
+choice, it's mechanical: the index is physically sorted by the first
+column, then the second within ties on the first, and so on, so it can
+only serve a query whose conditions form a prefix of that column list —
+the leftmost-prefix rule. I put `user_id` first because it's the query's
+equality filter; `created_at DESC, id DESC` after it because that's
+exactly the query's `ORDER BY`, letting Postgres return pre-sorted rows
+straight off the index instead of fetching everything that matches and
+sorting it afterward. I confirmed this wasn't just theoretical by
+capturing the before and after plans — the `Sort` node that existed before
+this index is gone after, and that's a direct, visible consequence of
+matching the index's trailing columns to the query's `ORDER BY`, not an
+assumption.
+
+### Partial indexes and when they win
+
+**What it is.** A partial index only includes rows matching a `WHERE`
+clause specified at index-creation time —
+`links_expires_at_active_partial_index` is `ON links (expires_at) WHERE
+is_active = true`, so a row with `is_active = false` isn't in this index
+at all, regardless of its `expires_at` value.
+
+**Why it exists in this project.** The cleanup sweep's predicate is
+`WHERE is_active = true AND expires_at IS NOT NULL AND expires_at <=
+now()`. `is_active` alone is a poor index candidate: it's a boolean with
+low selectivity — at any given moment, the overwhelming majority of links
+are active, so an index whose leftmost column is a value shared by most of
+the table gives the planner little reason to prefer it over a `Seq Scan`
+(and `before.md`'s methodology explicitly rejected a standalone
+`is_active` index for exactly this reason — see "Indexes considered and
+rejected" below). What actually makes this predicate selective is
+`expires_at <= now()` — but only among rows that are still active in the
+first place. A partial index keyed on `expires_at`, scoped to `WHERE
+is_active = true`, captures exactly that: selective on the column that's
+actually selective, restricted to the subset the query cares about.
+
+**How it works mechanically.** `before.md` shows the cost of not having
+this: a `Seq Scan` visiting all 50,000 seeded links, filtering row by row,
+with `Rows Removed by Filter: 48,559` against only 1,441 real matches —
+97% wasted work, explicitly visible in the plan. `after.md` shows a
+`Bitmap Index Scan` on the partial index instead, touching only the
+matching rows. The partial index also self-maintains its own relevance:
+the moment the sweep flips a row's `is_active` to `false`, that row drops
+out of the index on its very next update — the index's size tracks the
+"currently active" population, not the whole table, so it doesn't grow
+unboundedly as inactive rows accumulate over the table's lifetime the way
+a full index would.
+
+**Where it lives in the codebase.** `migrations/
+20260818173151020_add-performance-indexes.ts`
+(`links_expires_at_active_partial_index`); served query in `worker/
+processors/linkCleanupProcessor.ts`, `sweepExpiredLinks`.
+
+**Common pitfalls.**
+
+- Indexing a low-selectivity boolean column directly, expecting it to help
+  — the planner will often just ignore it in favor of a `Seq Scan`, since
+  "most rows match" makes an index lookup no cheaper than reading the
+  table.
+- Forgetting that a partial index's `WHERE` clause must be a *subset* of
+  (or logically imply) the query's `WHERE` clause for the planner to
+  consider it at all — an index partial on `is_active = true` can't serve
+  a query filtering on `is_active = false`.
+
+**Production considerations.** If the active/inactive ratio in production
+ever inverts (most links expired and swept, few still active), this
+partial index would become the small, efficient one and a hypothetical
+full index would have been the wasteful one — the win here isn't fixed at
+migration time, it tracks whatever the real active/inactive split turns
+out to be.
+
+**Interview answer.** A partial index only stores entries for rows
+matching a `WHERE` clause set at creation time. I used one here because
+the sweep's predicate has two parts with very different selectivity:
+`is_active = true` matches almost everything (a bad index key on its
+own), while `expires_at <= now()` is genuinely selective — but only
+within the active subset. A partial index scoped to `is_active = true`
+and keyed on `expires_at` gets both properties: it's small (only active
+rows), and its key column is actually discriminating within that scope. I
+verified this wasn't guesswork by measuring — the before plan was a `Seq
+Scan` visiting 50,000 rows to find 1,441 matches; after, a `Bitmap Index
+Scan` visiting only the matches.
+
+### ANALYZE, VACUUM, and planner statistics — two separate prerequisites
+
+**What it is.** `ANALYZE` samples a table's rows and updates the
+planner's statistics (row counts, most-common values, column
+correlations) — the numbers `EXPLAIN`'s cost estimates are computed from.
+`VACUUM` is a different operation entirely: among other things, it
+updates a table's *visibility map*, which tracks which pages contain only
+rows visible to every transaction. Both matter for index performance, for
+different reasons, and conflating them was a real mistake caught during
+this phase's own measurement.
+
+**Why it exists in this project.** `scripts/seed-bulk.ts` bulk-loads
+~550,000 rows in a handful of large batched `INSERT`s, then calls
+`ANALYZE users, links, clicks` before finishing — without it, the planner
+would still be working off whatever statistics existed before the load
+(for a freshly migrated table, essentially none), and `before.md`'s
+captured plans would depend on unpredictable autovacuum timing rather than
+being reproducible. That much was anticipated. What wasn't anticipated
+until the actual after-migration measurement: right after creating the
+three new indexes and running `ANALYZE`, the link-list *count* query's
+plan came back as a `Bitmap Heap Scan` instead of the expected `Index Only
+Scan` — even though the new composite index covers every column that
+query needs.
+
+**How it works mechanically.** An `Index Only Scan` can skip visiting the
+table heap entirely, but only for pages the visibility map marks
+"all-visible" (every row on that page is visible to every transaction, so
+there's no need to double-check row visibility against the heap).
+`ANALYZE` refreshes row-count/value statistics; it does **not** touch the
+visibility map. A freshly created index sits on a table whose visibility
+map was last updated before that index existed, so Postgres has no basis
+for trusting an index-only path yet and falls back to a `Bitmap Heap
+Scan`, checking the heap per row. Running `VACUUM users, links, clicks`
+immediately fixed it — the same query plan flipped straight to the
+expected `Index Only Scan` with `Heap Fetches: 0`, and execution time
+dropped back in line with the pre-migration baseline (0.250ms → 0.129ms,
+matching `before.md`'s 0.135ms). In production, autovacuum eventually
+does this automatically — but "eventually" is doing real work in that
+sentence, and it isn't instant.
+
+**Where it lives in the codebase.** `scripts/seed-bulk.ts`'s `ANALYZE`
+call; the explicit `VACUUM users, links, clicks;` step documented in
+`docs/performance/after.md`, run once after the new migration, before
+capturing any post-migration plan.
+
+**Common pitfalls.**
+
+- Assuming `ANALYZE` is the only planner-facing maintenance operation that
+  matters — this phase's own measurement is the counter-example.
+  `ANALYZE` and `VACUUM` are separate operations that happen to often run
+  together (`VACUUM ANALYZE` is common exactly because they're
+  complementary, not because they're the same thing).
+- Capturing a "before/after" comparison immediately after creating a new
+  index without accounting for this — a naive after-plan captured right
+  after `CREATE INDEX` (no `VACUUM`) would have made this index look worse
+  than it actually is, a measurement artifact rather than a real property
+  of the index.
+
+**Production considerations.** Autovacuum handles this automatically on a
+schedule driven by table modification thresholds — but a burst of bulk
+writes (a data migration, a large import) can outrun it, leaving newly
+built or newly relevant indexes in this same "not yet index-only-eligible"
+state for longer than expected. A manual `VACUUM` after a large bulk
+operation is a reasonable, low-risk way to close that gap deliberately
+rather than waiting on autovacuum's own timing.
+
+**Interview answer.** I ran into a real example of this while measuring
+Phase 11: right after creating a new composite index and running
+`ANALYZE`, one query's plan wasn't using an `Index Only Scan` even though
+the index covered every column it needed. The reason is that `ANALYZE`
+updates row-count and value statistics, but the ability to skip the heap
+entirely in an `Index Only Scan` depends on the visibility map, which only
+`VACUUM` updates — a freshly built index sits on a table whose visibility
+map predates it. Running `VACUUM` fixed it immediately. It's a good
+example of why I measure rather than assume: I expected `ANALYZE` alone
+to be sufficient, and the captured plan told me otherwise.
+
+### Estimated vs. actual row divergence as a diagnostic signal
+
+**What it is.** Every `EXPLAIN ANALYZE` node reports both an estimated row
+count (what the planner predicted, used to choose the plan) and an actual
+row count (what really came back). A large gap between them is a signal
+that the planner's statistics don't reflect reality well for that specific
+predicate — even when it doesn't change which plan gets chosen.
+
+**Why it exists in this project.** `before.md`'s cleanup-sweep plan
+estimated 289 matching rows for `WHERE is_active = true AND expires_at IS
+NOT NULL AND expires_at <= now()`; the real count was 1,441 — roughly 5x
+higher. This is flagged explicitly in `before.md` rather than glossed
+over, because it's informative independent of the indexing decision
+itself.
+
+**How it works mechanically.** Postgres's planner estimates a compound
+`AND` predicate's selectivity by treating each condition's selectivity as
+independent and multiplying them together, unless it has multivariate
+statistics telling it otherwise (extended statistics, not configured
+here). `is_active = true` and `expires_at <= now()` aren't actually
+independent in this data — links that are still active and links that are
+past their expiry date correlate (an old, still-active link is more likely
+to be one nobody has gotten around to expiring), so the independence
+assumption underestimates how many rows satisfy both conditions together.
+That's exactly the kind of correlation column-level statistics can't
+capture.
+
+**Where it lives in the codebase.** `docs/performance/before.md`, the
+cleanup-sweep section's "flagged estimate/actual divergence" note.
+
+**Common pitfalls.**
+
+- Treating a plan with a good (low) cost estimate as automatically fast —
+  the estimate is only as good as the statistics it's built from; a
+  confidently-wrong estimate can still choose a plan that does far more
+  work than expected.
+- Ignoring divergence because "the query was fast anyway" — at this
+  phase's data volume, a 5x miss on 1,441 rows out of 50,000 didn't change
+  which plan won. At a different scale, or with a less selective index
+  available, the same kind of miss could push the planner toward a worse
+  plan than the divergence-free estimate would have chosen.
+
+**Production considerations.** If this specific correlation strengthens
+over time in production (a growing gap between "expired" and "expired and
+swept," if the sweep ever falls behind), the divergence would grow with
+it — worth revisiting if sweep behavior or table composition changes
+materially from what this phase measured.
+
+**Interview answer.** Estimated-vs-actual divergence is one of the first
+things I check in an `EXPLAIN ANALYZE` plan, because it tells you whether
+to trust the plan's own reasoning. In this phase, the cleanup sweep's plan
+estimated 289 matching rows and actually found 1,441 — about 5x off. The
+cause is that Postgres estimates compound `AND` conditions assuming
+independence between columns unless told otherwise, and here `is_active`
+and `expires_at` are correlated in the real data. It didn't change which
+plan won in this case, but a bad estimate is a leading indicator: at a
+different scale, or with different indexes available, the same kind of
+miss can push the planner toward a genuinely worse plan than a correct
+estimate would have chosen.
+
+### What indexes cost: write amplification, storage, and planner complexity
+
+**What it is.** Every index on a table is additional work on every
+`INSERT`/`UPDATE`/`DELETE` that touches an indexed column — the index's
+own B-tree has to be kept correct, not just the table's heap. This is the
+cost side of the index/query tradeoff this whole phase has been arguing
+the benefit side of.
+
+**Why it exists in this project.** The click-insert path
+(`worker/processors/clickProcessor.ts`) runs on every single redirect that
+gets processed — it's the highest-frequency write in the system, and it's
+exactly the table (`clicks`) that gained a new composite index this phase.
+If that index's write cost were significant, it would be the one place in
+this phase where the tradeoff could plausibly not be worth it.
+
+**How it works mechanically.** A `processClickJob` micro-benchmark (1,000
+transactions, mixed hot/cold links, `worker/db/pool.ts`'s own connection,
+measured via `process.hrtime.bigint()`) was run before and after the
+migration:
+
+```
+Before: p50=0.647ms  p95=0.896ms  mean=0.719ms  max=9.974ms
+After:  p50=0.654ms  p95=0.836ms  mean=0.693ms  max=2.971ms
+```
+
+The honest result is **no measurable regression at this scale** — p50 is
+0.007ms higher (within run-to-run noise), p95 and mean are both slightly
+*lower*, and the max dropped substantially (almost certainly an unrelated
+outlier in the "before" run, not a systematic effect). The write cost of
+one more B-tree insert per row is real in principle — an index isn't
+free — but at ~494,000 rows and a 1,000-transaction sample, it's too
+small to distinguish from ordinary variance. This is the honest
+conclusion, not "indexes are free": a much larger table, or a benchmark
+built to average out noise across many more repetitions, would be needed
+to actually isolate that marginal cost.
+
+**Where it lives in the codebase.** `scripts/bench/clickWriteBench.ts`;
+results in `docs/performance/after.md`'s "Write-path benchmark" section.
+
+**Common pitfalls.**
+
+- Assuming "no measurable regression" means "no cost" — it means the cost
+  wasn't distinguishable from noise *at this specific scale and sample
+  size*, which is a narrower and more honest claim.
+- Skipping the write-cost measurement entirely because the read-side win
+  is large and "obviously worth it" — the whole point of a measurement-
+  driven methodology is not skipping the half of the tradeoff that's less
+  exciting to report.
+
+**Production considerations.** Storage cost also scales with row count
+and index width — a composite index on a two-column key
+(`link_id, clicked_at`) is wider per entry than a single-column one, and
+that difference compounds across hundreds of millions of rows in a way it
+doesn't at hundreds of thousands. Worth re-measuring storage and write
+cost specifically if `clicks` grows an order of magnitude or more.
+
+**Interview answer.** I measured the write-side cost, not just assumed
+it. Every index adds maintenance work on writes — indexes aren't free —
+so I ran the same click-insert benchmark before and after adding the new
+composite index on `clicks`. The honest result was no measurable
+regression at this data volume: the numbers moved within normal
+run-to-run noise, not a clear direction. I'm careful not to oversell that
+as "this index has no cost" — it has a real cost in principle, it's just
+too small to isolate from noise at ~494,000 rows and a 1,000-transaction
+sample. A responsible answer names the limits of what was actually
+measured, not just the headline number.
+
+### Indexes considered and rejected
+
+**What it is.** Three index ideas that came up during this phase's design
+and were explicitly turned down, with reasons — as load-bearing to this
+phase's methodology as the indexes that were added.
+
+**Why it exists in this project.** "No speculative indexes" cuts both
+ways: it means not adding an index without evidence, and it means writing
+down what was considered and declined so a future contributor doesn't
+re-propose the same idea without knowing it was already evaluated.
+
+**How it works mechanically.**
+
+- **`clicks.clicked_at` alone, non-composite.** No query in this codebase
+  filters or sorts by `clicked_at` without filtering by `link_id` first —
+  the click-aggregation endpoint is always scoped to one link. An index
+  whose leftmost column nothing queries by in isolation gets essentially
+  zero planner use while still paying full write-time maintenance cost on
+  every click insert.
+- **`links.is_active` alone, full (non-partial).** Covered above under
+  partial indexes — a standalone index on a low-selectivity boolean rarely
+  earns its cost over a `Seq Scan`, which is exactly why the actual fix
+  was a partial index keyed on the genuinely selective column instead.
+- **`INCLUDE`/covering columns** on any of the three new indexes (e.g.
+  adding `destination_url` to the list-links composite to make it fully
+  index-only). No query in this phase's measurements was proven to need
+  it — none of the captured plans showed a heap-fetch cost large enough to
+  justify the extra index width. This is exactly the "might help later"
+  reasoning this whole phase's methodology exists to avoid; if a future
+  measurement shows a heap fetch that's actually expensive, that's the
+  evidence needed to revisit, not before.
+
+**Where it lives in the codebase.** `migrations/
+20260818173151020_add-performance-indexes.ts`'s own comments;
+`docs/performance/README.md`'s "Rejected" section.
+
+**Common pitfalls.**
+
+- Only documenting what was built, not what was considered and declined —
+  the rejected list is what stops the same speculative index from getting
+  re-proposed and re-added without anyone remembering it was already
+  evaluated and found unnecessary.
+
+**Production considerations.** Any of these three could become justified
+later under different evidence — a future `clicked_at`-only query pattern,
+a shift in the active/inactive ratio, or a proven index-only-scan need —
+at which point the right move is the same one this whole phase modeled:
+capture a plan, then decide.
+
+**Interview answer.** I keep a "rejected" list, not just an "added" list.
+For this phase that's three indexes: a standalone `clicked_at` index
+(nothing queries it without `link_id` first), a standalone `is_active`
+index (too low-selectivity to beat a sequential scan — the partial index
+on `expires_at` was the actual fix), and `INCLUDE` columns on any of the
+three new indexes (no measured query needed them). Writing down what was
+considered and declined, with the reason, matters as much as writing down
+what got added — it's what stops the same speculative index from getting
+re-proposed later by someone who doesn't know it was already evaluated.
+
+### N+1 queries
+
+**What it is.** An N+1 query pattern is one query to fetch a list of `N`
+items, followed by `N` more queries — one per item — to fetch related
+data for each, where a single query (a `JOIN`, or a batched `WHERE id =
+ANY($1)`) could have done the same job in two queries total regardless of
+`N`. ORMs make this easy to write by accident: lazy-loading a relationship
+inside a loop looks identical to accessing an already-fetched field, so
+the extra round trip is invisible at the call site.
+
+**Why it exists in this project.** Confirming its absence is itself part
+of this phase's audit — a query-per-request-not-per-row discipline that's
+easy to erode silently as new features get added, so it's worth checking
+explicitly rather than assuming.
+
+**How it works mechanically.** This codebase doesn't use an ORM (raw
+parameterized SQL via `src/db/pool.ts`'s `query()` throughout), which
+removes the specific mechanism (transparent lazy-loading) that makes N+1
+easy to write without noticing — every query here is a query you can see
+directly in the code. A search across every loop construct (`for`,
+`for...of`, `forEach`, `.map`) in `src/` and `worker/` found exactly two
+categories: a bounded short-code-collision retry (`linkService.ts`, at
+most `MAX_GENERATION_ATTEMPTS` = 5 single-row `INSERT` attempts — a
+bounded retry on one logical write, not a fan-out over a result set), and
+in-memory `.map()` transforms of rows already fetched by a prior single
+query (`rowsResult.rows.map(toLink)` and similar). No loop issues a query
+per iteration over a previously-fetched collection.
+
+**Where it lives in the codebase.** Confirmed absent across `src/` and
+`worker/` — see `docs/performance/README.md`'s "N+1 audit" section for the
+specific search performed.
+
+**Common pitfalls.**
+
+- Assuming "we don't use an ORM" is itself a guarantee against N+1 — it
+  removes the most common *mechanism*, not the possibility; hand-written
+  code can still loop-and-query if nobody's watching for it.
+- Only checking the obvious data-fetching loops and missing one inside a
+  helper function several calls removed from the route handler — an N+1
+  audit needs to follow the actual call graph, not just the top-level
+  route code.
+
+**Production considerations.** Worth re-running this same audit whenever a
+new feature adds a loop that touches related data — the absence confirmed
+here is a snapshot of the current codebase, not a permanent guarantee.
+
+**Interview answer.** An N+1 is one query for a list plus one query per
+item for that item's related data, where a single `JOIN` or batched query
+could replace all `N` of the extra ones — ORMs make this easy to write
+accidentally because lazy-loading a relationship inside a loop looks
+identical to reading an already-fetched field. I audited this codebase by
+searching every loop construct across the API and worker code and traced
+each one — the only loops that exist are a bounded retry on a single
+logical write and in-memory transforms of data already fetched by one
+query. I'm reporting a confirmed absence, not assuming one, because
+"we don't use an ORM" reduces the risk but doesn't eliminate it by itself.
+
+### Connection pool sizing from evidence
+
+**What it is.** Both the API (`src/db/pool.ts`) and the worker (`worker/
+db/pool.ts`) run their own `pg.Pool` at `max: 10`. This phase's job was to
+find out whether that number is actually justified at the data volume and
+concurrency this system now has real measurements for, rather than
+picking a new number by feel.
+
+**Why it exists in this project.** "500 concurrent users sounds like it
+needs more than 10 connections" is exactly the kind of intuition this
+project's whole methodology exists to replace with a measurement.
+`pg.Pool` exposes `waitingCount`/`idleCount`/`totalCount` as live
+properties specifically for this — a burst of concurrent requests against
+a small pool will show up as a nonzero `waitingCount`, which is the actual
+undersizing signal, not a felt sense that the number is too low.
+
+**How it works mechanically.** A load-test script
+(`scripts/bench/poolLoadTest.ts`) fired 500 concurrent `listLinks` calls
+(1,000 actual queries — `listLinks` issues two per call) against 500
+distinct real seeded users, sampling `pool.waitingCount` every event-loop
+tick for the duration of the burst:
+
+```
+Run 1: 83.67ms total, peak waitingCount 1,001
+Run 2: 81.66ms total, peak waitingCount 1,001
+Run 3: 81.89ms total, peak waitingCount 1,001
+```
+
+Real queueing does happen — `waitingCount` peaks at 1,001 the instant the
+burst is dispatched, confirming `max: 10` is genuinely the bottleneck for
+a true all-at-once burst of this size. But the entire 1,000-query backlog
+still drains in ~82ms, because each individual query is sub-millisecond
+(the same queries measured throughout this phase) — a 10-connection pool
+churns through that backlog fast enough that the queueing, while real, has
+no user-visible consequence at this volume. The worker pool showed the
+same shape under a 200-job burst of `processClickJob` (40x its configured
+concurrency of 5): peak `waitingCount` 201, drained in ~71ms.
+`pg_stat_activity` snapshots taken mid-run, in both cases, showed no
+connections stuck in `idle in transaction` — the specific pathology
+`withTransaction`'s try/finally is designed to prevent.
+
+**Where it lives in the codebase.**
+`scripts/bench/poolLoadTest.ts`, `scripts/bench/workerPoolLoadTest.ts`;
+results in `docs/performance/README.md`'s "Connection pool review".
+
+**Common pitfalls.**
+
+- Treating a synthetic all-at-once burst as equivalent to real traffic —
+  500 requests landing in the same event-loop tick is a deliberately
+  adversarial pattern meant to find a ceiling, not a simulation of how
+  requests actually arrive (spread over wall-clock time) in production.
+- Concluding "queueing occurred, therefore the pool is too small" without
+  also checking whether the queue actually caused a user-visible delay —
+  both are real findings here, and they point in different directions
+  (yes to the first, no to the second, at this scale).
+
+**Production considerations.** The right trigger for revisiting `max: 10`
+is *sustained* (not momentary-burst) `waitingCount > 0` in real traffic,
+or `idle in transaction` connections that don't clear — neither showed up
+in this phase's measurements, which is itself the finding: no change
+justified *yet*, backed by actual sampled data rather than an assumption
+that a low number must be fine.
+
+**Interview answer.** I didn't re-guess the pool size, I measured it. I
+fired 500 concurrent requests at a pool sized for 10 connections and
+sampled `pool.waitingCount` throughout — real queueing showed up
+immediately (it peaked at over 1,000 pending connection requests), which
+confirms the pool genuinely is the bottleneck under that burst. But the
+whole backlog still drained in about 80 milliseconds, because the
+underlying queries are sub-millisecond each — so the queueing is real but
+has no user-visible cost at this data volume and this burst pattern. My
+conclusion was "no change justified yet," and I made sure that was a
+measured conclusion with real numbers behind it, not a guess dressed up as
+one — an unmeasured "it's probably fine" isn't something I'm willing to
+report as a finding.
+
+### Results
+
+Full before/after `EXPLAIN ANALYZE` plans: `docs/performance/before.md`,
+`docs/performance/after.md`. Summary:
+
+| Query | Before | After | Delta |
+|---|---|---|---|
+| Redirect lookup | 0.135 ms | 0.062 ms | not a target — already indexed |
+| Link list rows | 0.391 ms (Sort + scan) | 0.072 ms (no Sort) | ~5.4x faster |
+| Link list count | 0.135 ms | 0.129 ms | unchanged — no `ORDER BY` to serve |
+| Cleanup sweep | 24.478 ms (Seq Scan) | 14.123 ms (Bitmap Index Scan) | ~1.7x faster |
+| Click aggregation (30d) | 8.457 ms | 2.868 ms | ~2.9x faster |
+| Click aggregation (unbounded) | 16.091 ms | 14.369 ms | only ~11% — see `after.md` |
+| Write path (click insert, mean) | 0.719 ms | 0.693 ms | no measurable regression |
+
+The cleanup sweep was the single largest win, and also the query with the
+worst estimated/actual row divergence (5x) beforehand — both facts about
+the same query, not a coincidence: a `Seq Scan` doesn't care how wrong the
+row estimate is, it does the same linear amount of work regardless, which
+is exactly what made it the most expensive plan in this set to begin with.

@@ -25,7 +25,8 @@
     "migrate:up": "node --env-file=.env node_modules/.bin/node-pg-migrate up",
     "migrate:down": "node --env-file=.env node_modules/.bin/node-pg-migrate down",
     "migrate:create": "node --env-file=.env node_modules/.bin/node-pg-migrate create -j ts --migration-filename-format utc",
-    "seed": "tsx --env-file=.env scripts/seed.ts"
+    "seed": "tsx --env-file=.env scripts/seed.ts",
+    "seed:bulk": "tsx --env-file=.env scripts/seed-bulk.ts"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

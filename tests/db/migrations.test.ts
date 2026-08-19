@@ -23,6 +23,26 @@ async function tableExists(client: Client, tableName: string): Promise<boolean> 
   return result.rows[0]?.exists ?? false;
 }
 
+async function indexExists(client: Client, indexName: string): Promise<boolean> {
+  const result = await client.query<{ exists: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM pg_indexes
+       WHERE schemaname = 'public' AND indexname = $1
+     ) AS exists`,
+    [indexName],
+  );
+  return result.rows[0]?.exists ?? false;
+}
+
+// Phase 11's indexes — asserted present so a future migration accidentally
+// dropping one of these fails this test loudly, rather than silently
+// degrading listLinks/sweepExpiredLinks/getLinkClickStats back to a scan.
+const PHASE_11_INDEXES = [
+  'links_user_id_created_at_id_index',
+  'links_expires_at_active_partial_index',
+  'clicks_link_id_clicked_at_index',
+];
+
 describe('migrations', () => {
   it('applies all migrations, creating the expected tables', async () => {
     // globalSetup already ran migrations up before any test file starts;
@@ -32,6 +52,18 @@ describe('migrations', () => {
     try {
       for (const table of ['users', 'links', 'clicks', 'pgmigrations']) {
         expect(await tableExists(client, table)).toBe(true);
+      }
+    } finally {
+      await client.end();
+    }
+  });
+
+  it('creates the Phase 11 performance indexes', async () => {
+    const client = new Client({ connectionString: databaseUrl });
+    await client.connect();
+    try {
+      for (const indexName of PHASE_11_INDEXES) {
+        expect(await indexExists(client, indexName)).toBe(true);
       }
     } finally {
       await client.end();
@@ -51,7 +83,7 @@ describe('migrations', () => {
       dir: 'migrations',
       migrationsTable: 'pgmigrations',
       direction: 'down',
-      count: 4,
+      count: 5,
     });
 
     const client = new Client({ connectionString: databaseUrl });
@@ -70,5 +102,15 @@ describe('migrations', () => {
       migrationsTable: 'pgmigrations',
       direction: 'up',
     });
+
+    const clientAfterReup = new Client({ connectionString: databaseUrl });
+    await clientAfterReup.connect();
+    try {
+      for (const indexName of PHASE_11_INDEXES) {
+        expect(await indexExists(clientAfterReup, indexName)).toBe(true);
+      }
+    } finally {
+      await clientAfterReup.end();
+    }
   });
 });

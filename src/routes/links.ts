@@ -11,6 +11,7 @@ import {
   createLink,
   deleteLink,
   getLink,
+  getLinkClickStats,
   listLinks,
   updateLink,
 } from '../services/linkService.js';
@@ -83,6 +84,24 @@ const listLinksQuerySchema = z.object({
   offset: z.coerce.number().int().nonnegative('offset must be 0 or greater').default(0),
 });
 
+// Bounded the same way GET /api/links' limit is: an unbounded ?days range
+// would let a caller force a single aggregation query over a link's entire
+// click history, and clicks is the largest table in the schema, sitting on
+// the same Postgres the redirect hot path depends on — that DoS argument is
+// stronger here than it was for pagination, not weaker, so this is a
+// default-with-a-clamp, not merely optional. See MAX_PAGE_SIZE above for
+// the precedent this mirrors.
+const MAX_STATS_DAYS = 365;
+const DEFAULT_STATS_DAYS = 30;
+
+const linkStatsQuerySchema = z.object({
+  days: z.coerce
+    .number()
+    .int()
+    .positive('days must be a positive integer')
+    .default(DEFAULT_STATS_DAYS),
+});
+
 linksRouter.post(
   '/',
   requireAuth,
@@ -129,6 +148,27 @@ linksRouter.get('/:id', requireAuth, validateParams(idParamSchema), async (req, 
   }
   res.status(200).json({ link });
 });
+
+linksRouter.get(
+  '/:id/stats',
+  requireAuth,
+  validateParams(idParamSchema),
+  validateQuery(linkStatsQuerySchema),
+  async (req, res) => {
+    const { id } = idParamSchema.parse(req.validated?.params);
+    const { days: requestedDays } = linkStatsQuerySchema.parse(req.validated?.query);
+    // Same clamp-not-reject policy as GET /api/links' limit — see
+    // MAX_PAGE_SIZE's comment above.
+    const days = Math.min(requestedDays, MAX_STATS_DAYS);
+    const sinceDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    const stats = await getLinkClickStats(req.userId!, id, sinceDate);
+    if (!stats) {
+      throw notFound('Link not found');
+    }
+    res.status(200).json({ linkId: id, days, stats });
+  },
+);
 
 linksRouter.patch(
   '/:id',

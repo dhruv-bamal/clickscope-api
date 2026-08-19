@@ -309,6 +309,110 @@ describe('GET /api/links/:id', () => {
   });
 });
 
+describe('GET /api/links/:id/stats', () => {
+  async function insertClick(linkId: string, clickedAt: Date): Promise<void> {
+    await query('INSERT INTO clicks (link_id, clicked_at) VALUES ($1, $2)', [linkId, clickedAt]);
+  }
+
+  it('returns an empty array, not 404, for a link with no clicks', async () => {
+    const { token } = await signupUser('stats-empty');
+    const created = await post(token, { destinationUrl: 'https://example.com/no-clicks' });
+
+    const res = await request(app)
+      .get(`/api/links/${created.body.link.id}/stats`)
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.stats).toEqual([]);
+  });
+
+  it('groups clicks by day, correctly ordered', async () => {
+    const { token } = await signupUser('stats-grouped');
+    const created = await post(token, { destinationUrl: 'https://example.com/grouped' });
+    const linkId = created.body.link.id as string;
+
+    const dayOne = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+    const dayTwo = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000);
+    await insertClick(linkId, dayOne);
+    await insertClick(linkId, dayOne);
+    await insertClick(linkId, dayTwo);
+
+    const res = await request(app)
+      .get(`/api/links/${linkId}/stats`)
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.stats).toHaveLength(2);
+    expect(res.body.stats[0].clicks).toBe(2);
+    expect(res.body.stats[1].clicks).toBe(1);
+    expect(res.body.stats[0].day < res.body.stats[1].day).toBe(true);
+  });
+
+  it('excludes clicks older than the days window', async () => {
+    const { token } = await signupUser('stats-window');
+    const created = await post(token, { destinationUrl: 'https://example.com/windowed' });
+    const linkId = created.body.link.id as string;
+
+    await insertClick(linkId, new Date(Date.now() - 40 * 24 * 60 * 60 * 1000));
+    await insertClick(linkId, new Date(Date.now() - 1 * 24 * 60 * 60 * 1000));
+
+    const res = await request(app)
+      .get(`/api/links/${linkId}/stats`)
+      .query({ days: 30 })
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.stats).toHaveLength(1);
+    expect(res.body.days).toBe(30);
+  });
+
+  it('clamps a days value above the maximum instead of rejecting it', async () => {
+    const { token } = await signupUser('stats-clamp');
+    const created = await post(token, { destinationUrl: 'https://example.com/clamp-days' });
+
+    const res = await request(app)
+      .get(`/api/links/${created.body.link.id}/stats`)
+      .query({ days: 10_000 })
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.days).toBe(365);
+  });
+
+  it("returns 404 for another user's link, not another user's data", async () => {
+    const { token: tokenA } = await signupUser('stats-authz-a');
+    const { token: tokenB } = await signupUser('stats-authz-b');
+    const created = await post(tokenA, { destinationUrl: 'https://example.com/not-yours' });
+    await insertClick(created.body.link.id, new Date());
+
+    const res = await request(app)
+      .get(`/api/links/${created.body.link.id}/stats`)
+      .set('Authorization', `Bearer ${tokenB}`);
+
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 404 for a link id that does not exist at all', async () => {
+    const { token } = await signupUser('stats-nonexistent');
+
+    const res = await request(app)
+      .get('/api/links/00000000-0000-0000-0000-000000000000/stats')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(404);
+  });
+
+  it('returns 400, not 500, for a malformed UUID', async () => {
+    const { token } = await signupUser('stats-malformed');
+
+    const res = await request(app)
+      .get('/api/links/not-a-uuid/stats')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(400);
+  });
+});
+
 describe("object-level authorization: user B against user A's link", () => {
   it('GET returns 404 and leaves the row unchanged', async () => {
     const { token: tokenA } = await signupUser('authz-get-a');
