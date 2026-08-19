@@ -10216,3 +10216,480 @@ worst estimated/actual row divergence (5x) beforehand — both facts about
 the same query, not a coincidence: a `Seq Scan` doesn't care how wrong the
 row estimate is, it does the same linear amount of work regardless, which
 is exactly what made it the most expensive plan in this set to begin with.
+
+## Phase 13a: Testing the API
+
+### The testing pyramid, inverted, and why that's correct here
+
+**What it is.** The classic testing pyramid says: many fast unit tests at
+the base, fewer integration tests in the middle, a handful of end-to-end
+tests at the top. This suite is shaped the other way — of 25 files and 242
+tests, only `tests/lib/shortCode.test.ts` and most of `tests/config/env.test.ts`
+are pure unit tests with no I/O; nearly everything else runs supertest
+against the real Express app, backed by a real Postgres database
+(`clickscope_test`) and a real local Redis instance.
+
+**Why it exists in this project.** The pyramid's shape is a proxy for a
+cost tradeoff — unit tests are cheap and fast, so lean on them, and reserve
+expensive integration tests for what only shows up at the seams. But that
+tradeoff assumes the interesting bugs live in isolated logic. In this API,
+they don't. Every one of the 8 mutations exercised in this phase lived
+*at* a seam: a SQL WHERE clause's interaction with Postgres's bind-
+parameter protocol (mutation 1/2), a route's interaction with Express's
+`res.redirect` (mutation 3), an INSERT's interaction with a UNIQUE
+constraint (mutation 4), a function's interaction with wall-clock time
+(mutation 5), a service's interaction with Redis (mutation 6), a library's
+actual hashing behavior (mutation 7), a handler's interaction with request
+ordering (mutation 8). A unit test that mocks the database or Redis to
+isolate `deleteLink`'s "logic" would have to also mock away the exact
+mechanism — the `AND user_id = $2` clause talking to a real query planner
+— that mutation 1 broke. Mocking the seam out is mocking the bug out.
+Given that, this suite's near-total commitment to integration tests isn't
+a smell; it's the pyramid inverted on purpose because the thing being
+built is thin business logic wrapped around three real systems (Postgres,
+Redis, BullMQ), and the real systems are where the risk actually lives.
+
+**How it works mechanically.** `tests/globalSetup.ts` provisions a
+dedicated `clickscope_test` database and runs every migration once before
+the suite starts, so `npm test` is self-contained for a new contributor.
+`vitest.config.ts` sets `fileParallelism: false` because most files share
+that one Postgres instance and one Redis instance rather than each getting
+an isolated sandbox — cheaper to set up than one throwaway database per
+file, at the cost of requiring serial execution and, as this phase found,
+occasional cross-file interaction (see "Test isolation" below).
+
+**Where it lives in the codebase.** `tests/routes/*.test.ts` and
+`tests/services/*.test.ts` are the bulk of it; `tests/db/*.test.ts` tests
+the schema itself (constraints, migrations, index usage) directly against
+Postgres with no application code in between.
+
+**Common pitfalls.** Treating "integration-heavy" as inherently worse than
+"unit-heavy" without asking what a unit boundary would actually isolate in
+this specific codebase. The pyramid is a heuristic tuned for systems where
+business logic is large and infrastructure interaction is small; a thin
+API layer over Postgres/Redis/BullMQ is the inverse case, and forcing the
+pyramid's shape onto it would mean testing mocks instead of testing risk.
+
+**Production considerations.** The cost this shape actually pays is
+runtime and parallelism, not confidence: `fileParallelism: false` makes
+the suite serial, wall time was ~30s for 242 tests, and it will keep
+growing linearly as the suite grows rather than being parallelizable
+across workers the way isolated unit tests would be. That's a real,
+worsening cost, and the point at which per-file ephemeral database
+sandboxes (rather than one shared instance) become worth their setup
+complexity is a "when it starts to hurt" call, not a "do it now" one.
+
+**Interview answer.** My test suite is almost entirely integration tests
+against a real Postgres and Redis, not because I skipped unit testing, but
+because I mutation-tested it: I deliberately broke 8 real invariants — an
+authorization clause, a redirect status code, an idempotency constraint,
+a cache invalidation call, a bcrypt comparison, a CSRF check's ordering —
+and every one of them lived at the boundary between my code and a real
+system. A unit test that mocked that boundary away would have had to mock
+away the exact mechanism that made the bug real, so testing at the
+integration level wasn't a shortcut here, it was the only level where
+these bugs were observable at all.
+
+### Mutation testing by hand and what it revealed
+
+**What it is.** Mutation testing means deliberately introducing a specific
+bug into working code, running the test suite, and checking whether it
+fails — then reverting. Doing it "by hand" means picking the mutations
+deliberately (each one a plausible real regression) rather than using a
+mutation-testing framework that generates hundreds of syntactic mutants
+automatically. The payoff of the by-hand version is that every result is
+inspectable: not just "did the suite fail" but "which specific assertion
+failed, and was it the assertion the test was written to make, or an
+incidental crash that happened to also turn the suite red."
+
+**Why it exists in this project.** Coverage percentage answers "did any
+test execute this line." It cannot answer "would a test actually notice
+if this line's logic were wrong," which is the only question that matters
+for whether the suite is a real safety net. Eight real invariants were
+picked from across the codebase's security- and correctness-critical
+paths, applied one at a time on a scratch branch, run against the full
+242-test suite, and reverted before the next one — see the table below.
+
+**How it works mechanically.** The full result:
+
+| # | Mutation | Suite failed? | Caught by | Exact vs. incidental |
+|---|---|---|---|---|
+| 1 | `deleteLink`: drop `AND user_id = $2` | Yes (2 tests) | `linkService.test.ts` non-owner delete test (`expect(deleted).toBe(false)`); `links.test.ts` route-level 404 test | **Exact** — both are the assertion each test was written to make |
+| 2 | `updateLink`: drop `AND user_id = ...` | Yes (2 tests) | `linkService.test.ts` non-owner update test (`expect(result).toBeNull()`); `links.test.ts` route-level 404 test | **Exact** |
+| 3 | Redirect: `302` → `301` | Yes (12 tests) | `redirect.test.ts` — the dedicated 302 test plus 11 others that assert `status === 302` as a side effect of testing other behavior | **Exact** |
+| 4 | Click processor: drop `ON CONFLICT (job_id) DO NOTHING` | Yes (1 test) | `clickProcessor.test.ts` idempotency test | **Incidental** — the 2nd insert throws an uncaught Postgres `23505` unique-violation (`clicks_job_id_unique`) before the intended assertions (`toHaveLength(1)`, `click_count === 1`) ever execute. The suite is only protected here because the DB schema carries its own UNIQUE constraint as a second, independent line of defense — if that constraint didn't exist, this exact application bug would silently double-count clicks and nothing would catch it. |
+| 5 | `deadStateError`: check `expiresAt` before `isActive` | Yes (1 test) | `redirect.test.ts` — the pre-sweep/post-sweep message-transition test | **Exact** — and precisely targeted: the pre-sweep assertion in the same test doesn't discriminate (both orderings read "expired" while `isActive` is still true), only the post-sweep assertion does, exactly as the code's own branch structure predicts |
+| 6 | `updateLink`: remove `invalidateLinkCache` call | Yes (1 test) | `redirect.test.ts` PATCH-invalidates-cache test (`redis.get(...)` → `toBeNull()`) | **Exact** — caught at the route level only; `linkService.test.ts`'s own `updateLink` tests don't assert Redis state directly, which is fine, not a gap, since the route test covers it |
+| 7 | `verifyPassword`: always return `true` | Yes (6 tests) | `passwordService.test.ts` (2 tests) and `redirect.test.ts`/`auth.test.ts`/`authService.test.ts`/`linkService.test.ts` (4 more) | **Exact** — and broader than the mutation's obvious target: `verifyPassword` backs both link-unlock passwords *and* real user login, so this single mutation also broke user authentication, caught directly by `auth.test.ts`'s wrong-password login test |
+| 8 | OAuth callback: check `error` before `state` | **No — suite passed clean (242/242)** | — | **Confirmed gap.** No existing test forged a callback with both an invalid/unissued `state` and `error=access_denied` together — the existing tests covered each condition separately (`rejects an unknown state`, `handles denied consent`) but never the combination that actually exercises which one wins. |
+
+**Where it lives in the codebase.** `src/services/linkService.ts`
+(mutations 1, 2, 6), `src/routes/redirect.ts` (3, 5),
+`worker/processors/clickProcessor.ts` (4), `src/services/passwordService.ts`
+(7), `src/routes/auth.ts` (8). The gap-fill test lives in
+`tests/routes/googleAuth.test.ts`, right beside the tests it complements —
+"rejects an unknown state even when error=access_denied is also present —
+state, not error, decides the outcome" — proven to fail against the
+mutation (`302` received, `400` expected) before being confirmed to pass
+clean against the real code, per this phase's own rule that every new test
+must be shown capable of failing.
+
+**Common pitfalls.** Two, both surfaced directly by this exercise:
+
+- Applying a mutation naively can produce a *different* bug than intended.
+  The first attempt at mutation 1 just deleted the `AND user_id = $2` SQL
+  text but left the now-stale `userId` value in the query's parameter
+  array — Postgres's bind protocol strictly checks parameter count against
+  placeholder count, so this threw `bind message supplies 2 parameters,
+  but prepared statement "" requires 1` before the authorization logic was
+  ever exercised. That's a real catch, but not evidence the authorization
+  test works — it's evidence pg's driver validates parameter counts. The
+  mutation had to also drop the unused parameter to faithfully simulate
+  "the authorization check silently vanished" rather than "the query
+  became malformed."
+- A mutation "being caught" is not the same claim as "being caught for the
+  right reason." Mutation 4 is the concrete example: the suite goes red,
+  satisfying the letter of the exercise, but the assertion that actually
+  fires is a database-level uniqueness violation, not the click-count
+  assertion the test's own name promises to verify. A future refactor that
+  wrapped that insert in a broader try/catch (for an unrelated reason)
+  would silently remove this protection while the test file looked
+  unchanged — the test would still exist, still be named the same thing,
+  and would no longer catch the bug it claims to.
+
+**Production considerations.** The one confirmed gap (mutation 8) was a
+CSRF-adjacent ordering bug in the OAuth callback — exactly the class of
+bug that's cheap to introduce during an innocent-looking refactor (moving
+a block up a few lines to "handle errors first") and expensive to notice
+in production, since a forged callback exploiting it wouldn't error
+visibly, it would just quietly redirect as if consent had been denied.
+This is the argument for doing this exercise periodically rather than
+once: the code that's correct today can regress silently, and only a test
+that specifically pins the ordering would notice.
+
+**Interview answer.** I ran mutation testing by hand on this API: I
+introduced 8 specific, plausible bugs — one at a time, on a scratch
+branch, reverted after each — covering authorization, HTTP correctness,
+idempotency, cache invalidation, password verification, and CSRF
+protection, and recorded exactly which assertion caught each one. Seven
+were caught by the assertion they were designed to catch; one was only
+caught incidentally by a database constraint rather than the test's own
+logic, which told me that specific safety net is more fragile than its
+green checkmark suggests; and one — a reordering of an error-vs-state
+check in an OAuth callback — passed the suite completely clean, which is
+exactly the kind of gap that a coverage percentage would never have
+surfaced, since every line involved was already "covered."
+
+### Coverage as a map, not a target
+
+**What it is.** `npm run test:coverage` (added this phase via
+`@vitest/coverage-v8` — vitest 3's native provider, chosen over
+`@vitest/coverage-istanbul` because it needs no separate source-
+instrumentation pass and is precise enough for a number this phase treats
+as diagnostic, not a threshold to hit; istanbul's finer branch remapping
+buys nothing here) reports **76.89% statement coverage** overall.
+
+**Why it exists in this project.** That number is close to meaningless on
+its own, and the per-file breakdown proves why: `worker/index.ts`,
+`worker/shutdown.ts`, and `src/server.ts` show 0%, not because they're
+untested but because they're process entrypoints. `worker/index.ts` and
+its SIGTERM handling in `worker/shutdown.ts` genuinely are exercised —
+`tests/worker/clickQueue.integration.test.ts` spawns the real worker as a
+child process and asserts on its stdout and exit code — but v8's coverage
+instrumentation only sees the vitest process itself, so a real, working
+test produces a permanent, correct-looking zero. `scripts/seed.ts` and
+`scripts/bench/*` are 0% because they're operator-run scripts never
+imported by the app or the test suite, not because anything is broken.
+Averaging those zeros into "76.89%" makes the number look worse than the
+actual tested surface and tells you nothing about where the risk is.
+
+**How it works mechanically.** The useful signal is in the per-file table,
+read selectively:
+
+- `src/services/authService.ts` (82.3%) is missing lines 206-233: the
+  branch that handles two concurrent Google logins for the same account
+  racing on a Postgres unique-violation. This is real, security-adjacent
+  concurrency-handling code, genuinely hard to hit without deliberately
+  forcing the race (e.g., mocking `query` to reject once with a `23505`
+  error, the same technique `linkService.test.ts` already uses to force
+  `createLink`'s alias-collision retry path).
+- `src/services/linkService.ts` (93.9%) is missing the negative-cache
+  *read* path (lines 391-393) — the branch that serves a cached "this
+  short code doesn't exist" sentinel. The cache's *write* side is
+  exercised elsewhere; the read side specific to this file currently
+  isn't, meaning a break in negative-cache deserialization wouldn't be
+  caught here.
+- `src/routes/redirect.ts` (97.36%) is missing lines 168-170: POST
+  `/:shortCode/unlock` called on a link that isn't password-protected.
+  Low-risk (a three-line redirect), but genuinely never asserted.
+- `src/routes/auth.ts` (97.1%) is missing lines 119-120: a valid JWT for a
+  user account that no longer exists. Untested because there's currently
+  no delete-user code path to construct that state with — this is a
+  testability gap that traces back to a missing feature, not a missing
+  test.
+- `src/middleware/notFoundHandler.ts` (50%, 0% functions) is entirely
+  unexercised — no test has ever hit a genuinely undefined route. Cheap to
+  add, simply hasn't been.
+- By contrast, `src/services/linkService.ts` lines 435-439 (a Redis SET
+  failure while writing the negative cache) and `rateLimit.ts` line 95 (a
+  `Retry-After` header defensively defaulting when express-rate-limit
+  didn't set one) are the low-value kind: narrow defensive branches
+  structurally identical to sibling branches (`redirect.test.ts`'s "falls
+  back gracefully when Redis SET fails") that are already proven tested,
+  just not this exact narrow combination of them.
+
+**Where it lives in the codebase.** `vitest.config.ts`'s new `coverage`
+block (`provider: 'v8'`, `text` + `html` reporters); run via the new
+`npm run test:coverage` script.
+
+**Common pitfalls.** Chasing the percentage up by testing whatever's
+cheapest to cover (usually more happy-path assertions on already-tested
+code) rather than reading the uncovered-lines list and asking which ones
+are actually load-bearing. The 0%-coverage entrypoint files are the sharpest
+version of this trap: instrumenting them "properly" would require running
+coverage collection across a spawned child process, real infrastructure
+work with no corresponding increase in actual risk covered — chasing that
+number up would be pure theater.
+
+**Production considerations.** A coverage threshold gate in CI (there
+isn't one currently — this repo has no CI config at all) would be actively
+harmful here without carving out the entrypoint/script files first, since
+it would either block on unfixable structural zeros or get disabled/raised
+by whoever hits it, either of which is worse than not having the gate.
+
+**Interview answer.** I added coverage tooling this phase, and the
+headline number — 76.89% — is the least interesting thing it produced.
+Most of the gap is structural: worker and server entrypoints that a
+separate-process integration test genuinely exercises but that in-process
+instrumentation can't see, and operator scripts nothing imports. The
+useful output was the per-file uncovered-line list, which surfaced a real
+concurrent-signup race branch worth testing with a forced-collision mock,
+and confirmed that most of what's "missing" is either structurally
+invisible to the tool or a defensive branch identical in kind to ones
+already proven tested elsewhere.
+
+### Test isolation and the shared-state trap
+
+**What it is.** Most of this suite's files share one real Postgres
+database and one real Redis instance rather than each getting an isolated
+sandbox. That's a deliberate cost tradeoff (see above), but it means one
+file's side effects can, in principle, leak into another's — Phase 10
+already hit this once, when shared Redis-backed rate-limit state let one
+test file's supertest requests exhaust budget a later file's requests then
+inherited, fixed by having `auth.test.ts`, `links.test.ts`,
+`googleAuth.test.ts`, and `redirect.test.ts` each flush their own
+`rl:auth-*` keys in a file-local `beforeAll`.
+
+**Why it exists in this project.** This phase re-ran that check: `npm
+test` twice back-to-back, then five times with `--sequence.shuffle.files`
+at fixed seeds. Three distinct findings came out of it, none of them the
+already-fixed rate-limit issue recurring:
+
+1. The plain back-to-back run actually failed once, in
+   `tests/scripts/seedBulk.test.ts`'s "produces the expected row-count
+   range, a skewed click distribution, and a sweep-target row" test — but
+   this is **not** cross-file contamination. It's a self-contained
+   statistical flake: at the test's `SCALE=0.002` (100 seeded links), only
+   a 3%-per-link roll produces an "expired but still active" row, so the
+   expected count is ~3 but has a real, non-negligible (~5%,
+   `0.97^100 ≈ e^-3`) chance of landing at exactly 0 in any given run. Two
+   consecutive runs (fail, then pass) is consistent with that math, not
+   with any state leaking between files.
+2. Shuffling file order at 5 different seeds never actually broke on the
+   dependency `vitest.config.ts`'s own comment names — `migrations.test.ts`
+   dropping and recreating tables `constraints.test.ts` depends on. 4 of
+   the 5 shuffled seeds ran `constraints.test.ts` *before*
+   `migrations.test.ts` (the "wrong" order per that comment) and all 4
+   passed clean regardless. That doesn't mean the comment is wrong — it
+   may describe a narrower failure window this particular set of seeds
+   didn't land in — but it's worth noting the empirical behavior didn't
+   match the documented severity in this sample, rather than either
+   removing the safeguard or treating it as unconfirmed.
+3. One shuffle (seed 1) produced a genuine, new cross-file failure:
+   `tests/routes/googleAuth.test.ts`'s "issues a different state on each
+   call" test threw `TypeError: Invalid URL` because `GET /api/auth/google`
+   returned a response with no `Location` header — consistent with
+   `storeState`'s Redis write failing inside the route handler. In that
+   shuffle order, this test ran immediately after
+   `tests/worker/clickQueue.integration.test.ts`, which spawns a real,
+   separate worker OS process against the *same* shared Redis instance and
+   only `SIGTERM`s it at the end of its own test. Re-running the identical
+   seed immediately after passed clean — so this is a timing-sensitive
+   race tied to that spawned process's teardown, not a deterministic
+   ordering bug, and it reproduced once in roughly six full-suite runs
+   during this phase.
+
+**How it works mechanically.** `fileParallelism: false` (existing) forces
+files to run one at a time within the vitest process, which is what makes
+the rate-limit and migrations/constraints risks tractable at all — but it
+says nothing about a real external OS process (finding 3) that
+`fileParallelism` has no authority over, since it's not a vitest file at
+all.
+
+**Where it lives in the codebase.** `tests/scripts/seedBulk.test.ts` line
+77 (finding 1); `vitest.config.ts`'s `fileParallelism` comment and
+`tests/db/migrations.test.ts`/`constraints.test.ts` (finding 2);
+`tests/worker/clickQueue.integration.test.ts` (finding 3, the spawned
+child process).
+
+**Common pitfalls.** Treating "the suite passed when I reran it" as
+resolution rather than as more data. All three findings here were only
+visible *because* the suite was run more than once, in more than one
+order — a single green `npm test` run proves nothing about either the ~5%
+flake or the rare cross-process race.
+
+**Production considerations.** None of these three findings were fixed in
+this phase — findings 1 and 3 are both probabilistic rather than
+deterministic, and CLAUDE.md's instruction to name a fix rather than
+implement it applies squarely here: (1) could be seeded with a fixed PRNG
+or asserted with `toBeGreaterThanOrEqual(0)` plus a documented rationale
+instead of `toBeGreaterThan(0)`, and (3) would need either a private Redis
+logical DB for the spawned worker, or an explicit settle delay after
+`child.kill('SIGTERM')` resolves, before the next file is allowed to
+start. Finding 2 needs no fix — it's a discrepancy between documented and
+observed risk, not a bug, worth a comment update at most.
+
+**Interview answer.** I don't trust a single green test run to mean the
+suite is actually isolated — I ran it twice back-to-back and five times
+shuffled at fixed seeds specifically to try to break that assumption. It
+surfaced three different things: a real ~5% statistical flake in one
+probabilistic test, an interesting non-finding (a documented file-ordering
+risk that didn't actually reproduce across several shuffles), and a
+genuine, if rare, cross-process race caused by a test that spawns a real
+worker against the same shared Redis the rest of the suite uses. None of
+them were the already-known rate-limit leak recurring — which is itself
+useful confirmation that that specific fix is holding.
+
+### What deserves tests here, and what doesn't
+
+**What it is.** Not every line of this codebase is worth the same testing
+investment. Authorization boundaries, HTTP-visible correctness, and
+consistency-under-failure paths are worth deliberate, named tests.
+Framework-guaranteed behavior and truly unreachable branches aren't.
+
+**Why it exists in this project.** The coverage-theater audit in this
+phase (grepping every test file for `toHaveBeenCalled()`-only assertions,
+`not.toThrow()`, bare `toBeDefined()`/`toBeTruthy()`, and status-only
+checks, then reading every match's full test block, not just the matched
+line) found **no genuine coverage theater** — every borderline pattern
+turned out to be a deliberately narrow, meaningful assertion for its
+specific purpose: `not.toThrow()` on `assertSafeToRun` is the entire
+correct contract for a guard function; `resolves.toBeDefined()` on a
+constraint test is paired with, and only meaningful next to, its sibling
+`.rejects.toMatchObject({code: '23514'})` tests; `toBeDefined()` on a
+health-check response proves the redirect router isn't shadowing the real
+route, which is the one narrow thing that test exists to prove. None were
+strengthened or deleted, because none needed to be.
+
+**How it works mechanically.** The signal that *does* separate
+high-value from low-value tests in this codebase isn't a lint pattern, it's
+what this phase's mutation table already answered directly: every
+mutation that lived at a security or correctness boundary (ownership
+checks, password verification, CSRF ordering) was caught by an assertion
+written specifically for that boundary. The coverage map's uncovered
+lines split the same way — a real concurrent-signup race (worth testing)
+versus a Redis-outage branch identical in kind to three already-tested
+siblings (not worth another copy).
+
+**Where it lives in the codebase.** The full coverage-theater grep and
+read covered all 25 files under `tests/`; the borderline cases named
+above live in `tests/scripts/seedBulk.test.ts`, `tests/db/constraints.test.ts`,
+and `tests/routes/redirect.test.ts`.
+
+**Common pitfalls.** Confusing "assertion count" with "assertion value" —
+a test with five `expect()` calls that all check the same fact five
+different ways is worth less than one test with a single `expect()` that
+checks the fact a mutation would actually break. This phase's mutation
+table is a more honest measure of value than either coverage percentage
+or assertion count.
+
+**Production considerations.** The discipline that keeps this suite free
+of theater is visible in its own conventions: nearly every test that
+mutates state also re-queries the database directly to confirm the row
+actually changed (or didn't), rather than trusting the HTTP response
+alone. That's the pattern worth protecting as the suite grows — a new
+contributor copying an existing test file by example will copy this habit
+along with it, for free.
+
+**Interview answer.** I audited this suite specifically for coverage
+theater — tests that assert a mock was called or that nothing threw,
+without checking the actual outcome — and found none. What that told me
+is less about this suite's cleverness and more about a checkable habit:
+almost every state-mutating test re-reads the database directly to
+confirm what actually happened, instead of trusting the response body.
+That habit is what makes the difference between a test that looks
+thorough and one that actually is.
+
+### Why authorization tests are the highest-value tests here
+
+**What it is.** Of the 8 mutations exercised this phase, 3 were direct
+authorization or identity-boundary bypasses: mutation 1 (any user can
+delete any other user's link), mutation 2 (any user can edit any other
+user's link), and mutation 8 (a forged OAuth callback can be accepted
+without ever proving it originated from a request this server issued).
+
+**Why it exists in this project.** These are qualitatively different from
+the other 5 mutations. A wrong redirect status code (mutation 3) degrades
+UX. A missed cache invalidation (mutation 6) causes stale data for a
+bounded window. A duplicate click (mutation 4, in its incidental-catch
+form) skews an analytics number. All of those are real bugs, but they're
+contained — they affect correctness within the boundary of "the request
+this app is legitimately handling." An authorization bypass doesn't stay
+contained: mutation 1 or 2, left unpatched, would mean *the isolation
+between users this entire API's data model depends on* simply doesn't
+exist, silently, for every user, all the time — not a degraded experience
+but a completely different (and false) security posture than the one the
+schema and route layer both claim to provide. Mutation 8's one confirmed
+gap is the sharpest version of this: unlike 1 and 2, which were already
+directly tested and caught instantly, mutation 8 slipped through with
+*zero* suite signal — the exact failure mode an authorization test
+exists to prevent.
+
+**How it works mechanically.** The pattern that makes mutations 1 and 2's
+tests effective isn't clever — it's structural. Both
+`tests/services/linkService.test.ts` and `tests/routes/links.test.ts`
+don't just call the function/route as a non-owner and check the response;
+they re-query Postgres directly afterward to confirm the row is
+byte-for-byte unchanged. That's what makes those two mutations get caught
+by the *intended* assertion rather than incidentally: the test doesn't
+just check "did I get denied," it checks "did the denial actually prevent
+the write," which is the only version of the assertion that can't be
+fooled by, say, a handler that returns 404 but still executes the query.
+
+**Where it lives in the codebase.** `tests/services/linkService.test.ts`
+("returns null/false and leaves the row untouched when attempted by a
+non-owner", both `updateLink` and `deleteLink`); `tests/routes/links.test.ts`
+("object-level authorization: user B against user A's link"); the new
+`tests/routes/googleAuth.test.ts` test from this phase's gap-fill.
+
+**Common pitfalls.** Writing an authorization test that only checks the
+HTTP status code. A 404 or 401 response proves the *caller* didn't see
+the data — it doesn't prove the *write* didn't happen, if the bug is in
+which rows a mutation targets rather than which rows a read returns. The
+re-query-the-database pattern this suite already uses is the fix, and
+it's the reason mutations 1 and 2 were both caught cleanly while mutation
+8 — which had no equivalent "prove the bypass didn't have an effect" test
+for the *combination* of conditions that actually mattered — was not.
+
+**Production considerations.** Authorization tests are also the tests
+most worth re-running under mutation testing specifically, on a recurring
+basis, rather than trusting a green suite to mean the boundary still
+holds — because as mutation 8 showed, the individual conditions
+(`rejects an unknown state`, `handles denied consent`) can each be
+perfectly tested in isolation while the *combination and ordering* that
+actually defines the security property goes completely unverified,
+invisible to a coverage tool since every line involved is "covered" by
+some test or other.
+
+**Interview answer.** If I only had time to test one class of thing in an
+API like this, it would be authorization boundaries — not because other
+bugs don't matter, but because their blast radius is different in kind,
+not just degree. A wrong status code degrades one request; a broken
+ownership check breaks the security model for every user, silently, until
+someone notices. This phase's mutation table backs that up directly: the
+two ownership-check mutations were caught instantly by tests that
+re-verify database state, not just response codes, while the one bug that
+slipped through completely undetected was also, not coincidentally, the
+one authorization-adjacent check whose *combination* of conditions had no
+dedicated test — proof that the coverage that matters most here is
+coverage of the boundary, not coverage of the line count.

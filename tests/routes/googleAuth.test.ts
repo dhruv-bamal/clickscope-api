@@ -157,6 +157,23 @@ describe('GET /api/auth/google/callback', () => {
     expect(exchangeCodeForIdentity).not.toHaveBeenCalled();
   });
 
+  it('rejects an unknown state even when error=access_denied is also present — state, not error, decides the outcome', async () => {
+    // Proves the precedence, not just the individual branches: a forged
+    // callback with a bad/never-issued state AND a denial-shaped error
+    // must still 400 on the state check, not be redirected as if it were
+    // a legitimate consent denial. If state validation ever moved below
+    // the `error` check, this exact request would instead get a 302 to
+    // FRONTEND_URL?error=oauth_denied — silently accepting a forged
+    // callback that never proved it originated from a request this
+    // server issued.
+    const res = await request(app)
+      .get('/api/auth/google/callback')
+      .query({ state: 'never-issued-state', error: 'access_denied' });
+
+    expect(res.status).toBe(400);
+    expect(exchangeCodeForIdentity).not.toHaveBeenCalled();
+  });
+
   it('handles denied consent (?error=) as a redirect, not a server error, without exchanging a code', async () => {
     const state = await getState();
 
