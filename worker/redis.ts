@@ -1,3 +1,4 @@
+import * as Sentry from '@sentry/node';
 import { Redis } from 'ioredis';
 import { workerConfig } from './config.js';
 import { logger } from './logger.js';
@@ -24,4 +25,5 @@ export const workerRedis = new Redis(workerConfig.REDIS_URL, {
 
 workerRedis.on('error', (err: Error) => {
   logger.error({ err }, 'Worker Redis connection error');
+  Sentry.captureException(err);
 });

@@ -18,7 +18,7 @@ import {
 
 export const linksRouter = Router();
 
-const idParamSchema = z.object({
+export const idParamSchema = z.object({
   id: z.string().uuid('id must be a valid UUID'),
 });
 
@@ -46,7 +46,7 @@ const linkPasswordSchema = z
   .min(1, 'password must not be empty')
   .max(72, 'password must be at most 72 characters');
 
-const createLinkSchema = z.object({
+export const createLinkSchema = z.object({
   destinationUrl: destinationUrlSchema,
   customAlias: customAliasSchema.optional(),
   expiresAt: futureDateSchema.optional(),
@@ -57,7 +57,7 @@ const createLinkSchema = z.object({
 // .strict() rejects customAlias/shortCode in a PATCH body — the short code
 // is immutable after creation; changing it would break every URL already
 // shared under the old one.
-const updateLinkSchema = z
+export const updateLinkSchema = z
   .object({
     destinationUrl: destinationUrlSchema.optional(),
     expiresAt: futureDateSchema.nullable().optional(),
@@ -75,7 +75,7 @@ const updateLinkSchema = z
 const MAX_PAGE_SIZE = 100;
 const DEFAULT_PAGE_SIZE = 20;
 
-const listLinksQuerySchema = z.object({
+export const listLinksQuerySchema = z.object({
   limit: z.coerce
     .number()
     .int()
@@ -94,7 +94,7 @@ const listLinksQuerySchema = z.object({
 const MAX_STATS_DAYS = 365;
 const DEFAULT_STATS_DAYS = 30;
 
-const linkStatsQuerySchema = z.object({
+export const linkStatsQuerySchema = z.object({
   days: z.coerce
     .number()
     .int()

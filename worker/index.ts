@@ -1,3 +1,6 @@
+import './instrumentation.js';
+
+import * as Sentry from '@sentry/node';
 import { Queue, Worker } from 'bullmq';
 import {
   CLICK_QUEUE_NAME,
@@ -85,6 +88,8 @@ for (const [name, worker] of [
       attemptsMade !== null &&
       attemptsMade < maxAttempts;
     log.error({ jobId: job?.id, err, attemptsMade, maxAttempts, willRetry }, 'Job failed');
+    // Safe no-op if Sentry.init() was never called (SENTRY_DSN unset).
+    Sentry.captureException(err, { tags: { worker: name, jobId: job?.id ?? 'unknown' } });
   });
 }
 

@@ -1,3 +1,4 @@
+import * as Sentry from '@sentry/node';
 import { Pool, type PoolClient, type PoolConfig, type QueryResult, type QueryResultRow } from 'pg';
 import { workerConfig } from '../config.js';
 import { logger } from '../logger.js';
@@ -33,6 +34,7 @@ export const pool = new Pool(poolConfig);
 
 pool.on('error', (err) => {
   logger.error({ err }, 'Unexpected error on idle worker database client');
+  Sentry.captureException(err);
 });
 
 export async function query<T extends QueryResultRow = QueryResultRow>(

@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import * as Sentry from '@sentry/node';
 import type { NextFunction, Request, Response } from 'express';
 import type { Config } from '../config/env.js';
 import { AppError } from '../lib/errors.js';
@@ -61,6 +62,14 @@ export function createErrorHandler(nodeEnv: Config['NODE_ENV']) {
         { err, requestId, statusCode, isOperational: isAppError },
         'Request failed with server error',
       );
+      // 5xx only — a Sentry issue is for incidents, not expected client
+      // errors. captureException is a safe no-op if Sentry.init() was
+      // never called (SENTRY_DSN unset). Tagging with requestId is what
+      // lets a Sentry issue link back to the correlated Pino log lines
+      // for the same request.
+      Sentry.captureException(err, {
+        tags: { requestId, statusCode: String(statusCode), isOperational: String(isAppError) },
+      });
     } else {
       log.warn(
         { err, requestId, statusCode, isOperational: isAppError },

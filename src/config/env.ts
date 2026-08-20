@@ -154,6 +154,18 @@ export const envSchema = z.object({
   // POST /api/links rate limit — keyed per authenticated user, not IP.
   RATE_LIMIT_LINKS_WINDOW_SECONDS: z.coerce.number().int().positive().default(60),
   RATE_LIMIT_LINKS_MAX: z.coerce.number().int().positive().default(20),
+
+  // Sentry project DSN. Optional, no default: local dev shouldn't require
+  // provisioning a Sentry project just to boot — every Sentry.* call in
+  // this app (src/lib/sentry.ts) safely no-ops when init() was never
+  // called. Despite looking secret-shaped, a DSN is not a credential: it
+  // only identifies where to send events, carries no read/query
+  // capability, and Sentry's own client SDKs are designed to be embedded
+  // in shipped browser bundles. Safe to expose to the client (relevant
+  // for a future browser-side Sentry integration) for the same reason a
+  // Stripe *publishable* key is safe to expose despite the word "key" —
+  // see Notes.md, "Phase 14a: Observability & API Documentation."
+  SENTRY_DSN: z.string().url('SENTRY_DSN must be a valid URL').optional(),
 });
 
 export type Config = z.infer<typeof envSchema>;

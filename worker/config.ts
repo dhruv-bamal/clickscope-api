@@ -29,6 +29,7 @@ const workerEnvSchema = envSchema.pick({
   DATABASE_URL: true,
   REDIS_URL: true,
   LOG_LEVEL: true,
+  SENTRY_DSN: true,
 });
 
 export type WorkerConfig = z.infer<typeof workerEnvSchema>;

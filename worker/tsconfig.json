@@ -4,6 +4,6 @@
     "rootDir": "..",
     "outDir": "../dist"
   },
-  "include": ["./**/*.ts", "../src/queues/contracts.ts"],
+  "include": ["./**/*.ts", "../src/queues/contracts.ts", "../src/lib/sentryScrub.ts"],
   "exclude": ["../node_modules", "../dist", "../tests", "../migrations"]
 }

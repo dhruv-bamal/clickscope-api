@@ -6,6 +6,7 @@ import { notFoundHandler } from './middleware/notFoundHandler.js';
 import { requestContext } from './middleware/requestContext.js';
 import { corsMiddleware, securityHeaders } from './middleware/security.js';
 import { authRouter } from './routes/auth.js';
+import { docsRouter } from './routes/docs.js';
 import { healthRouter } from './routes/health.js';
 import { linksRouter } from './routes/links.js';
 import { redirectRouter } from './routes/redirect.js';
@@ -83,6 +84,7 @@ app.use(express.json());
 //    security, before the catch-all.
 app.use(rootRouter);
 app.use(healthRouter);
+app.use(docsRouter);
 // Prefix-mounted, not flat like the two routers above — those each have a
 // single route, so a full path costs nothing; authRouter has three routes
 // today and future feature routers (link CRUD, etc.) will have more, so

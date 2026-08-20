@@ -1,3 +1,4 @@
+import * as Sentry from '@sentry/node';
 import { Pool, type PoolConfig, type QueryResult, type QueryResultRow } from 'pg';
 import { config } from '../config/index.js';
 import { logger } from '../lib/logger.js';
@@ -58,6 +59,7 @@ export const pool = new Pool(poolConfig);
 // unhandled 'error' event, which crashes the Node process outright.
 pool.on('error', (err) => {
   logger.error({ err }, 'Unexpected error on idle database client');
+  Sentry.captureException(err);
 });
 
 /**

@@ -10693,3 +10693,813 @@ slipped through completely undetected was also, not coincidentally, the
 one authorization-adjacent check whose *combination* of conditions had no
 dedicated test — proof that the coverage that matters most here is
 coverage of the boundary, not coverage of the line count.
+
+## Phase 14a: Observability & API Documentation
+
+### The three observability pillars, and what this phase does and doesn't cover
+
+**What it is.** "Observability" is usually broken into three pillars:
+logs (discrete, structured events), metrics (numeric aggregates over
+time — counts, gauges, histograms), and traces (the causal path a single
+request takes across services/processes). This phase touches all three
+in a small way — Sentry for error-shaped events, a route-pattern log
+field for latency aggregation, and BullMQ queue depth as a health-check
+gauge — without building a real instance of any of them.
+
+**Why it exists in this project.** A phase like this is where it's
+easiest to overclaim. The honest scope is: error tracking (Sentry) is
+real and production-grade as far as it goes. The "metrics" here are a
+log field plus a script that greps a file — not a metrics backend.
+There is no tracing at all: a click enqueued on the redirect path and
+processed later by the worker has no span connecting those two log
+lines beyond a shared `linkId`/`clickId` a human has to cross-reference
+by hand.
+
+**How it works mechanically.** Logs: Pino, unchanged from Phase 3,
+extended with a `route` field (see "Route-pattern aggregation"
+below). Metrics: `scripts/log-percentiles.ts` reads NDJSON log lines
+off disk/stdin and computes percentiles in-process — there's no
+scrape endpoint, no persistence, no alerting. Traces: none — Sentry's
+`tracesSampleRate` is explicitly `0` (see "Error tracking vs.
+structured logging" below), so even the one library in this phase that
+*could* produce spans is configured not to.
+
+**Where it lives in the codebase.** `src/lib/sentry.ts` /
+`worker/lib/sentry.ts` (error tracking), `src/middleware/requestContext.ts`
+(the `route` field), `scripts/log-percentiles.ts` (the percentile
+script), `src/services/health.ts` (queue depth as a gauge, read
+on-demand rather than pushed anywhere).
+
+**Common pitfalls.** Treating "we added Sentry" as "we have
+observability." Error tracking answers "what broke and how often" for
+things that already throw; it says nothing about a redirect that
+succeeds but takes 800ms, or a slow degradation in queue depth that
+never crosses the health check's threshold. Those need the logging and
+health-check pieces respectively — which is exactly why this phase
+built both, not just the first one.
+
+**Production considerations.** At real traffic, the two gaps above stop
+being academic: log-file percentiles don't survive a log rotation or a
+multi-instance deployment (each instance's log file only sees its own
+slice of traffic), and "no tracing" means a slow click stops being
+debuggable past "the redirect enqueued it" — nothing connects that log
+line to the specific worker invocation that processed it later. See
+"What this phase's logging setup is not" below for what a real
+deployment reaches for instead.
+
+**Interview answer.** Observability isn't one tool, it's three
+complementary signal types — logs, metrics, traces — and it's easy to
+add one (usually error tracking, because it's the easiest to demo) and
+call the box checked. This phase deliberately built a small, honest
+version of all three specifically so the gaps would be visible and
+nameable, rather than quietly missing.
+
+### Error tracking vs. structured logging
+
+**What it is.** Pino logging (Phase 3) and Sentry (this phase) look
+similar — both capture an error object — but answer different
+questions. Logging answers "what happened, in order, for this specific
+request," and is designed to be read sequentially or grepped. Error
+tracking answers "which distinct failures are happening, how often,
+and are they new" — it deduplicates by stack trace/fingerprint and is
+designed to be triaged, not read top-to-bottom.
+
+**Why it exists in this project.** Without Sentry, a spike in a
+specific 500 is only visible by someone actively tailing or querying
+logs. Sentry turns that into a thing that pages/notifies on its own,
+grouped by the actual failure rather than by request. That's a
+genuinely different job from logging, not a nicer UI for the same job.
+
+**How it works mechanically.** Sentry is wired into exactly three
+places, deliberately not as request middleware:
+1. `src/middleware/errorHandler.ts`'s existing `statusCode >= 500`
+   branch — the same branch that already does `log.error` — calls
+   `Sentry.captureException`, tagged with `requestId`, `statusCode`,
+   and `isOperational`. 4xx responses are `log.warn`'d as before and
+   never reach Sentry: they're expected client errors (bad input,
+   wrong password, expired link), not incidents.
+2. `worker/index.ts`'s existing `worker.on('failed', ...)` listener
+   (already logging job failures) additionally calls
+   `Sentry.captureException`, tagged with which worker and job ID.
+3. Sentry's own default `onUncaughtException`/`onUnhandledRejection`
+   integrations, enabled automatically by `Sentry.init()` — nothing
+   hand-rolled for this; Node's default crash-on-uncaught-exception
+   behavior is preserved, Sentry just gets to see it first.
+
+`Sentry.init()` itself is guarded on `SENTRY_DSN` being set
+(`src/lib/sentry.ts`, `worker/lib/sentry.ts`) — unset, it logs one line
+and every `Sentry.*` call elsewhere becomes a safe no-op, so local dev
+never needs a real Sentry project. `tracesSampleRate: 0` turns off
+performance/span instrumentation entirely, and no Sentry Express
+middleware (`Sentry.setupExpressErrorHandler` or similar) is
+registered — see "The redirect hot path" below for why, and what
+that's worth in practice.
+
+**Where it lives in the codebase.** `src/lib/sentry.ts`,
+`src/lib/sentryScrub.ts`, `src/instrumentation.ts` (server),
+`worker/lib/sentry.ts`, `worker/instrumentation.ts` (worker),
+`src/middleware/errorHandler.ts` and `worker/index.ts` (the two capture
+call sites). `src/instrumentation.ts` / `worker/instrumentation.ts` are
+imported first, before anything else, in `src/server.ts` /
+`worker/index.ts` — Node ESM evaluates static imports in declaration
+order, so this guarantees `Sentry.init()` runs before any route or job
+handler exists to throw. `src/app.ts` never imports either
+instrumentation module, so the supertest-based test suite (which
+imports `app` directly) never triggers `Sentry.init()` as a side
+effect.
+
+**Common pitfalls.** Wiring error tracking through a generic Express
+error-handling middleware layered *on top of* an app's own error
+handler, duplicating the 5xx/4xx distinction that already exists.
+Capturing every error indiscriminately (4xx included) is the other
+common mistake — it turns Sentry into a firehose of expected outcomes
+(wrong passwords, expired links, validation failures) and trains
+whoever's on call to ignore it.
+
+**Production considerations.** At scale, this setup would want sampling
+(`sampleRate` < 1 on very high-volume error types) and release tracking
+(tagging events with a deploy version, so a regression is visible as
+"started at deploy X") — neither is in scope here; both slot into the
+same `Sentry.init()` call without restructuring anything.
+
+**Interview answer.** Logging and error tracking look redundant because
+they both touch the same exception object, but they're solving
+different problems — one is a sequential record, the other is
+deduplicated triage. I wired Sentry into the exact two places this app
+already distinguishes real incidents from expected errors (the
+error handler's 5xx branch, the worker's job-failure listener) instead
+of adding a parallel error-handling layer, so the two systems agree
+about what counts as "server error" by construction, not by convention.
+
+### Scrubbing before it leaves the process, and proving it
+
+**What it is.** A `beforeSend` hook (`src/lib/sentryScrub.ts`) that
+Sentry runs on every event immediately before transmitting it, given
+the chance to redact or drop the event entirely.
+
+**Why it exists in this project.** Error events are unusually likely to
+carry exactly the data that must never leave this process: the request
+that crashed a handler often has the full request body, headers, and
+cookies attached (Sentry captures these by default), and this app
+specifically handles JWTs (`Authorization` headers), OAuth codes (the
+`/api/auth/google/callback` query string), passwords (signup, login,
+and link-unlock bodies), and signed unlock cookies. None of those
+should be readable in a third-party-hosted dashboard.
+
+**How it works mechanically.** `scrubSentryEvent` redacts by key name
+(`authorization`, `cookie`, `set-cookie`, `password`, `token`, `jwt`,
+case-insensitive) recursively through `request.headers`,
+`request.data`, `event.extra`, and `event.contexts` — and handles two
+things that don't fit that pattern: `request.cookies` is blanket-redacted
+regardless of key name (every entry in a parsed Cookie header is a
+cookie value by construction — this app's own
+`link_unlock_<shortCode>` cookie has an app-specific name no denylist
+would know in advance), and `request.query_string` is parsed with
+`URLSearchParams` specifically to delete the OAuth `code` parameter,
+since Sentry stores it as a raw string, not a parsed object, and the
+sensitive thing there is a value keyed by an entirely unremarkable name
+("code"). The function returns a new object; nothing is mutated in
+place.
+
+**Where it lives in the codebase.** `src/lib/sentryScrub.ts`, shared
+verbatim between the API and worker processes (`worker/lib/sentry.ts`
+imports it directly across the `src/`/`worker/` boundary — the same
+established pattern `worker/config.ts` already uses for
+`envSchema`/`contracts.ts`; `worker/tsconfig.json`'s `include` list was
+extended with this one file for exactly that reason).
+`tests/lib/sentryScrub.test.ts` is the proof, not the docstring above:
+it builds a fake event containing an `Authorization` header, a
+`Cookie` header, `request.cookies`, a `password` and `token` field in
+the body, a `jwt` field in `extra`, and a query string with a `code`
+param — then asserts each one is actually gone from the scrubbed
+output, while a deliberately-included benign field (`user-agent`,
+`email`) survives untouched. Asserting the hook is *registered* would
+have caught a wiring mistake; asserting the hook *works* is what
+catches a subtly wrong redaction (this exact project caught one during
+development — see "Common pitfalls" below).
+
+**Common pitfalls.** The first version of this scrub redacted
+`request.cookies` the same key-matching way as headers — which is
+wrong, because a cookie's *key* is an application-specific name
+(`link_unlock_abc123`), not a recognizable word like "cookie." The
+test caught this immediately (`expected 'some-signed-token' to be
+'[REDACTED]'`) precisely because it asserted the actual redacted
+*value*, not just that `beforeSend` ran. That's the general lesson:
+a scrub test that only checks "the hook fired" or "the function didn't
+throw" would have passed on the broken version.
+
+**Production considerations.** This denylist is necessarily incomplete
+— any future field with a sensitive value and an unrecognizable key
+(a new "reset code," an API key issued to a third party) needs either a
+new denylist entry or, more robustly, a shift toward an allowlist
+("only these fields ever leave the process") as the surface grows.
+
+**Interview answer.** The easy version of this feature is a
+`beforeSend` hook that looks right; the hard version is proving it. I
+wrote a test that builds a fake Sentry event with every category of
+secret this app handles — JWTs, passwords, an OAuth code, a signed
+cookie — and asserts each one is actually redacted in the output, not
+just that the hook exists. That test caught a real bug during
+development: my first pass redacted cookies by matching the key name
+"cookie," which does nothing for a cookie whose actual name is
+`link_unlock_abc123`. Testing the claim, not the wiring, is what
+caught it.
+
+### SENTRY_DSN: a public identifier, not a secret
+
+**What it is.** A Sentry DSN (`https://<key>@<org>.ingest.sentry.io/<project>`)
+looks exactly like a credential — it's a URL with what reads as an API
+key embedded in it — but it functions as a write-only mailing address,
+not an access token.
+
+**Why it exists in this project.** It matters here because
+`SENTRY_DSN` is defined in `src/config/env.ts` right alongside genuine
+secrets (`JWT_SECRET`, `GOOGLE_CLIENT_SECRET`) that must never be
+exposed, and because a future browser-side Sentry integration (Phase
+14b, out of scope here) would need this same value shipped inside a
+public frontend bundle — which would be a serious mistake if it were
+actually a credential.
+
+**How it works mechanically.** The DSN only tells Sentry's client SDK
+*where* to send events; it grants no read access to any project data,
+no way to query past events, and no way to change project settings —
+those all require a separate, genuinely secret API token that this app
+never touches. Sentry's own SDKs are designed and documented to be
+embedded in shipped client code (browser bundles, mobile apps) for
+exactly this reason. If a DSN leaks, the only thing a third party can
+do with it is send Sentry *more* events under this project — an
+availability nuisance (rate-limit/quota noise), not a data breach.
+
+**Where it lives in the codebase.** `src/config/env.ts`
+(`SENTRY_DSN: z.string().url().optional()`), `.env.example`. Optional,
+no default — unlike `JWT_SECRET`, an unset `SENTRY_DSN` is a completely
+fine, common state (local dev), not a startup-blocking misconfiguration.
+
+**Common pitfalls.** Treating it like every other `*_SECRET`/`*_KEY`
+env var reflexively — e.g., refusing to let a build tool inline it into
+a client bundle, or being surprised it isn't in a secrets manager
+alongside `JWT_SECRET`. The comment on the `SENTRY_DSN` field in
+`src/config/env.ts` calls this out explicitly for exactly that reason.
+
+**Production considerations.** The one thing worth actually gatekeeping
+around a DSN, even though it isn't a credential: Sentry-side quota and
+alert-noise limits, since anyone holding it can generate billable
+events. That's a usage-management concern, not a confidentiality one.
+
+**Interview answer.** A Sentry DSN reads as a secret — it's a URL with
+what looks like an embedded key — but it's actually a write-only
+address: it tells the SDK where to send events and grants no read
+access to anything. That's exactly why Sentry's own client SDKs ship
+DSNs inside public browser bundles by design. I still keep it in the
+same env schema as real secrets, because that's where config belongs,
+but I don't treat it with the same handling requirements — the
+comment in the schema says so explicitly, so the next person touching
+this doesn't have to rediscover it.
+
+### Route-pattern aggregation vs. raw-path logging
+
+**What it is.** The request-completion log line
+(`src/middleware/requestContext.ts`) now includes a `route` field —
+the matched route *pattern* (`/api/links/:id`), not the raw request
+path (`/api/links/3f9a1e2c-...`) it already logged as `path`.
+
+**Why it exists in this project.** A raw path is only useful for
+looking at one specific request. The moment any path segment is a
+UUID, short code, or other per-resource identifier, grouping log lines
+by raw path turns "the p95 latency of `GET /api/links/:id`" into
+thousands of one-sample groups — every distinct UUID *is* a distinct
+"route" from a raw-path grouping's point of view, which makes
+aggregation meaningless. This app's own routes make the problem
+concrete: `/api/links/:id`, `/api/links/:id/stats`, and the public
+`/:shortCode` redirect all embed a variable identifier directly in the
+path.
+
+**How it works mechanically.** `requestContext` runs first in the
+middleware stack (`src/app.ts`), before Express has matched a route —
+so `req.route` doesn't exist yet at "Request started" time. It's only
+guaranteed to exist by the time `res.on('finish')` fires, since routing
+(and the handler it dispatched to) has already completed by then.
+`getRoutePattern` reconstructs the full pattern as
+`` `${req.baseUrl}${req.route.path}` ``: `req.baseUrl` holds a
+prefix-mounted router's mount point (`/api/links` for `linksRouter`,
+`''` for the flat-mounted `redirectRouter`), and `req.route.path` holds
+the matched route's own path relative to that mount. A request that
+never matches any route at all (a genuine 404, or a body-parse failure
+before routing runs) logs the fixed literal `route: 'unmatched'` —
+bounded, and not attacker-controlled the way echoing an arbitrary path
+back would be. `path` is left alone, still logged for looking at one
+specific request — including a quirk worth knowing: inside a
+prefix-mounted router, Express strips the mount prefix from `req.url`
+for the router's dispatch and doesn't restore it before `finish` fires,
+so `path` on a mounted route is itself mount-relative
+(`/3f9a1e2c-...`, not `/api/links/3f9a1e2c-...`). `route` is
+unaffected by that quirk, which is exactly why it — not `path` — is the
+field this phase adds for aggregation.
+
+**Where it lives in the codebase.** `src/middleware/requestContext.ts`
+(`getRoutePattern`, and the "Request completed" log call site).
+`scripts/log-percentiles.ts` groups by `` `${method} ${route}` ``
+specifically, never by `path`. `tests/middleware/requestContext.test.ts`
+proves both the prefix-mounted and flat-mounted cases resolve to the
+expected pattern, and that an unmatched request logs `'unmatched'`
+rather than leaking whatever garbage path was requested.
+
+**Common pitfalls.** Reading `req.route.path` at "Request started"
+time — it isn't set yet, since routing hasn't happened. Assuming
+`req.path` at `res.on('finish')` reflects the full request path for a
+prefix-mounted route — see the mount-relative quirk above.
+
+**Production considerations.** At real scale, this same "aggregate by
+pattern, not literal value" principle is exactly what a metrics
+backend's label/tag conventions enforce structurally (a Prometheus
+histogram labeled by route, for instance) — this phase's log field is
+a manual, log-file version of a discipline real metrics tooling bakes
+in by design.
+
+**Interview answer.** Grouping request logs by raw path silently stops
+working the moment any path has a variable segment — every UUID
+becomes its own "route," so there's nothing left to aggregate. I added
+a `route` field built from Express's own matched-route metadata
+(`req.baseUrl` plus `req.route.path`) specifically so a request to
+`/api/links/<any-uuid>` always aggregates under the same key,
+`/api/links/:id` — which is also exactly the label convention a real
+metrics system like Prometheus would enforce for you automatically.
+
+### A local percentile script, and what this observability setup is NOT
+
+**What it is.** `scripts/log-percentiles.ts` — a `tsx`-run script that
+reads NDJSON log lines (from a file or stdin), filters for `"Request
+completed"` entries, groups them by `` `${method} ${route}` ``, and
+prints p50/p95/p99 per group using the same nearest-rank percentile
+method already used by `scripts/bench/clickWriteBench.ts`.
+
+**Why it exists in this project.** The task asked for "a way to
+actually look at the aggregate without standing up real
+infrastructure" — this is deliberately that and nothing more. It's the
+smallest thing that turns a stream of individual request-completion
+log lines into an answer to "how slow is `GET /:shortCode` really,"
+without adding Prometheus, a hosted APM, or any new always-on process.
+
+**How it works mechanically.** `computePercentiles` is a pure function
+over an array of durations (sort, then nearest-rank index per
+percentile) — independently testable and reusable. `groupDurationsByRoute`
+parses each line as JSON, silently skips anything that isn't a
+`"Request completed"` line with the right shape (a non-JSON
+`pino-pretty` line, an unrelated log message), and buckets the rest.
+`npm run logs:percentiles` runs it as a CLI; nothing here writes state
+anywhere or runs on an interval.
+
+**Where it lives in the codebase.** `scripts/log-percentiles.ts`,
+`tests/scripts/logPercentiles.test.ts` (percentile math on a known
+distribution, and the parsing/grouping logic on a small NDJSON
+fixture — independent of any real log file).
+
+**Common pitfalls.** Running this against `NODE_ENV=development`
+output: `src/lib/logger.ts`'s `pino-pretty` transport produces
+colorized, non-JSON text in development, which this script silently
+skips every line of (it looks like it ran successfully and printed
+nothing meaningful) — it needs Pino's native NDJSON output, i.e.
+production-style logging or a redirected/piped log stream from a
+non-development environment.
+
+**Production considerations — what this explicitly does NOT give you.**
+This is not distributed tracing: nothing connects a `GET /:shortCode`
+request's enqueue to the worker process's later handling of that same
+click — Phase 9's queue/worker split means those are two separate log
+streams with no shared span or trace ID, only a shared `clickId`/`linkId`
+a human can grep for by hand. This is not a real metrics backend:
+nothing here is scraped, persisted beyond the log file, alerted on, or
+visible without manually running a command — a percentile computed
+today tells you nothing about the trend over the last week. At actual
+production scale, this is exactly the gap Prometheus + Grafana (pull-based
+metrics scraping, real dashboards, alerting rules) or a hosted APM
+(Datadog, Honeycomb, Sentry's own Performance product) fill — either
+would also solve the tracing gap by propagating a trace ID across the
+queue boundary, which nothing in this phase attempts.
+
+**Interview answer.** I built the smallest possible way to answer "how
+slow is this route, really" from logs that already exist — a script
+that greps NDJSON for completion lines and computes percentiles,
+grouped by route pattern. I'd be upfront in an interview that this is
+not a metrics backend or tracing: it can't tell you a trend over time,
+it can't connect a request to the background job it triggered, and
+running it is a manual step, not a dashboard. It's a stopgap that
+answers one specific question cheaply, not a replacement for
+Prometheus/Grafana or a hosted APM at real scale.
+
+### Queue depth as a third health dependency
+
+**What it is.** `GET /health` (`src/routes/health.ts`) now checks three
+dependencies instead of two: Postgres, Redis, and the depth of the
+`click-recording` BullMQ queue (`checks.queue` in the response body).
+
+**Why it exists in this project.** Phase 9 already established that a
+growing queue backlog is the thing that turns `click_count`'s "bounded
+overshoot" claim from a hopeful one into a genuinely bounded one — but
+that observation only lived in a 30-second interval log line
+(`worker/index.ts`'s `logQueueDepth`) inside the *worker* process.
+Nothing outside that process could ask "is the queue currently healthy"
+on demand, and nothing fed into the one signal (`/health`'s status
+code) that's actually wired to affect traffic routing in a real
+deployment.
+
+**How it works mechanically.** `checkQueueDepth`
+(`src/services/health.ts`) calls `clickQueue.getWaitingCount()` on the
+API process's own `Queue` handle (`src/queues/clickQueue.ts`) —
+BullMQ queues are just named Redis key namespaces, so this reads live
+state directly from Redis without reaching into the separate worker
+process at all. A count over `QUEUE_DEPTH_DEGRADED_THRESHOLD` (100)
+reports `'degraded'`; a failed check (e.g. Redis unreachable) reports
+`'error'` rather than throwing, matching `checkDatabaseHealth`/
+`checkRedisHealth`'s existing never-throws contract. `getHealthReport`
+folds all three checks into the same binary `'ok'`/`'degraded'` →
+200/503 the route already returned — the response *shape* grew a
+field, the response *contract* (status code meaning) didn't change.
+
+**Where it lives in the codebase.** `src/services/health.ts`
+(`checkQueueDepth`, `QueueDepthStatus`, the threshold constant),
+`src/routes/health.ts` (unchanged — still just maps
+`report.status` to a status code). `tests/routes/health.test.ts`
+covers all three states (healthy, backed-up/`degraded`, and a rejected
+`getWaitingCount` call producing `'error'` without the endpoint
+hanging or crashing).
+
+**Common pitfalls.** Checking `link-cleanup` instead of (or in addition
+to) `click-recording` — see the next section for why that's the wrong
+default. Forcing `checkQueueDepth` into the exact same `timed()` helper
+`checkDatabaseHealth`/`checkRedisHealth` already share: that helper's
+contract is `() => Promise<boolean>`, and a queue-depth check
+fundamentally needs to report a count, not just ok/error — bending a
+two-call-site helper into a three-shape one was a worse trade than a
+small amount of duplicated timing boilerplate.
+
+**Production considerations.** `QUEUE_DEPTH_DEGRADED_THRESHOLD = 100`
+is a starting point, not a tuned number — the same "measure, don't
+guess" caveat Phase 7/9 already applied to concurrency numbers applies
+here too. A real deployment would also want this exposed as an
+alertable time-series (see the previous section's "what this is NOT"),
+not just a threshold checked at request time.
+
+**Interview answer.** A health check that only pings its datastores
+misses an entire class of degradation this app actually has: a worker
+that's falling behind. I added the click-recording queue's waiting
+count as a third dependency, reusing the API process's own existing
+Queue handle to read it directly from Redis — no new connection, no
+reaching into the separate worker process — and folded it into the
+same 200/503 contract the endpoint already had, so nothing consuming
+`/health` today needs to change to benefit from the new signal.
+
+### Why click-recording, not link-cleanup
+
+**What it is.** The health check's queue-depth check reads only the
+`click-recording` queue's waiting count, deliberately not
+`link-cleanup`'s.
+
+**Why it exists in this project.** The two queues aren't equally
+important to an operator deciding "should traffic keep routing here."
+Click-recording is the high-volume, user-facing queue — `worker/index.ts`'s
+own comment already calls its depth "the primary health signal for
+this process," and a backlog there means real click loss/delay risk at
+scale (see "What a consistently growing queue depth means
+operationally" below). Link-cleanup is a low-volume scheduled sweep
+(one repeatable job, every 60 seconds) — a backlog there means expired
+links get deactivated slightly late, which is a correctness nicety, not
+a readiness signal worth taking an instance out of rotation over.
+
+**How it works mechanically.** `checkQueueDepth` imports `clickQueue`
+specifically (`src/queues/clickQueue.ts`), not `linkCleanupQueue`. The
+helper is written narrowly enough — one queue, one threshold — that
+adding a second check later (if link-cleanup's backlog ever became
+operationally interesting) would mean one more `Promise.all` entry, not
+a redesign.
+
+**Where it lives in the codebase.** `src/services/health.ts`.
+
+**Common pitfalls.** Assuming "more checks is strictly better" and
+wiring up every queue in the system by default. A health check whose
+overall status can flip to `'degraded'` because of a queue nobody
+actually needs paged for is worse than not checking it — it trains
+whoever's on call to distrust the signal.
+
+**Production considerations.** If link-cleanup ever grew real
+operational stakes (e.g. expired links staying reachable for
+unacceptably long), the fix would be adding it as its own named check
+(`checks.linkCleanupQueue`), not folding it into the existing
+`checks.queue` — keeping the two independently visible is what let this
+phase pick one now without foreclosing the other later.
+
+**Interview answer.** Not every queue in a system deserves a vote in
+whether traffic keeps routing to an instance — I picked click-recording
+specifically because it's the one whose backlog has real user-facing
+consequences at the volumes this app is built for, and left
+link-cleanup out rather than checking it by default just because it
+existed. That's a scope decision worth being able to name and defend,
+not an oversight.
+
+### What a consistently growing queue depth means operationally
+
+**What it is.** A `waiting` count on the click-recording queue that
+climbs over successive `/health` checks (or successive 30-second
+`logQueueDepth` log lines in the worker), rather than staying roughly
+flat.
+
+**Why it exists in this project.** Phase 9 already established the
+mechanism this matters for: `worker/index.ts` comments it directly —
+queue lag compounds with the redirect path's cache TTL lag (Phase 8) to
+widen `click_count`'s "bounded overshoot" from a bound that holds in
+practice to one that only holds on paper. A health check that surfaces
+this the moment it starts happening is what makes that bound something
+an operator can actually catch, instead of a claim that quietly stops
+being true.
+
+**How it works mechanically.** A queue depth that's rising, specifically
+(not just nonzero — some waiting jobs at any instant is normal, healthy
+throughput), means jobs are being enqueued faster than the worker is
+draining them. That has exactly three plausible causes, in the order
+Phase 9's existing diagnostic writeup already establishes: worker
+concurrency is genuinely too low for current traffic, the worker's
+downstream dependency (Postgres, via `worker/db/pool.ts`) is degraded
+and each job is taking longer than normal, or the worker process is
+down entirely and nothing is draining the queue at all. `/health`'s
+`checks.queue` field distinguishes the first two symptoms from a
+*Redis*-side problem (an `'error'` status, meaning the check itself
+couldn't run) but doesn't by itself distinguish "worker slow" from
+"worker down" — that's what checking whether the worker process is
+still emitting its own `logQueueDepth`/job-lifecycle log lines is for,
+alongside this endpoint, not instead of it.
+
+**Where it lives in the codebase.** `src/services/health.ts`
+(`checkQueueDepth`), `worker/index.ts` (`logQueueDepth`, the
+complementary always-running signal inside the worker process itself).
+
+**Common pitfalls.** Reading a single `/health` snapshot as
+diagnostic on its own. One `waiting: 40` tells you almost nothing;
+`waiting: 40` followed by `waiting: 90` followed by `waiting: 180`
+across successive checks is the actual signal — the trend, not the
+instant value, which is exactly the kind of thing `scripts/log-percentiles.ts`
+and this phase's whole "what this isn't" caveat is about: a real
+time-series view (Grafana, a hosted APM) would make that trend visible
+at a glance instead of requiring an operator to remember the last few
+numbers by hand.
+
+**Production considerations.** This is the strongest concrete argument
+in this phase for the "what this observability setup does NOT give
+you" gap: a rising queue depth is a *trend*, and this phase's tooling
+(a threshold-gated health check, a manually-run percentile script) has
+no memory of the past — an operator watching `/health` at
+30-second intervals by hand can still catch it, but a real deployment
+wants that trend graphed and alerted on automatically.
+
+**Interview answer.** A single queue-depth number is close to useless
+on its own — what actually matters is whether it's climbing across
+successive checks, because that's the signal that the worker is
+falling behind rather than just momentarily busy. I built the
+snapshot (`/health`'s `checks.queue`) because that's what this phase
+could add without new infrastructure, but I'd be direct that catching
+the *trend* really wants a time-series tool graphing and alerting on
+it, not a person eyeballing a health endpoint every so often.
+
+### Generating an OpenAPI spec from existing Zod schemas, not hand-writing one
+
+**What it is.** `openapi.json`, committed at the repo root, generated
+by `npm run openapi:generate` (`scripts/generate-openapi.ts`) from the
+same Zod schemas that already validate real request traffic in
+`src/routes/{auth,links,redirect}.ts`, plus a small set of
+response-shape schemas in `src/openapi/schemas.ts`.
+
+**Why it exists in this project.** A hand-written OpenAPI spec is a
+second description of the API that has to be kept in sync with the
+first (the actual route code) by discipline alone — exactly the
+failure mode the sibling `clickscope-web` repo already documents
+concretely: its `src/types/api.ts` is hand-written by reading this
+repo's source directly, and its own Notes.md (Phase 12b, "Types
+hand-written today, generated in Phase 14") names this as an active
+drift risk and points at this exact phase as the fix. Generating from
+the request-validation schemas that are already load-bearing (a broken
+schema breaks real requests immediately, not just documentation) is
+what closes that gap for the request side.
+
+**How it works mechanically.** `@asteasolutions/zod-to-openapi`
+(pinned to `^7.3.4` — see "Why zod-to-openapi stays a devDependency"
+below) patches Zod's prototype with `extendZodWithOpenApi`, then
+`src/openapi/registry.ts` calls `registry.registerPath({...})` once
+per route, referencing the *actual* exported schemas from the route
+files (`signupSchema`, `createLinkSchema`, `idParamSchema`, etc. — each
+of those files only needed one change for this phase: adding `export`
+to a `const` that was already a clean, isolated Zod schema) for
+request bodies/params/query, and the `src/openapi/schemas.ts` response
+schemas for response bodies. `generateOpenApiDocument()` builds the
+document via `OpenApiGeneratorV3`, pulling `info.title`/`info.version`
+from `src/lib/serviceInfo.ts` (already the single source of truth for
+those values elsewhere — `src/app.ts`'s startup log, `GET /`'s
+liveness body — so this is a third reuse, not a third place reading
+`package.json`). `scripts/generate-openapi.ts` writes the result to
+`openapi.json`; `src/routes/docs.ts` reads that committed file once at
+import time and serves it via `swagger-ui-express` at `/docs`, and raw
+at `/openapi.json`.
+
+**Where it lives in the codebase.** `src/openapi/registry.ts` (the
+`registerPath` calls, one per route), `src/openapi/schemas.ts`
+(response schemas), `scripts/generate-openapi.ts`, `src/routes/docs.ts`,
+`openapi.json` (committed). `tests/openapi/spec.test.ts` validates the
+generated document against the OpenAPI 3.0 meta-schema via
+`@apidevtools/swagger-parser` (not just "the route responds"), asserts
+every one of this API's 15 method+path combinations is present with
+exactly the status codes it actually returns, and asserts the
+committed `openapi.json` matches a freshly generated document — a
+staleness guard that fails the next `npm test` run if a route or
+schema changed and nobody re-ran `npm run openapi:generate`.
+
+**Common pitfalls.** Assuming schema-generation alone eliminates all
+drift. It closes the *request*-side gap completely (the schemas
+generating the spec are the same objects Express validates real
+traffic against), but the *response* side is a genuine, smaller
+version of the same problem one layer in — see "The response-schema
+drift risk" below.
+
+**Production considerations.** `openapi.json` being a committed,
+explicitly-regenerated artifact (not regenerated on every server boot)
+means `clickscope-web` (or any other consumer) can generate a typed
+client against a stable file with a real git history, rather than
+against a live server that could change out from under a build.
+
+**Interview answer.** The whole point of generating a spec instead of
+hand-writing one is that the thing generating it is the same thing
+already enforcing the API's real behavior — these are the literal Zod
+schemas Express validates requests against, not a parallel description
+someone has to remember to update. That's a stronger guarantee than
+"we wrote docs and tried to keep them current," and it's specifically
+what the sibling frontend repo's own Notes.md was already waiting on
+this phase to provide.
+
+### Why zod-to-openapi stays a devDependency
+
+**What it is.** `@asteasolutions/zod-to-openapi` is a `devDependency`,
+never imported by `src/app.ts` or anything that runs in a live request
+path — only by `src/openapi/registry.ts`, which itself is only
+imported by `scripts/generate-openapi.ts` and by
+`tests/openapi/spec.test.ts`.
+
+**Why it exists in this project.** The generated *output*
+(`openapi.json`) is what the running server serves; the *generator* is
+a build-time tool, structurally no different from `eslint` or
+`prettier` already being devDependencies. Shipping it as a runtime
+dependency would mean every deploy carries a schema-to-JSON-Schema
+conversion library that never actually executes after the build step.
+
+**How it works mechanically.** Pinned to `^7.3.4` specifically, not the
+latest major: `npm view` confirms `7.3.4`'s peer dependency is
+`zod: ^3.20.2`, matching this repo's installed `zod@^3.24.1`; the
+`8.x`/`9.x` line requires `zod@^4`, which this repo doesn't use and
+isn't otherwise motivated to adopt just for this. Auto-upgrading past
+`7.x` here would have silently broken at the next `npm install` for a
+reason completely unrelated to anything this phase changed.
+
+**Where it lives in the codebase.** `package.json` (`devDependencies`),
+`src/openapi/registry.ts` and `src/openapi/schemas.ts` (the only two
+files that import it).
+
+**Common pitfalls.** Reaching for the newest major version by default
+without checking peer-dependency compatibility against the rest of the
+project — this repo is intentionally still on Zod v3, and a careless
+`npm install @asteasolutions/zod-to-openapi@latest` would have pulled a
+version that requires v4 and broken the build immediately.
+
+**Production considerations.** If this repo ever migrates to Zod v4,
+`zod-to-openapi` would need to move to `8.x`/`9.x` in the same change —
+worth noting as a coupled upgrade, not two independent ones.
+
+**Interview answer.** I checked the actual peer-dependency
+compatibility before picking a version, rather than defaulting to
+"install latest" — this project is on Zod v3, and zod-to-openapi's 8.x
+line requires Zod v4, so pinning to the last v3-compatible release
+(`7.3.4`) was a deliberate choice, not an oversight I'd have discovered
+later at a broken `npm install`.
+
+### The response-schema drift risk, and its sibling-repo analogue
+
+**What it is.** `src/openapi/schemas.ts` hand-writes Zod schemas for
+response shapes (`AuthUserSchema`, `LinkSchema`, `HealthReportSchema`,
+etc.) that mirror the *actual* return types (`AuthUser` in
+`src/services/authService.ts`, `Link` in `src/services/linkService.ts`)
+— because unlike request bodies, nothing in this codebase validates a
+response against a Zod schema at runtime; these interfaces are plain
+hand-written TypeScript.
+
+**Why it exists in this project.** This is a smaller, one-layer-in
+version of exactly the drift risk this whole phase exists to close on
+the request side. If `linkService.ts`'s `Link` interface gains a field,
+or `authService.ts` renames one, nothing forces
+`src/openapi/schemas.ts` to be updated in step — the generated spec
+would silently describe a shape that no longer matches what the API
+actually returns, and nothing in the test suite would catch it, because
+`tests/openapi/spec.test.ts` checks that the spec is internally valid
+and covers every route/status code, not that a real response matches
+its documented schema.
+
+**How it works mechanically.** There isn't a mechanism that closes
+this — that's the point of naming it explicitly rather than letting it
+look solved. Two ways to close it, deliberately left for a later
+phase: (1) make `Link`/`AuthUser` themselves `z.infer<>` from a Zod
+schema instead of a hand-written `interface`, so the response type and
+the OpenAPI schema are the same object by construction, the way
+request validation already works; or (2) a contract test that runs a
+real service call and validates its return value against
+`src/openapi/schemas.ts`'s schemas directly, catching drift at test
+time instead of never.
+
+**Where it lives in the codebase.** `src/openapi/schemas.ts` (the
+doc-comment at the top of the file makes this same point in-repo, for
+whoever's reading the code directly rather than Notes.md).
+
+**Common pitfalls.** Treating "we generate the spec from schemas" as a
+blanket guarantee against drift, without noticing that guarantee only
+holds for the half of the API surface (requests) that was already
+schema-validated before this phase started.
+
+**Production considerations.** This is exactly the category of problem
+the sibling `clickscope-web` repo's Phase 12b section already names for
+its own hand-written `src/types/api.ts` — the fix there was "wait for
+Phase 14's OpenAPI spec." This section is the honest disclosure that
+Phase 14a moves that problem one layer closer to solved, not all the
+way: a generated *client* (a true Phase 14b/consumer-side follow-up)
+would still be trusting `src/openapi/schemas.ts`'s accuracy, which
+nothing currently verifies against live service code.
+
+**Interview answer.** Generating the spec from Zod schemas solves
+drift for request validation completely, because the schema generating
+the docs is the literal schema Express validates against. It does not
+solve it for responses, because nothing in this codebase validates a
+response against a schema at runtime — I wrote hand-mirrored response
+schemas instead, and said so directly in both the code and here, rather
+than letting "we generate the spec" imply a stronger guarantee than it
+actually provides. Naming the boundary of a fix is part of the fix.
+
+### The redirect hot path: measuring, not assuming, Sentry's cost
+
+**What it is.** A direct check that wiring Sentry into this API doesn't
+add latency to `GET /:shortCode` — this app's highest-traffic,
+intentionally-unthrottled route (Phase 10's rate-limiting section
+explicitly exempts it).
+
+**Why it exists in this project.** The architectural argument (no
+Sentry Express middleware, no tracing, `Sentry.captureException` only
+called from the error handler's 5xx branch and the worker's job-failure
+listener — see "Error tracking vs. structured logging" above) implies
+zero cost on a successful redirect, since none of Sentry's code runs on
+that path at all. An implication isn't a measurement, so this phase
+checked it directly instead of asserting it.
+
+**How it works mechanically.** An in-process benchmark (supertest
+against the real `app`, 300 iterations of `GET /:shortCode` against a
+seeded, non-password-protected link) was run twice: once with
+`SENTRY_DSN` unset (Sentry never initialized) and once with a
+well-formed fake DSN set (Sentry fully initialized, `beforeSend`
+registered, exactly as it would be in production) — measuring end-to-end
+request duration via `process.hrtime` around each call. Results:
+
+| | p50 | p95 | p99 | mean |
+|---|---|---|---|---|
+| `SENTRY_DSN` unset | 1.245ms | 2.467ms | 3.754ms | 1.413ms |
+| `SENTRY_DSN` set (Sentry initialized) | 1.131ms | 1.923ms | 2.638ms | 1.219ms |
+
+The Sentry-initialized run was marginally *faster* across every
+percentile — well within run-to-run noise for a sub-2ms local
+benchmark, not a real effect. The honest conclusion is "no measurable
+difference," not "Sentry made it faster."
+
+**Where it lives in the codebase.** The benchmark itself was a
+throwaway script (not committed — it isn't a piece of this phase's
+deliverable code, just the evidence for this claim), structured like
+`scripts/bench/clickWriteBench.ts`: seed a link via the real
+`POST /api/links` route, then time repeated `GET /:shortCode` calls
+against the real `app` import, comparing the two `SENTRY_DSN` states as
+separate process runs (Sentry's init state is a module-level singleton
+set once at process start, so toggling it mid-process isn't
+meaningful).
+
+**Common pitfalls.** Trusting the architectural argument alone
+("Sentry isn't called on this path, so it must be free") without
+measuring — that argument is about *call count*, not about whether
+`Sentry.init()` itself installs anything with steady-state cost
+(instrumented globals, patched built-ins) that could tax every request
+regardless of whether `captureException` is ever invoked. Measuring is
+what rules that out empirically instead of by assumption.
+
+**Production considerations.** This benchmark is local, single-process,
+and un-loaded (no concurrent traffic) — it answers "does Sentry add
+per-request overhead," not "does Sentry change this service's behavior
+under real production load or memory pressure." A real capacity check
+before a production Sentry rollout would want a proper load test
+(k6, autocannon) under realistic concurrency, which this phase
+deliberately didn't add as a new dependency for a one-time check (see
+"Not added" in the dependency table).
+
+**Interview answer.** I didn't just argue Sentry was free on the hot
+path because it's architecturally never called there — I measured it,
+300 iterations each way, with Sentry fully initialized versus not.
+The two runs were statistically indistinguishable, with the
+Sentry-on run actually coming in marginally faster, which is exactly
+what "no measurable cost" should look like for a sub-2ms local
+benchmark. Stating a performance claim without the number behind it is
+a habit worth not having.

@@ -11,7 +11,7 @@ import { buildGoogleAuthUrl, exchangeCodeForIdentity } from '../services/oauthSe
 
 export const authRouter = Router();
 
-const signupSchema = z.object({
+export const signupSchema = z.object({
   email: z.string().email('Must be a valid email address'),
   // Length only, no composition rules (must contain a symbol/digit/etc.).
   // NIST 800-63B considers complexity rules counterproductive: they push
@@ -26,7 +26,7 @@ const signupSchema = z.object({
 // compare and produces the same generic 401 as any other wrong password;
 // a separate validation error here would leak more than the vague login
 // message intends to.
-const loginSchema = z.object({
+export const loginSchema = z.object({
   email: z.string().email('Must be a valid email address'),
   password: z.string().min(1, 'Password is required'),
 });
@@ -47,7 +47,7 @@ authRouter.post('/login', loginLimiter, validateBody(loginSchema), async (req, r
 // consent and a denial — so `state` is required regardless of which
 // outcome this request represents. `code` is absent when the user denies
 // consent; `error` (e.g. "access_denied") is present in exactly that case.
-const googleCallbackQuerySchema = z.object({
+export const googleCallbackQuerySchema = z.object({
   state: z.string({ required_error: 'Missing OAuth state parameter' }),
   code: z.string().optional(),
   error: z.string().optional(),

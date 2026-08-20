@@ -1,6 +1,6 @@
 import express from 'express';
 import request from 'supertest';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   badRequest,
   conflict,
@@ -11,6 +11,11 @@ import {
   unauthorized,
 } from '../../src/lib/errors.js';
 import { createErrorHandler } from '../../src/middleware/errorHandler.js';
+
+const captureException = vi.fn();
+vi.mock('@sentry/node', () => ({
+  captureException: (...args: unknown[]) => captureException(...args),
+}));
 
 function buildApp(nodeEnv: 'development' | 'production' | 'test') {
   const app = express();
@@ -94,5 +99,30 @@ describe('createErrorHandler', () => {
     const res = await request(buildApp('production')).get('/conflict');
 
     expect(res.body.error.message).toBe('Email already in use');
+  });
+
+  describe('Sentry capture', () => {
+    it('captures a 5xx error, tagged with the request ID', async () => {
+      captureException.mockClear();
+      const res = await request(buildApp('development')).get('/internal');
+
+      expect(captureException).toHaveBeenCalledTimes(1);
+      const [err, context] = captureException.mock.calls[0]!;
+      expect(err).toMatchObject({ message: expect.any(String) });
+      expect(context.tags.requestId).toBe(res.body.error.requestId);
+      expect(context.tags.statusCode).toBe('500');
+    });
+
+    it.each([
+      ['/bad-request', 400],
+      ['/unauthorized', 401],
+      ['/not-found', 404],
+      ['/conflict', 409],
+    ])('does NOT capture a %s (%i) client error — that is expected, not an incident', async (path) => {
+      captureException.mockClear();
+      await request(buildApp('development')).get(path);
+
+      expect(captureException).not.toHaveBeenCalled();
+    });
   });
 });

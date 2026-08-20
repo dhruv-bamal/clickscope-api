@@ -10,8 +10,16 @@ vi.mock('../../src/db/health.js', () => ({
   checkDatabaseHealth: vi.fn(),
 }));
 
+// clickQueue is mocked the same way — getWaitingCount is the one method
+// checkQueueDepth (src/services/health.ts) calls, so that's the only
+// method this fixture needs.
+vi.mock('../../src/queues/clickQueue.js', () => ({
+  clickQueue: { getWaitingCount: vi.fn() },
+}));
+
 let app: Express;
 let checkDatabaseHealth: ReturnType<typeof vi.fn>;
+let getWaitingCount: ReturnType<typeof vi.fn>;
 
 beforeAll(async () => {
   // src/config/index.ts reads process.env at MODULE-EVALUATION time (a
@@ -31,6 +39,12 @@ beforeAll(async () => {
   };
   checkDatabaseHealth = dbHealth.checkDatabaseHealth;
 
+  const clickQueueModule = (await import('../../src/queues/clickQueue.js')) as unknown as {
+    clickQueue: { getWaitingCount: ReturnType<typeof vi.fn> };
+  };
+  getWaitingCount = clickQueueModule.clickQueue.getWaitingCount;
+  getWaitingCount.mockResolvedValue(3);
+
   ({ app } = await import('../../src/app.js'));
 });
 
@@ -43,6 +57,7 @@ describe('GET /health', () => {
   // asymmetry and what it implies for CI.
   it('returns 200 with status "ok" when every dependency is healthy', async () => {
     checkDatabaseHealth.mockResolvedValue(true);
+    getWaitingCount.mockResolvedValue(3);
 
     const res = await request(app).get('/health');
 
@@ -50,6 +65,44 @@ describe('GET /health', () => {
     expect(res.body.status).toBe('ok');
     expect(res.body.checks.database).toEqual({ status: 'ok', latencyMs: expect.any(Number) });
     expect(res.body.checks.redis).toEqual({ status: 'ok', latencyMs: expect.any(Number) });
+    expect(res.body.checks.queue).toEqual({
+      status: 'ok',
+      latencyMs: expect.any(Number),
+      waiting: 3,
+    });
+  });
+
+  it('returns 503 with status "degraded" when the click-recording queue is backed up', async () => {
+    checkDatabaseHealth.mockResolvedValue(true);
+    getWaitingCount.mockResolvedValue(500);
+
+    const res = await request(app).get('/health');
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.checks.queue).toEqual({
+      status: 'degraded',
+      latencyMs: expect.any(Number),
+      waiting: 500,
+    });
+    // Database/redis are unaffected by the queue being backed up — proves
+    // each check is independent, not a single pass/fail flag.
+    expect(res.body.checks.database.status).toBe('ok');
+
+    getWaitingCount.mockResolvedValue(3);
+  });
+
+  it('reports the queue check as "error" (never hangs or crashes) if getWaitingCount rejects', async () => {
+    checkDatabaseHealth.mockResolvedValue(true);
+    getWaitingCount.mockRejectedValue(new Error('Redis connection lost'));
+
+    const res = await request(app).get('/health');
+
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('degraded');
+    expect(res.body.checks.queue).toEqual({ status: 'error', latencyMs: expect.any(Number), waiting: -1 });
+
+    getWaitingCount.mockResolvedValue(3);
   });
 
   it('returns 503 with status "degraded" when a dependency is unreachable', async () => {

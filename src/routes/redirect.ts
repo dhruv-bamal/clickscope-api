@@ -14,7 +14,7 @@ import { signUnlockToken, verifyUnlockToken } from '../services/unlockTokenServi
 
 export const redirectRouter = Router();
 
-const shortCodeParamSchema = z.object({
+export const shortCodeParamSchema = z.object({
   // No charset check here (unlike customAliasSchema at write time) — a
   // short code that can't possibly exist just falls through to the
   // ordinary "no such link" 404 below; this is a public route reachable
@@ -22,7 +22,7 @@ const shortCodeParamSchema = z.object({
   shortCode: z.string().min(1).max(MAX_ALIAS_LENGTH),
 });
 
-const unlockBodySchema = z.object({ password: z.string().min(1) }).strict();
+export const unlockBodySchema = z.object({ password: z.string().min(1) }).strict();
 
 const UNLOCK_COOKIE_MAX_AGE_MS = 30 * 60 * 1000; // keep in sync with unlockTokenService's UNLOCK_TOKEN_TTL
 

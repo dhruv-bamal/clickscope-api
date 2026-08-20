@@ -1,3 +1,5 @@
+import './instrumentation.js';
+
 import { app } from './app.js';
 import { config } from './config/index.js';
 import { pool } from './db/pool.js';
