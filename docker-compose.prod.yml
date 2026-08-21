@@ -1,0 +1,98 @@
+# Local validation that the production Docker images (Dockerfile) build,
+# run, and can actually talk to Postgres/Redis and each other — this is
+# NOT a real production deployment. No orchestrator, no secrets manager,
+# no TLS, no real Render config. See Notes.md, "Phase 15a: Containerization
+# & CI." Real deployment wiring is Phase 15c.
+#
+# Usage:
+#   cp .env.prod.example .env.prod   # then fill in real-looking values
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Neither the api nor worker service runs migrations on boot — node-pg-migrate
+# is a devDependency, so it isn't even present in these images' node_modules.
+# Apply the schema from the host once postgres is up:
+#   DATABASE_URL=postgres://clickscope:clickscope@localhost:${POSTGRES_PORT:-5433}/clickscope \
+#     npm run migrate:up
+#
+# Uses different host ports (5433/6380) than the dev docker-compose.yml
+# (5432/6379) so both stacks can run side by side without a port collision.
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-clickscope}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-clickscope}
+      POSTGRES_DB: ${POSTGRES_DB:-clickscope}
+    ports:
+      - '${POSTGRES_PORT:-5433}:5432'
+    volumes:
+      - clickscope_prod_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-clickscope}']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - '${REDIS_PORT:-6380}:6379'
+    volumes:
+      - clickscope_prod_redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    restart: unless-stopped
+    env_file:
+      - .env.prod
+    ports:
+      - '3000:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # busybox wget ships in node:24-alpine already — no extra install.
+      test: ['CMD', 'wget', '-qO-', 'http://localhost:3000/health']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    restart: unless-stopped
+    # Reuses the same .env.prod file as api — worker/config.ts only reads
+    # its own narrower Zod-picked subset (NODE_ENV, DATABASE_URL, REDIS_URL,
+    # LOG_LEVEL, SENTRY_DSN) and ignores the rest, so one file is simpler
+    # than maintaining two. No HEALTHCHECK: the worker has no HTTP surface
+    # and nothing here depends_on it, so a synthetic liveness probe would
+    # give false confidence rather than real signal.
+    env_file:
+      - .env.prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  clickscope_prod_postgres_data:
+  clickscope_prod_redis_data:

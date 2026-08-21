@@ -10,3 +10,10 @@ tests
 Notes.md
 CLAUDE.md
 .nvmrc
+.claude
+.github
+docker-compose*.yml
+
+# openapi.json is intentionally NOT ignored — src/routes/docs.ts reads it
+# at import time and the api build target COPYs it explicitly. Don't add
+# it here even by a broad *.json pattern.

@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: clickscope
+          POSTGRES_PASSWORD: clickscope
+          POSTGRES_DB: clickscope_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U clickscope"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      # .env.test.example's dummy values already satisfy env.ts's Zod schema
+      # (the test suite never calls the real Google API — nock intercepts).
+      # Two copies of the same file: tests/globalSetup.ts hardcodes
+      # process.loadEnvFile('.env.test'), and the migrate:up script
+      # hardcodes node --env-file=.env — both must exist as real files.
+      - run: |
+          cp .env.test.example .env.test
+          cp .env.test.example .env
+
+      - run: npm run typecheck
+
+      - run: npm run lint
+
+      # Exercises the actual CLI path (node-pg-migrate against the service
+      # Postgres), distinct from globalSetup.ts's programmatic runner()
+      # call below — a CLI-specific migration failure surfaces here, on
+      # its own step, instead of inside a confusing test failure.
+      - run: npm run migrate:up
+
+      # Re-running migrations via globalSetup.ts here is idempotent. This
+      # also already covers the OpenAPI drift guard (the last test in
+      # tests/openapi/spec.test.ts fails if committed openapi.json is stale
+      # relative to the Zod schemas) — no separate regenerate-and-diff step.
+      - run: npm test
+
+      # Informational only, not a merge-blocking check — see Notes.md,
+      # "Phase 15a" / "Coverage as a map, not a target" (Phase 13a): entry
+      # point files (worker/index.ts, worker/shutdown.ts, src/server.ts)
+      # structurally read as 0% despite being genuinely tested via
+      # child-process integration tests that v8 coverage can't see into.
+      # A blind percentage gate would be wrong without carving those out
+      # first, which is out of scope for this phase.
+      - run: npm run test:coverage
+        continue-on-error: true
+
+  docker-build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Verifies the Dockerfile itself, not just `npm run build` — two
+      # things only this job catches: (1) the runtime stage's
+      # `npm ci --omit=dev` is a genuinely different dependency resolution
+      # than the test job's `npm ci`; (2) tsconfig.json's `include` is
+      # `src/**/*.ts` only, so `npm run typecheck` above never type-checks
+      # worker/ at all — the build-worker stage's own `tsc` invocation is
+      # the only thing in this whole pipeline that does.
+      - run: docker build --target api -t clickscope-api:ci .
+
+      - run: docker build --target worker -t clickscope-worker:ci .
+
+      - run: docker images clickscope-api:ci
+      - run: docker images clickscope-worker:ci

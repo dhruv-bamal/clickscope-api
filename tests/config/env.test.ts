@@ -241,4 +241,37 @@ describe('parseEnv', () => {
       ).toThrow(EnvValidationError);
     });
   });
+
+  describe('SENTRY_DSN', () => {
+    const baseEnv = {
+      DATABASE_URL: 'postgres://user:pass@localhost:5432/clickscope',
+      REDIS_URL: 'redis://localhost:6379',
+      CORS_ORIGIN: 'http://localhost:5173',
+      JWT_SECRET: VALID_JWT_SECRET,
+      ...VALID_OAUTH_ENV,
+    };
+
+    it('is undefined when omitted entirely', () => {
+      const config = parseEnv(baseEnv);
+      expect(config.SENTRY_DSN).toBeUndefined();
+    });
+
+    // Node's --env-file and Docker Compose's env_file: both parse a bare
+    // `SENTRY_DSN=` line as "", not as an absent variable — this asserts
+    // that case parses identically to SENTRY_DSN being unset entirely,
+    // rather than failing .url() validation. See src/config/env.ts.
+    it('treats an empty string the same as SENTRY_DSN being unset', () => {
+      const config = parseEnv({ ...baseEnv, SENTRY_DSN: '' });
+      expect(config.SENTRY_DSN).toBeUndefined();
+    });
+
+    it('accepts a valid DSN URL', () => {
+      const config = parseEnv({ ...baseEnv, SENTRY_DSN: 'https://key@o0.ingest.sentry.io/0' });
+      expect(config.SENTRY_DSN).toBe('https://key@o0.ingest.sentry.io/0');
+    });
+
+    it('rejects a non-empty, non-URL SENTRY_DSN', () => {
+      expect(() => parseEnv({ ...baseEnv, SENTRY_DSN: 'not-a-url' })).toThrow(EnvValidationError);
+    });
+  });
 });

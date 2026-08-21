@@ -11503,3 +11503,473 @@ Sentry-on run actually coming in marginally faster, which is exactly
 what "no measurable cost" should look like for a sub-2ms local
 benchmark. Stating a performance claim without the number behind it is
 a habit worth not having.
+
+## Phase 15a: Containerization & CI
+
+### Multi-stage builds and layer caching
+
+**What it is.** A single `Dockerfile` with six named stages
+(`deps` → `build-api`/`build-worker` → `runtime-base` → `api`/`worker`)
+producing two separate, independently-taggable images from one file, via
+`docker build --target api` and `docker build --target worker`.
+
+**Why it exists in this project.** The API and worker are one npm
+package with one `node_modules` tree (see CLAUDE.md: "worker/ — separate
+process, separate deploy," not a separate package) but two different
+entrypoints and two different `tsc` projects (`tsconfig.json` vs.
+`worker/tsconfig.json`). A naive single-stage build would need
+`typescript`, `vitest`, `tsx`, `eslint`, and every other devDependency
+installed in the image that actually runs in production, just because
+they were needed to produce `dist/`. Multi-stage builds let the
+*compile* environment and the *run* environment diverge completely —
+only the compiled JavaScript crosses the boundary via `COPY --from=`.
+
+**How it works mechanically.** `deps` runs `npm ci` once, cached and
+shared by both `build-api` and `build-worker`. Each build stage copies in
+only what it needs to compile (`build-api` gets `tsconfig.json` + `src/`;
+`build-worker` gets both `tsconfig.json`/`src/` and `worker/`, because
+`worker/tsconfig.json` extends the root config and imports two `src/`
+files directly) and runs its own `tsc` invocation. `runtime-base` starts
+from a *fresh* `node:24-alpine`, not from either build stage, and runs a
+second, independent `npm ci --omit=dev` against the same lockfile — this
+is deliberate, not wasteful: reusing a build stage's `node_modules` via
+`COPY --from=build-api /app/node_modules` would drag every devDependency
+into the shipped image. The final `api`/`worker` stages then each `COPY
+--from=` only the compiled `dist/` output from their respective build
+stage. Docker caches each `RUN`/`COPY` instruction as a layer keyed on
+its inputs, so instruction *order* matters: `package.json` and
+`package-lock.json` are copied and `npm ci`'d **before** any source file
+is copied, in every stage that installs dependencies. A commit that only
+touches `.ts` files (the overwhelming majority) never invalidates the
+`npm ci` layer — Docker reuses it from cache, and the build only re-runs
+`tsc` and the final `COPY`.
+
+**Where it lives in the codebase.** `Dockerfile` (repo root).
+
+**Common pitfalls.** Copying the entire repo (`COPY . .`) before running
+`npm ci` is the single most common way to defeat layer caching — it
+means *any* file change, including a one-line comment edit, invalidates
+the dependency-install layer and forces a full reinstall on every build.
+The fix is exactly the ordering above: dependency manifests first,
+source second. A second pitfall specific to this repo: `worker/`'s build
+needs a full copy of `src/` (not just the two files it imports), because
+`COPY` operates on whole directories and TypeScript's own module
+resolution needs the rest of `src/` present on disk even though only
+`src/queues/contracts.ts` and `src/lib/sentryScrub.ts` end up compiled
+into `worker/tsconfig.json`'s `include` list.
+
+**Production considerations.** Image size is the direct payoff:
+`runtime-base`'s `npm ci --omit=dev` plus alpine's small footprint keeps
+both final images well under what a single-stage build (devDependencies
+and all) would produce, which matters for both registry storage cost and
+container cold-start pull time. The cache-locality payoff (fast
+rebuilds on code-only changes) matters more in CI, where every PR
+triggers a fresh `docker build`.
+
+**Interview answer.** Multi-stage builds let me separate "what it takes
+to compile this code" from "what it takes to run it" — the build stage
+gets the full devDependency tree and a `tsc` invocation, but only the
+compiled JavaScript crosses into the final image via `COPY --from=`.
+Combined with copying `package.json` before source, this means a
+code-only change reuses the cached dependency-install layer instead of
+reinstalling `node_modules` on every build, and the shipped image never
+carries `typescript`, `vitest`, or any other tool that only existed to
+produce it.
+
+### Non-root containers
+
+**What it is.** Both final images run as the `node` user
+(`USER node` in `runtime-base`, inherited by both `api` and `worker`),
+not as `root`, which is Docker's default if no `USER` is specified.
+
+**Why it exists in this project.** If a dependency has a
+remote-code-execution vulnerability, or the app itself has an injection
+flaw that lets an attacker run arbitrary shell commands inside the
+container, running as `root` means that code executes with root
+privileges *inside the container* — able to modify any file the image
+ships, install packages, or (depending on how the container was
+launched) reach further than intended into the host. Running as a
+low-privilege user doesn't prevent every kind of container escape, but
+it removes an entire, easy class of "escalate from arbitrary code
+execution to full control of the container" for free.
+
+**How it works mechanically.** `node:24-alpine` already creates a
+`node` user (uid/gid 1000) as part of the base image — no manual
+`RUN addgroup && adduser` is needed. `USER node` in `runtime-base`
+switches the effective user for every instruction after it (and for the
+final `CMD`) in both the `api` and `worker` stages that build from it.
+`COPY --chown=node:node` is used for every file copied into the runtime
+stages (`dist/`, `openapi.json`) so those files are actually owned by
+the user that will read them — copying as `root` and then switching
+`USER` would leave root-owned files that a non-root process still has
+read access to (fine here, since nothing needs write access at runtime),
+but explicit ownership is the more correct pattern in general and costs
+nothing.
+
+**Where it lives in the codebase.** `Dockerfile`, `runtime-base` stage.
+
+**Common pitfalls.** Binding to a port below 1024 requires root
+privileges on Linux — irrelevant here since `PORT` defaults to 3000, but
+worth knowing as the reason some containerized services stay on root
+despite the security tradeoff. Forgetting `--chown` on `COPY` after
+switching `USER` is the more likely mistake: the copied files remain
+owned by whichever user ran the `COPY` instruction (root, since `COPY`
+itself doesn't run as the container's runtime user), which is harmless
+for read-only files but breaks anything the app tries to write to that
+path at runtime.
+
+**Production considerations.** This is table-stakes for any image
+pushed to a real registry or run under a platform with pod security
+policies (Kubernetes, many managed container platforms reject or flag
+images that declare `USER root` or specify no `USER` at all). Costs
+nothing here since neither the API nor the worker writes to its own
+filesystem at runtime — everything persistent lives in Postgres/Redis.
+
+**Interview answer.** Non-root containers limit the blast radius of a
+code-execution vulnerability — if an attacker gets arbitrary code
+running inside the container, they get it as a low-privilege user, not
+root. `node:24-alpine` ships a `node` user out of the box, so this cost
+nothing beyond one `USER node` line and remembering `--chown` on the
+`COPY` instructions that populate the runtime stage.
+
+### CI service containers and health checks
+
+**What it is.** `.github/workflows/ci.yml`'s `test` job declares
+`postgres:16` and `redis:7` as `services:` — GitHub Actions spins up
+both as sibling containers alongside the job's own runner container for
+the job's duration, torn down automatically when the job finishes.
+
+**Why it exists in this project.** This test suite is deliberately not
+built on mocks — `tests/globalSetup.ts` connects to a real Postgres,
+creates a `clickscope_test` database, and runs every migration through
+it before any test runs (see Phase 13a's "inverted pyramid" reasoning).
+CI has to reproduce that same real-database posture, not substitute
+something lighter, or CI would be testing a meaningfully different
+system than what `npm test` verifies locally.
+
+**How it works mechanically.** Each `services:` entry's `options:`
+block wires in a `--health-cmd` (the same `pg_isready`/`redis-cli ping`
+checks the local `docker-compose.yml` already uses) — GitHub Actions
+won't start the job's own steps until every service container reports
+healthy, so `npm run migrate:up` in step 5 never races an
+still-initializing Postgres. Because the `test` job doesn't wrap itself
+in a `container:` block (it runs directly on the `ubuntu-latest` runner
+VM, not inside a container of its own), Actions automatically publishes
+each service's `ports:` mapping onto the runner's own `localhost` — which
+is exactly what `.env.test.example`'s `DATABASE_URL=postgres://…@localhost:5432/…`
+and `REDIS_URL=redis://localhost:6379` already assume, so the committed
+dummy-value file works in CI completely unmodified.
+
+**Where it lives in the codebase.** `.github/workflows/ci.yml`,
+`test` job's `services:` block.
+
+**Common pitfalls.** Omitting the health-check options is the most
+common mistake — without them, Actions considers a service "up" the
+moment its container process starts, not once it's actually accepting
+connections, and the very next step (`npm run migrate:up`) can then fail
+intermittently against a Postgres that's still initializing its data
+directory. The other common mistake is wrapping the job in a
+`container:` block without realizing that changes how service ports are
+reached (via the service's container name as hostname, not
+`localhost`) — this workflow deliberately avoids that, keeping
+`.env.test.example`'s existing `localhost` URLs valid.
+
+**Production considerations.** Service containers only exist for the
+duration of the CI job — they have no relationship to the real Postgres/
+Redis this API talks to once deployed (Phase 15c's concern). Their only
+job is giving CI a real, disposable, correctly-versioned (16/7, matching
+`docker-compose.yml` and this Dockerfile's own image choices) database
+and cache to run the actual test suite against.
+
+**Interview answer.** GitHub Actions' `services:` block gives a CI job
+real, disposable sibling containers for the job's duration, health-
+checked before the job's own steps run. Because this job isn't wrapped
+in its own `container:`, those services are reachable on `localhost` at
+their mapped ports — the same URLs the committed `.env.test.example`
+already uses for local development, so no CI-specific environment
+branching was needed.
+
+### The migration race on concurrent deploys, and why migrations don't run on container boot
+
+**What it is.** Neither the `api` nor `worker` image runs
+`npm run migrate:up` (or anything migration-related) as part of its
+`CMD` or startup sequence. Migrations are, and will remain in Phase
+15c, a separate, explicit step — never something that happens
+automatically when a container starts.
+
+**Why it exists in this project.** Two independent reasons, one
+structural and one about correctness under concurrency. Structurally:
+`node-pg-migrate` is a devDependency (see `package.json`), and both
+final images install with `npm ci --omit=dev` in `runtime-base` — the
+built images' `node_modules` **do not contain node-pg-migrate at all**,
+so `npm run migrate:up` isn't just discouraged inside these containers,
+it's impossible to run. That's a deliberate consequence of the
+prod/dev dependency split, not an accident this phase is working around.
+Conceptually, even if migrations *could* run on boot: a typical
+zero-downtime deploy starts new container replicas before (or
+concurrently with) stopping old ones, and some deploy strategies run
+more than one replica of the API at a time. If every replica tried to
+run migrations against a shared database on startup, two replicas
+starting within the same window would race to apply the same migration
+—`node-pg-migrate` isn't designed to have multiple concurrent runners
+racing against the same `pgmigrations` tracking table, and the failure
+mode ranges from a harmless duplicate-migration error (if the migration
+is naturally idempotent or errors cleanly on re-application) to a
+genuinely corrupted migration history or a half-applied schema change if
+two runners interleave mid-migration.
+
+**How it works mechanically.** For local image validation via
+`docker-compose.prod.yml`, the compose file's own header comment
+documents the correct sequence: bring up `postgres`/`redis` (and
+`api`/`worker`, which will run fine against whatever schema currently
+exists, since neither depends on a specific migration state to *start*
+— only individual routes/jobs would fail against a stale schema), then
+run `npm run migrate:up` from the host, pointed at the compose Postgres's
+mapped port. In a real deployment (Phase 15c), the equivalent will be a
+platform-provided "pre-deploy command" or "release phase" hook — a
+single, one-shot step the platform runs once per deploy, before new
+application containers start receiving traffic, decoupled from the
+application containers' own lifecycle entirely.
+
+**Where it lives in the codebase.** `docker-compose.prod.yml`'s header
+comment (documents the sequence for local validation);
+`package.json`'s `devDependencies`/`dependencies` split (the structural
+enforcement); this section and Phase 15c (not yet written) for the real
+deploy wiring.
+
+**Common pitfalls.** The tempting shortcut is to add a migration step
+to the container's `CMD` (e.g. `sh -c "npm run migrate:up && node
+dist/server.js"`) so "the container just works" without a separate
+deploy step to configure. This is exactly the concurrent-replica race
+described above waiting to happen the first time more than one replica
+starts around the same time — and in this repo, it isn't even available
+as a shortcut, since `node-pg-migrate` isn't in the runtime image at
+all.
+
+**Production considerations.** A real pre-deploy/release-phase hook
+(Phase 15c) runs migrations exactly once per deploy, before any new
+replica starts serving traffic, with the platform itself responsible for
+not starting application containers until that step succeeds — this is
+the mechanism that makes migrations safe under concurrent-replica
+deploys, not anything in this phase's Dockerfile or compose file.
+
+**Interview answer.** Migrations never run as part of a container's
+startup command here — partly because it's a genuine correctness risk
+(two replicas racing to migrate the same database concurrently can
+corrupt the migration history), and partly because the runtime image
+structurally can't do it anyway: `node-pg-migrate` is a devDependency,
+so it's absent from the `npm ci --omit=dev` production `node_modules`.
+Migrations are a separate, one-shot step — run by hand against a local
+compose stack in this phase, and via a platform pre-deploy hook once
+real deployment is wired up.
+
+### Why the Docker build itself is verified in CI, not just `npm run build`
+
+**What it is.** `.github/workflows/ci.yml` has a second job,
+`docker-build`, that actually runs `docker build --target api` and
+`docker build --target worker` — separate from, and not a substitute
+for, the `test` job's `npm run typecheck`/`npm test`.
+
+**Why it exists in this project.** Two concrete gaps a passing
+`npm run build` wouldn't catch. First: the `test` job's `npm ci`
+installs the *full* dependency tree (prod + dev), but `runtime-base`'s
+`npm ci --omit=dev` is a genuinely different dependency resolution — a
+package that only "works" because some devDependency happens to shadow
+or polyfill something it needs would pass every check in the `test` job
+and still fail (or misbehave) in the actual shipped image. Second, and
+more concrete to this repo: the root `tsconfig.json`'s `include` is
+`src/**/*.ts` only (`worker/` is explicitly excluded from the project
+`npm run typecheck` compiles) — so `npm run typecheck` **never
+type-checks a single file under `worker/` at all**. The `build-worker`
+Dockerfile stage's own `tsc -p worker/tsconfig.json` invocation is the
+only thing in this entire CI pipeline that type-checks the worker
+process's code.
+
+**How it works mechanically.** `docker-build` runs on a fresh checkout,
+independent of the `test` job (no `needs:`, so both run in parallel —
+`docker-build` doesn't depend on database/migration state, only on the
+repo being checked out). It builds both targets and finishes with
+`docker images clickscope-api:ci clickscope-worker:ci`, printing each
+image's size to the job log as a lightweight size-regression signal (a
+sudden jump would show up in the log without any extra tooling).
+
+**Where it lives in the codebase.** `.github/workflows/ci.yml`,
+`docker-build` job.
+
+**Common pitfalls.** Treating `docker build` as "just packaging" and
+gating CI on `npm run build` alone would silently leave `worker/`
+completely untype-checked in this repo's specific tsconfig layout — a
+type error introduced in `worker/index.ts` or any file under `worker/`
+would pass every other CI step and only surface at runtime, or not at
+all if the code path isn't exercised by a test.
+
+**Production considerations.** Building both images on every PR also
+means image-build failures (a missing file in a `COPY`, a stage
+referencing the wrong build output) are caught before merge, not
+discovered during an actual deploy attempt — cheaper and faster to fix
+in a PR than in a failed production rollout.
+
+**Interview answer.** `npm run build` and `docker build` aren't
+redundant checks here — they verify different things. The Docker build
+job catches two gaps the plain build/test job can't: it resolves
+dependencies the way the shipped image actually will
+(`npm ci --omit=dev`, not the full dev tree), and — because this repo's
+root `tsconfig.json` excludes `worker/` from `npm run typecheck` — the
+worker's own `tsc` invocation inside the Dockerfile is the only place in
+CI that type-checks the worker process at all.
+
+### One repo, two deployable images
+
+**What it is.** One `Dockerfile`, two build targets
+(`docker build --target api`, `docker build --target worker`), producing
+two independently-taggable, independently-deployable images from a
+single npm package with one shared `node_modules` tree.
+
+**Why it exists in this project.** CLAUDE.md already frames the worker
+as "a separate process, separate deploy" — but separate deploy doesn't
+require separate source-of-truth files for how each image is built. The
+API and worker are 100% dependency-identical (no separate
+`worker/package.json` exists — see the Phase 15a exploration that
+confirmed this) and differ only in which `tsc` project compiles
+(`tsconfig.json` vs. `worker/tsconfig.json`) and which compiled entry
+file runs (`dist/server.js` vs. `dist/worker/index.js`). A single
+Dockerfile with named targets keeps the base image version, the `npm ci`
+invocation, and the non-root `USER` setup defined exactly once — a Node
+version bump or a base-image security patch is one line, in one file,
+guaranteed to apply identically to both images, instead of two files
+that have to be kept in sync by hand.
+
+**How it works mechanically.** `docker build --target api -t
+clickscope-api .` and `docker build --target worker -t
+clickscope-worker .` are two independent invocations against the same
+`Dockerfile` — Docker resolves each target's stage graph separately
+(`api` only pulls in `build-api`'s output; `worker` only pulls in
+`build-worker`'s), so building one target never requires compiling the
+other's source, and each produces a genuinely separate image that can be
+pushed, tagged, and deployed on its own schedule.
+
+**Where it lives in the codebase.** `Dockerfile` (single file, six
+named stages); `.github/workflows/ci.yml`'s `docker-build` job (builds
+both targets independently); `docker-compose.prod.yml` (each of the
+`api`/`worker` services points `build.target` at its respective stage).
+
+**Common pitfalls.** The alternative this phase considered and rejected
+was two near-duplicate files (`Dockerfile.api`, `Dockerfile.worker`) —
+tempting for "each can be read/changed in isolation," but in practice it
+means the base image tag, the `npm ci` step, and the `USER node` line
+all exist in two places that a future change (a Node version bump, a
+new non-root-user requirement) has to remember to update in both, with
+no compiler or test to catch a missed one.
+
+**Production considerations.** Deploy independence comes from tagging
+and deploying the two *images* separately (a worker rollout doesn't have
+to redeploy the API, and vice versa), not from the images' build recipes
+living in separate files — this phase's single-Dockerfile choice doesn't
+weaken that independence at all.
+
+**Interview answer.** One Dockerfile with two build targets gave this
+project two fully independent, independently-deployable images without
+duplicating the parts that are genuinely shared — the base image, the
+dependency install, the non-root user setup. Multi-stage targets exist
+for exactly this shape: same foundation, different final output.
+Splitting into two files would have meant keeping the shared parts in
+sync by hand, for no real gain in deploy independence, since that
+independence already comes from tagging and deploying the two images
+separately.
+
+### Empty string vs. absent: the `--env-file` trap
+
+**What it is.** `src/config/env.ts`'s `SENTRY_DSN` field now runs a
+`z.preprocess()` step that converts an empty-string value to `undefined`
+before Zod's own `.optional()`/`.url()` checks ever see it — found and
+fixed while validating `docker-compose.prod.yml` in this phase, when a
+`SENTRY_DSN=` line (deliberately left blank, matching `.env.example`'s
+own pattern for "disable Sentry") crashed both the `api` and `worker`
+containers on boot with `SENTRY_DSN must be a valid URL`.
+
+**Why it exists in this project.** `.optional()` only treats a
+genuinely *absent* key — no `SENTRY_DSN` property in the parsed object
+at all — as unset. An empty string is a **present** value as far as Zod
+is concerned, so `z.string().url().optional()` still runs `.url()`
+against `""` and rejects it. That distinction wouldn't matter if a blank
+line in an env file actually produced an absent key, but it doesn't:
+both Node's `--env-file` flag and Docker Compose's `env_file:` directive
+parse a bare `KEY=` line as `process.env.KEY = ""`, not as `KEY` being
+left out of `process.env` entirely. Confirmed directly:
+`node --env-file=/tmp/testenv -e "console.log(JSON.stringify(process.env.FOO))"`
+against a file containing `FOO=` prints `""`, not `undefined`. This
+means every optional env var in this app was always one blank-but-present
+line away from failing validation it was specifically designed to pass —
+`SENTRY_DSN` just happened to be the first one anyone actually left
+blank against a code path (a fresh container boot) that surfaced it
+loudly instead of silently.
+
+**How it works mechanically.** `z.preprocess((value) => (value === ''
+? undefined : value), innerSchema)` runs its function against the raw
+input *before* `innerSchema` (here, `z.string().url(...).optional()`)
+ever validates it. An empty string is rewritten to `undefined`
+up front, so `.optional()` sees exactly what it was always designed to
+handle — an absent value — and the `.url()` check never runs against it
+at all. A non-empty string still flows through unchanged and still has
+to pass `.url()`. This is different from `.or(z.literal(''))`, which
+would have made `""` a *valid distinct output value* alongside a real
+URL, rather than normalizing it away — the task here is "treat blank
+the same as absent," not "also accept blank as its own valid state."
+
+**Where it lives in the codebase.** `src/config/env.ts` (the
+`SENTRY_DSN` field); `tests/config/env.test.ts`'s `describe('SENTRY_DSN'
+...)` block (asserts `SENTRY_DSN: ''` parses identically to `SENTRY_DSN`
+omitted, alongside the existing valid-DSN and rejected-non-URL cases).
+Because `worker/config.ts` builds its own schema via
+`envSchema.pick({ ..., SENTRY_DSN: true, ... })`, this one fix covers
+both the API and the worker — there's no second copy of this field to
+patch.
+
+**Common pitfalls, and the generic-helper question.** The natural
+follow-up question: should every optional field in this schema get the
+same `emptyStringAsUndefined()` treatment, via a small reusable helper,
+rather than fixing `SENTRY_DSN` as a one-off? Decided against it here,
+for a concrete reason rather than just "keep it simple": `SENTRY_DSN` is
+currently the **only** field in `envSchema` using bare `.optional()` —
+every other field that has a fallback uses `.default(...)` instead
+(`NODE_ENV`, `PORT`, `LOG_LEVEL`, `JWT_EXPIRES_IN`, `BCRYPT_COST`,
+`TRUST_PROXY`, every `RATE_LIMIT_*` var). A generic helper would have
+exactly one real call site today — introducing an abstraction for a
+problem with one instance is exactly the kind of speculative generality
+this project's conventions call out to avoid. It's also not a drop-in
+fix for the `.default()` fields even if it were generalized: those
+fields' relationship with an empty string is a *different* bug shape,
+not the same one. `z.coerce.number().default(3000)` given `PORT=""`
+doesn't skip to the default at all — `.default()` only activates on
+`undefined`, and `Number('')` coerces to `0`, not `NaN` or "missing," so
+`PORT=""` currently fails `.positive()` with a real but differently-worded
+error, never silently falls back to 3000. Papering over that with the
+same `emptyStringAsUndefined()` helper would be a second, separate fix
+disguised as reusing the first one. If a second genuinely-`.optional()`
+field (no default, format-validated) gets added later, revisit this as
+a two-instance pattern worth a helper then — not before.
+
+**Production considerations.** This is exactly the kind of bug that
+only shows up in exactly the environment least likely to be interactively
+debugged — a container failing health checks in CI or a fresh deploy,
+not a developer's terminal where `.env` was hand-edited and SENTRY_DSN
+was probably either filled in or the line deleted outright rather than
+left blank. Catching it here, while validating `docker-compose.prod.yml`
+locally rather than during a real deploy, is the entire point of Phase
+15a's "prove the images actually run" step — this bug would have looked
+identical in a real Render deploy log.
+
+**Interview answer.** `.optional()` in Zod (and most schema libraries)
+means "absent is fine," not "falsy is fine" — an empty string is a
+value, not a missing one, and format validators like `.url()` correctly
+reject it. The trap is that `--env-file`/`env_file:` parsing of a
+blank-but-present `KEY=` line produces exactly that: a present empty
+string, not an absent key, so a field that looks optional in the schema
+can still reject the exact "leave it blank to disable" input the schema
+was written to accept. `z.preprocess()` fixes it by normalizing `""` to
+`undefined` before the rest of the schema runs, restoring the semantics
+`.optional()` was supposed to have. I fixed it narrowly for the one
+field that actually has this shape today rather than generalizing to a
+helper — the other "defaultable" fields in this schema have a different,
+unrelated empty-string interaction that the same helper wouldn't
+actually solve.

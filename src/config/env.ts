@@ -165,7 +165,19 @@ export const envSchema = z.object({
   // for a future browser-side Sentry integration) for the same reason a
   // Stripe *publishable* key is safe to expose despite the word "key" —
   // see Notes.md, "Phase 14a: Observability & API Documentation."
-  SENTRY_DSN: z.string().url('SENTRY_DSN must be a valid URL').optional(),
+  // `.preprocess` runs before `.optional()`/`.url()` see the value, so an
+  // empty string is normalized to undefined first. This matters because
+  // `.optional()` alone only treats an *absent* key as unset — an empty
+  // string is a present value as far as Zod is concerned, and would fail
+  // `.url()`. Empty strings reach here in practice because Node's
+  // `--env-file` and Docker Compose's `env_file:` both parse a bare
+  // `SENTRY_DSN=` line (value intentionally left blank to disable Sentry)
+  // as `""`, not as an absent variable. See Notes.md, "Phase 15a:
+  // Containerization & CI" / "Empty string vs. absent: the --env-file trap."
+  SENTRY_DSN: z.preprocess(
+    (value) => (value === '' ? undefined : value),
+    z.string().url('SENTRY_DSN must be a valid URL').optional(),
+  ),
 });
 
 export type Config = z.infer<typeof envSchema>;
