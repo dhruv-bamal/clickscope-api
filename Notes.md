@@ -11787,11 +11787,15 @@ process's code.
 
 **How it works mechanically.** `docker-build` runs on a fresh checkout,
 independent of the `test` job (no `needs:`, so both run in parallel —
-`docker-build` doesn't depend on database/migration state, only on the
-repo being checked out). It builds both targets and finishes with
-`docker images clickscope-api:ci clickscope-worker:ci`, printing each
-image's size to the job log as a lightweight size-regression signal (a
-sudden jump would show up in the log without any extra tooling).
+building doesn't depend on database/migration state, only on the repo
+being checked out; the `services:` Postgres/Redis this job *does*
+declare exist purely for the boot-smoke-test steps below, not for the
+build itself — see the next section). It builds both targets and runs
+`docker images clickscope-api:ci` and `docker images clickscope-worker:ci`
+as two separate steps (not one `docker images repo1 repo2` call — this
+Docker CLI version rejects more than one repository argument, confirmed
+while validating this phase), printing each image's size to the job log
+as a lightweight size-regression signal.
 
 **Where it lives in the codebase.** `.github/workflows/ci.yml`,
 `docker-build` job.
@@ -11817,6 +11821,120 @@ dependencies the way the shipped image actually will
 root `tsconfig.json` excludes `worker/` from `npm run typecheck` — the
 worker's own `tsc` invocation inside the Dockerfile is the only place in
 CI that type-checks the worker process at all.
+
+### The boot-smoke test: `docker build` succeeding still isn't enough
+
+**What it is.** Two more steps in the `docker-build` job, after both
+images are built: one starts the `api` image and polls `GET /health`
+until it returns `200` or `503` (a hard timeout otherwise fails the
+job), the other starts the `worker` image and confirms it's still
+running and has logged its ready message a few seconds later.
+
+**Why it exists in this project.** `docker build` only proves an image
+*compiles and assembles* — it never runs the container, so it structurally
+cannot catch a boot-time crash. Both real bugs this phase turned up
+(the missing `COPY openapi.json` and `SENTRY_DSN=""`, see "Empty string
+vs. absent" below) were exactly that shape: the image built successfully
+every time, and only crashed once actually started. Without this step,
+either bug would have sailed through CI green and only surfaced during
+an actual deploy.
+
+**How it works mechanically.** `--network host` puts the smoke-test
+container in the GitHub Actions runner's own network namespace, so
+`localhost:5432`/`localhost:6379` (the job's own `services:` Postgres/
+Redis, published on the runner's localhost the same way the `test`
+job's are) are directly reachable from inside it — a container on the
+default bridge network can't see the runner's published service ports
+any other way, since bridge networking gives the container its own
+loopback, separate from the runner's. The api container runs with
+`--env-file .env.prod.example` (reusing the same file that validates
+`docker-compose.prod.yml` locally — one source of truth, re-validated
+against the schema on every CI run) plus `-e` overrides pointing
+`DATABASE_URL`/`REDIS_URL` at the service containers instead of
+compose's `postgres`/`redis` hostnames. A bash loop polls `/health`
+once a second for up to 30s, accepting `200` or `503` as success (both
+prove the container is up and serving HTTP; only silence or a crash
+fails the job) and dumping `docker logs` on timeout for diagnosis. The
+worker check is a liveness check, not an HTTP one — it has no endpoint
+— so it asserts `docker inspect -f '{{.State.Running}}'` is still `true`
+five seconds in, and greps its logs for the same `"clickscope-worker
+ready"` line `worker/index.ts` already logs on a real successful boot.
+
+Real, reachable Redis matters here for a reason beyond realism, found
+while building this step: `src/queues/connection.ts`'s BullMQ queue
+connection sets `maxRetriesPerRequest: null` (a hard BullMQ requirement
+for `Worker`, applied to this `Queue` connection too, for one consistent
+mental model — see that file's own comment). `getHealthReport()`
+(`src/services/health.ts`) calls `checkQueueDepth()`, which issues a
+command against that same connection. With `maxRetriesPerRequest: null`,
+a command issued while the connection can't be established doesn't fail
+after some bounded number of retries — it queues forever, since that's
+precisely the "give up" behavior this setting disables. Confirmed
+directly: pointing this smoke test at Postgres/Redis URLs with nothing
+actually listening made `/health` never respond at all, not even
+eventually — `Promise.all` in `getHealthReport()` never resolves, so the
+request hangs indefinitely rather than returning `503`. A smoke test
+built against placeholder, unreachable URLs wouldn't just be less
+realistic — it would be permanently broken, timing out on every single
+run regardless of whether the image itself was fine. This is also a
+real latent gap in the app's own readiness probe, independent of this
+CI step: if Redis genuinely goes down in production, `/health` may hang
+indefinitely instead of reporting `503` promptly. Out of scope to fix as
+part of a CI smoke test — noted here as a discovered risk, not a bug
+this phase fixes.
+
+**Where it lives in the codebase.** `.github/workflows/ci.yml`,
+`docker-build` job, the "Boot-smoke test the api image" and "Boot-smoke
+test the worker image" steps (plus their `if: always()` cleanup steps
+immediately after each).
+
+**Common pitfalls.** Docker Desktop's `--network host` (macOS/Windows)
+is scoped to its internal Linux VM, not literally the host machine — a
+`curl` run directly in a Mac terminal cannot reach a `--network host`
+container's ports, only another process *inside* that same VM namespace
+can (confirmed directly while validating this step: `docker run --rm
+--network host curlimages/curl ...` reached the smoke-tested container
+and got the expected `503`; a bare Mac-terminal `curl` to the same URL
+got connection-refused). This is a Docker-Desktop-specific quirk with no
+bearing on GitHub Actions' Linux runners, where the runner's own shell
+*is* the host network namespace and a plain `curl` step reaches a
+`--network host` container directly — but it means this exact step
+can't be validated identically on a Mac; local validation instead used
+the compose network with published ports, which exercises the same
+retry-loop and pass/fail logic without depending on host networking. A
+second, smaller pitfall caught while testing: `curl -w '%{http_code}'
+... || echo 000` is redundant and produces doubled output (`000000`) on
+a connection failure — curl already writes `000` via `-w` when no
+response is received, but still exits non-zero, so the `||` fires *in
+addition to* curl's own correct output. Dropped the `|| echo 000`
+entirely once this was confirmed.
+
+**Production considerations.** This step validates boot correctness,
+not full production behavior — `NODE_ENV=production` (from
+`.env.prod.example`) means the database check will always report
+`error` here, since this job's throwaway Postgres service, like the
+local `docker-compose.prod.yml` validation, has no SSL listener (see
+"Empty string vs. absent" below and `src/db/pool.ts`'s SSL requirement).
+A `503` with `database: error` is the expected, passing outcome, not a
+failure — what this step actually proves is that the container starts
+and serves an HTTP response within a bounded window, which is exactly
+the class of bug (a crash before the server ever binds its port) that
+neither `docker build` nor the `test` job's `npm test` can see.
+
+**Interview answer.** `docker build` proves an image assembles
+correctly; it says nothing about whether the process inside it actually
+starts. Both real bugs this project hit while building its Docker
+pipeline — a runtime-read file missing from a `COPY`, and an env var
+that crashed startup — were boot-time failures a passing `docker build`
+would never catch. The smoke test closes that gap by actually running
+each image and checking for a live signal (an HTTP response for the
+API, a log line plus liveness for the worker) within a timeout. Getting
+this right required understanding a downstream detail I hadn't
+otherwise had a reason to look at: one dependency's queue connection
+disables its own request-retry limit, so pointing the smoke test at
+fake, unreachable infrastructure wouldn't have "mostly worked" — it
+would have hung on every run, because that specific connection is
+designed to wait forever rather than fail fast.
 
 ### One repo, two deployable images
 

@@ -81,6 +81,36 @@ jobs:
   docker-build:
     runs-on: ubuntu-latest
 
+    # Only for the boot-smoke-test steps below, not for the build itself —
+    # this job still has no dependency on the `test` job or its migration
+    # state. These are a second, throwaway, unmigrated Postgres/Redis, used
+    # purely so the smoke-tested containers have something real to connect
+    # to. See the smoke-test step comments for why "real" matters here,
+    # not just "any placeholder URL."
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: clickscope
+          POSTGRES_PASSWORD: clickscope
+          POSTGRES_DB: clickscope_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U clickscope"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -97,3 +127,100 @@ jobs:
 
       - run: docker images clickscope-api:ci
       - run: docker images clickscope-worker:ci
+
+      # Boot-smoke test: a successful `docker build` only proves the image
+      # compiles and assembles correctly — it never runs the container, so
+      # it can't catch a boot-time crash. Two real bugs found while
+      # validating this phase were exactly that: a missing `COPY
+      # openapi.json` (src/routes/docs.ts reads it at import time, not
+      # per-request) and SENTRY_DSN="" (an empty-but-present env var,
+      # which is what --env-file/env_file: actually produce for a blank
+      # line, not an absent one — see Notes.md, "Empty string vs. absent:
+      # the --env-file trap") — both crashed the container on startup, and
+      # neither would have failed `docker build` itself.
+      #
+      # --network host puts the container in the runner's own network
+      # namespace, so `localhost:5432`/`localhost:6379` reach the service
+      # containers above directly — a container on the default bridge
+      # network can't see the runner's published service ports any other
+      # way. Real, reachable Redis specifically (not just some placeholder
+      # URL) matters for a reason beyond realism: checkQueueDepth()
+      # (src/services/health.ts) runs on the BullMQ queue connection
+      # (src/queues/connection.ts), which sets `maxRetriesPerRequest:
+      # null` — required by BullMQ, but it means a command issued against
+      # a Redis that's never going to come up doesn't fail fast, it queues
+      # forever. Against a truly unreachable Redis, /health would never
+      # respond at all, and this step would hang until curl's own loop
+      # timeout on every single run, not just when something's actually
+      # broken.
+      #
+      # NODE_ENV=production (from .env.prod.example) means the database
+      # check will still report "error" here — this CI Postgres has no
+      # SSL listener, same as the local docker-compose.prod.yml validation
+      # — so a 503 with database:error is the expected, healthy outcome,
+      # not a failure. What this step actually verifies is that the
+      # container starts, serves HTTP, and responds within a reasonable
+      # window — a 200 or a 503 both prove that. No response at all (a
+      # crash, or a hang) is what fails the job.
+      - name: Boot-smoke test the api image
+        run: |
+          docker run -d --name smoke-api --network host \
+            --env-file .env.prod.example \
+            -e DATABASE_URL=postgres://clickscope:clickscope@localhost:5432/clickscope_test \
+            -e REDIS_URL=redis://localhost:6379 \
+            clickscope-api:ci
+
+          code=000
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /tmp/health.json -w '%{http_code}' http://localhost:3000/health)
+            if [ "$code" = "200" ] || [ "$code" = "503" ]; then
+              echo "api responded with HTTP $code after ${i}s:"
+              cat /tmp/health.json
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "api never returned 200/503 on /health within 30s (last code: $code)"
+          docker logs smoke-api
+          exit 1
+
+      - name: Stop api smoke-test container
+        if: always()
+        run: docker rm -f smoke-api >/dev/null 2>&1 || true
+
+      # The worker has no HTTP endpoint, so its equivalent of "responds to
+      # /health" is: the container is still running (not crash-looped) and
+      # logged its own ready message, a few seconds after start — mirrors
+      # worker/index.ts's actual startup log line. Covers the worker half
+      # of the same SENTRY_DSN="" bug: it crashed both images identically
+      # (see Notes.md), so an api-only smoke test would have left that
+      # exact regression uncaught for the worker.
+      - name: Boot-smoke test the worker image
+        run: |
+          docker run -d --name smoke-worker --network host \
+            --env-file .env.prod.example \
+            -e DATABASE_URL=postgres://clickscope:clickscope@localhost:5432/clickscope_test \
+            -e REDIS_URL=redis://localhost:6379 \
+            clickscope-worker:ci
+
+          sleep 5
+
+          if [ "$(docker inspect -f '{{.State.Running}}' smoke-worker)" != "true" ]; then
+            echo "worker container exited within 5s of starting"
+            docker logs smoke-worker
+            exit 1
+          fi
+
+          if ! docker logs smoke-worker 2>&1 | grep -q "clickscope-worker ready"; then
+            echo "worker did not log its ready message within 5s"
+            docker logs smoke-worker
+            exit 1
+          fi
+
+          echo "worker booted and logged ready within 5s:"
+          docker logs smoke-worker
+
+      - name: Stop worker smoke-test container
+        if: always()
+        run: docker rm -f smoke-worker >/dev/null 2>&1 || true
