@@ -11508,10 +11508,16 @@ a habit worth not having.
 
 ### Multi-stage builds and layer caching
 
-**What it is.** A single `Dockerfile` with six named stages
-(`deps` → `build-api`/`build-worker` → `runtime-base` → `api`/`worker`)
-producing two separate, independently-taggable images from one file, via
-`docker build --target api` and `docker build --target worker`.
+**What it is.** Two files, `Dockerfile.api` and `Dockerfile.worker`, each
+with the same four-stage shape (`deps` → its own build stage →
+`runtime-base` → a final stage), producing two separate,
+independently-taggable images via `docker build -f Dockerfile.api ...`
+and `docker build -f Dockerfile.worker ...`. Originally this was one
+`Dockerfile` with six named stages and two build targets
+(`docker build --target api` / `--target worker`); it was split into two
+files for a deploy-platform reason unrelated to the caching mechanics
+described below — see "One repo, two deployable images" further down for
+why.
 
 **Why it exists in this project.** The API and worker are one npm
 package with one `node_modules` tree (see CLAUDE.md: "worker/ — separate
@@ -11524,27 +11530,32 @@ they were needed to produce `dist/`. Multi-stage builds let the
 *compile* environment and the *run* environment diverge completely —
 only the compiled JavaScript crosses the boundary via `COPY --from=`.
 
-**How it works mechanically.** `deps` runs `npm ci` once, cached and
-shared by both `build-api` and `build-worker`. Each build stage copies in
-only what it needs to compile (`build-api` gets `tsconfig.json` + `src/`;
-`build-worker` gets both `tsconfig.json`/`src/` and `worker/`, because
-`worker/tsconfig.json` extends the root config and imports two `src/`
-files directly) and runs its own `tsc` invocation. `runtime-base` starts
-from a *fresh* `node:24-alpine`, not from either build stage, and runs a
-second, independent `npm ci --omit=dev` against the same lockfile — this
-is deliberate, not wasteful: reusing a build stage's `node_modules` via
-`COPY --from=build-api /app/node_modules` would drag every devDependency
-into the shipped image. The final `api`/`worker` stages then each `COPY
---from=` only the compiled `dist/` output from their respective build
-stage. Docker caches each `RUN`/`COPY` instruction as a layer keyed on
-its inputs, so instruction *order* matters: `package.json` and
-`package-lock.json` are copied and `npm ci`'d **before** any source file
-is copied, in every stage that installs dependencies. A commit that only
-touches `.ts` files (the overwhelming majority) never invalidates the
-`npm ci` layer — Docker reuses it from cache, and the build only re-runs
-`tsc` and the final `COPY`.
+**How it works mechanically.** Each file's `deps` stage runs `npm ci`
+once; each file's build stage copies in only what it needs to compile
+(`Dockerfile.api`'s `build-api` gets `tsconfig.json` + `src/`;
+`Dockerfile.worker`'s `build-worker` gets `tsconfig.json`/`src/` and
+`worker/`, because `worker/tsconfig.json` extends the root config and
+imports two `src/` files directly) and runs its own `tsc` invocation.
+`runtime-base` in each file starts from a *fresh* `node:24-alpine`, not
+from either build stage, and runs a second, independent `npm ci
+--omit=dev` against the same lockfile — this is deliberate, not wasteful:
+reusing the build stage's `node_modules` via `COPY --from=build-api
+/app/node_modules` would drag every devDependency into the shipped image.
+Each file's final stage then `COPY --from=` only the compiled `dist/`
+output from its own build stage. Docker caches each `RUN`/`COPY`
+instruction as a layer keyed on its inputs, so instruction *order*
+matters: `package.json` and `package-lock.json` are copied and `npm
+ci`'d **before** any source file is copied, in every stage that installs
+dependencies, in both files. A commit that only touches `.ts` files (the
+overwhelming majority) never invalidates the `npm ci` layer — Docker
+reuses it from cache, and each build only re-runs `tsc` and the final
+`COPY`. Because Docker's layer cache is content-addressed rather than
+file-scoped, `Dockerfile.api`'s and `Dockerfile.worker`'s identical
+`deps` stages can still share cached layers with each other on the same
+machine, even though they're defined in two separate files.
 
-**Where it lives in the codebase.** `Dockerfile` (repo root).
+**Where it lives in the codebase.** `Dockerfile.api`, `Dockerfile.worker`
+(repo root).
 
 **Common pitfalls.** Copying the entire repo (`COPY . .`) before running
 `npm ci` is the single most common way to defeat layer caching — it
@@ -11606,7 +11617,8 @@ read access to (fine here, since nothing needs write access at runtime),
 but explicit ownership is the more correct pattern in general and costs
 nothing.
 
-**Where it lives in the codebase.** `Dockerfile`, `runtime-base` stage.
+**Where it lives in the codebase.** `Dockerfile.api`, `Dockerfile.worker`
+— each file's `runtime-base` stage.
 
 **Common pitfalls.** Binding to a port below 1024 requires root
 privileges on Linux — irrelevant here since `PORT` defaults to 3000, but
@@ -11766,8 +11778,8 @@ real deployment is wired up.
 ### Why the Docker build itself is verified in CI, not just `npm run build`
 
 **What it is.** `.github/workflows/ci.yml` has a second job,
-`docker-build`, that actually runs `docker build --target api` and
-`docker build --target worker` — separate from, and not a substitute
+`docker-build`, that actually runs `docker build -f Dockerfile.api` and
+`docker build -f Dockerfile.worker` — separate from, and not a substitute
 for, the `test` job's `npm run typecheck`/`npm test`.
 
 **Why it exists in this project.** Two concrete gaps a passing
@@ -11790,7 +11802,7 @@ independent of the `test` job (no `needs:`, so both run in parallel —
 building doesn't depend on database/migration state, only on the repo
 being checked out; the `services:` Postgres/Redis this job *does*
 declare exist purely for the boot-smoke-test steps below, not for the
-build itself — see the next section). It builds both targets and runs
+build itself — see the next section). It builds both files and runs
 `docker images clickscope-api:ci` and `docker images clickscope-worker:ci`
 as two separate steps (not one `docker images repo1 repo2` call — this
 Docker CLI version rejects more than one repository argument, confirmed
@@ -11938,62 +11950,86 @@ designed to wait forever rather than fail fast.
 
 ### One repo, two deployable images
 
-**What it is.** One `Dockerfile`, two build targets
-(`docker build --target api`, `docker build --target worker`), producing
-two independently-taggable, independently-deployable images from a
-single npm package with one shared `node_modules` tree.
+**What it is.** Two files, `Dockerfile.api` and `Dockerfile.worker`, each
+a self-contained multi-stage build (`deps` → its own build stage →
+`runtime-base` → a final unnamed stage), producing two
+independently-taggable, independently-deployable images from a single npm
+package with one shared `node_modules` tree. `docker build -f
+Dockerfile.api -t clickscope-api .` and `docker build -f Dockerfile.worker
+-t clickscope-worker .` each build only their own file's default (last)
+stage — no `--target` flag involved.
 
-**Why it exists in this project.** CLAUDE.md already frames the worker
-as "a separate process, separate deploy" — but separate deploy doesn't
-require separate source-of-truth files for how each image is built. The
-API and worker are 100% dependency-identical (no separate
-`worker/package.json` exists — see the Phase 15a exploration that
-confirmed this) and differ only in which `tsc` project compiles
-(`tsconfig.json` vs. `worker/tsconfig.json`) and which compiled entry
-file runs (`dist/server.js` vs. `dist/worker/index.js`). A single
-Dockerfile with named targets keeps the base image version, the `npm ci`
-invocation, and the non-root `USER` setup defined exactly once — a Node
-version bump or a base-image security patch is one line, in one file,
-guaranteed to apply identically to both images, instead of two files
-that have to be kept in sync by hand.
+**Why it exists in this project.** CLAUDE.md already frames the worker as
+"a separate process, separate deploy." The API and worker are 100%
+dependency-identical (no separate `worker/package.json` exists — see the
+original Phase 15a exploration that confirmed this) and differ only in
+which `tsc` project compiles (`tsconfig.json` vs. `worker/tsconfig.json`)
+and which compiled entry file runs (`dist/server.js` vs.
+`dist/worker/index.js`).
 
-**How it works mechanically.** `docker build --target api -t
-clickscope-api .` and `docker build --target worker -t
-clickscope-worker .` are two independent invocations against the same
-`Dockerfile` — Docker resolves each target's stage graph separately
-(`api` only pulls in `build-api`'s output; `worker` only pulls in
-`build-worker`'s), so building one target never requires compiling the
-other's source, and each produces a genuinely separate image that can be
-pushed, tagged, and deployed on its own schedule.
+**How it works mechanically.** Each file independently runs `deps` (`npm
+ci`), its own build stage (`build-api` copies `tsconfig.json` + `src/`;
+`build-worker` copies `tsconfig.json` + `src/` + `worker/`, since
+`worker/tsconfig.json` extends the root config and imports two `src/`
+files directly), then a fresh `runtime-base` (`node:24-alpine`, a second
+independent `npm ci --omit=dev` against the same lockfile, `USER node`),
+then a final stage that `COPY --from=` only the compiled `dist/` output
+from its own build stage. Because the two files share no build context
+across each other, `docker build -f Dockerfile.api ...` never needs to
+compile worker source at all, and vice versa.
 
-**Where it lives in the codebase.** `Dockerfile` (single file, six
-named stages); `.github/workflows/ci.yml`'s `docker-build` job (builds
-both targets independently); `docker-compose.prod.yml` (each of the
-`api`/`worker` services points `build.target` at its respective stage).
+**Where it lives in the codebase.** `Dockerfile.api`, `Dockerfile.worker`
+(repo root); `.github/workflows/ci.yml`'s `docker-build` job (builds each
+file explicitly by path via `-f`); `docker-compose.prod.yml` (each of the
+`api`/`worker` services points `build.dockerfile` at its respective
+file).
 
-**Common pitfalls.** The alternative this phase considered and rejected
-was two near-duplicate files (`Dockerfile.api`, `Dockerfile.worker`) —
-tempting for "each can be read/changed in isolation," but in practice it
-means the base image tag, the `npm ci` step, and the `USER node` line
-all exist in two places that a future change (a Node version bump, a
-new non-root-user requirement) has to remember to update in both, with
-no compiler or test to catch a missed one.
+**Common pitfalls.** The two files now duplicate everything that isn't
+target-specific — the base image tag, the `npm ci` / `npm ci --omit=dev`
+invocations, the `USER node` line — so a future change (a Node version
+bump, a new non-root-user requirement) has to be made in both files by
+hand, with no compiler or test to catch a missed one. This is a real,
+accepted cost, not an oversight (see the addendum below for why it's
+accepted).
 
-**Production considerations.** Deploy independence comes from tagging
-and deploying the two *images* separately (a worker rollout doesn't have
-to redeploy the API, and vice versa), not from the images' build recipes
-living in separate files — this phase's single-Dockerfile choice doesn't
-weaken that independence at all.
+**Production considerations.** Deploy independence comes from tagging and
+deploying the two *images* separately (a worker rollout doesn't have to
+redeploy the API, and vice versa) — that was true under the single-file
+`--target` approach and remains true here; splitting the build recipes
+into two files doesn't change deploy independence one way or the other.
 
-**Interview answer.** One Dockerfile with two build targets gave this
-project two fully independent, independently-deployable images without
-duplicating the parts that are genuinely shared — the base image, the
-dependency install, the non-root user setup. Multi-stage targets exist
-for exactly this shape: same foundation, different final output.
-Splitting into two files would have meant keeping the shared parts in
-sync by hand, for no real gain in deploy independence, since that
-independence already comes from tagging and deploying the two images
-separately.
+**Addendum: why this reversed from one file to two.** This section
+originally argued for a single `Dockerfile` with two named targets
+(`docker build --target api` / `--target worker`) specifically to avoid
+this duplication — and rejected a two-file split as "no real gain in
+deploy independence." That reasoning assumed the deploy target could pass
+a `--target` flag at build time. Render's dashboard-driven Docker builds
+cannot: there is no field in the Render UI to select a build stage from a
+multi-stage Dockerfile, and this is a confirmed, currently open, unresolved
+feature request on Render's own community forum — not a hypothetical
+limitation. Since Render is this project's actual deploy target, the
+single-file approach isn't just suboptimal here, it's unusable: Render
+would build the file's *last* stage (`worker`, in the original ordering)
+for both services, with no way to make it build `api` for one of them.
+Splitting into two files works around this because each file's implicit
+default final stage IS the image Render needs — the fix is entirely about
+what the deploy target can select at build time, not a change in opinion
+about DRY-ness. The duplication cost flagged above is accepted because
+there's no alternative that both satisfies Render's constraint and keeps
+one shared file.
+
+**Interview answer.** This project briefly had one Dockerfile with two
+named build targets, on the theory that shared setup (base image, `npm
+ci`, non-root user) should live in exactly one place. That broke against
+a real deploy-platform constraint: Render's dashboard builds a Dockerfile
+as-is and has no way to pass `--target`, so a single multi-stage file
+can't produce two different final images there — it was actually
+architecture picked without checking what the deploy platform could do
+with it. The fix was a mechanical split into `Dockerfile.api` and
+`Dockerfile.worker`, each self-contained with the same stage structure,
+non-root user, and layer-caching order as before. The tradeoff is real —
+shared setup now lives in two files and has to be updated in both — but
+it's the only option that actually works with Render's build model.
 
 ### Empty string vs. absent: the `--env-file` trap
 

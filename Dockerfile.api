@@ -1,0 +1,42 @@
+# Builds only the api image (Render's dashboard can't pass --target, so
+# this file's default final stage IS the api image):
+#   docker build -f Dockerfile.api -t clickscope-api .
+#
+# Mirrors Dockerfile.worker's structure exactly except for the build stage
+# and final COPY/CMD. See Notes.md, "Phase 15a: Containerization & CI" and
+# its "One repo, two deployable images" addendum for why this is two files
+# instead of one multi-stage file with --target.
+
+# ---- deps: install once ----
+FROM node:24-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# ---- build-api: compile src/ only (tsc -p tsconfig.json -> dist/server.js etc.) ----
+FROM deps AS build-api
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+# ---- runtime-base: prod-only deps, non-root.
+# A second `npm ci --omit=dev` against the same lockfile (not a copy of the
+# build stage's node_modules) so devDependencies like typescript, vitest,
+# and tsx never end up in the shipped image. ----
+FROM node:24-alpine AS runtime-base
+WORKDIR /app
+ENV NODE_ENV=production
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+# node:24-alpine already ships a non-root `node` user (uid 1000).
+USER node
+
+# ---- api: final image ----
+FROM runtime-base AS api
+COPY --from=build-api --chown=node:node /app/dist ./dist
+# src/routes/docs.ts reads this file synchronously at import time, not
+# per-request — omitting it crashes the container on startup, not just on
+# a /docs request.
+COPY --chown=node:node openapi.json ./openapi.json
+EXPOSE 3000
+CMD ["node", "dist/server.js"]

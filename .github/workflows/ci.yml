@@ -114,16 +114,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Verifies the Dockerfile itself, not just `npm run build` — two
+      # Verifies the Dockerfiles themselves, not just `npm run build` — two
       # things only this job catches: (1) the runtime stage's
       # `npm ci --omit=dev` is a genuinely different dependency resolution
       # than the test job's `npm ci`; (2) tsconfig.json's `include` is
       # `src/**/*.ts` only, so `npm run typecheck` above never type-checks
       # worker/ at all — the build-worker stage's own `tsc` invocation is
       # the only thing in this whole pipeline that does.
-      - run: docker build --target api -t clickscope-api:ci .
+      - run: docker build -f Dockerfile.api -t clickscope-api:ci .
 
-      - run: docker build --target worker -t clickscope-worker:ci .
+      - run: docker build -f Dockerfile.worker -t clickscope-worker:ci .
 
       - run: docker images clickscope-api:ci
       - run: docker images clickscope-worker:ci

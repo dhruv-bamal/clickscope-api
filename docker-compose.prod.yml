@@ -1,8 +1,9 @@
-# Local validation that the production Docker images (Dockerfile) build,
-# run, and can actually talk to Postgres/Redis and each other — this is
-# NOT a real production deployment. No orchestrator, no secrets manager,
-# no TLS, no real Render config. See Notes.md, "Phase 15a: Containerization
-# & CI." Real deployment wiring is Phase 15c.
+# Local validation that the production Docker images (Dockerfile.api,
+# Dockerfile.worker) build, run, and can actually talk to Postgres/Redis
+# and each other — this is NOT a real production deployment. No
+# orchestrator, no secrets manager, no TLS, no real Render config. See
+# Notes.md, "Phase 15a: Containerization & CI." Real deployment wiring is
+# Phase 15c.
 #
 # Usage:
 #   cp .env.prod.example .env.prod   # then fill in real-looking values
@@ -53,8 +54,7 @@ services:
   api:
     build:
       context: .
-      dockerfile: Dockerfile
-      target: api
+      dockerfile: Dockerfile.api
     restart: unless-stopped
     env_file:
       - .env.prod
@@ -76,8 +76,7 @@ services:
   worker:
     build:
       context: .
-      dockerfile: Dockerfile
-      target: worker
+      dockerfile: Dockerfile.worker
     restart: unless-stopped
     # Reuses the same .env.prod file as api — worker/config.ts only reads
     # its own narrower Zod-picked subset (NODE_ENV, DATABASE_URL, REDIS_URL,

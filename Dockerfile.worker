@@ -1,23 +1,17 @@
-# Multi-stage build producing two images from one file:
-#   docker build --target api    -t clickscope-api    .
-#   docker build --target worker -t clickscope-worker .
+# Builds only the worker image (Render's dashboard can't pass --target, so
+# this file's default final stage IS the worker image):
+#   docker build -f Dockerfile.worker -t clickscope-worker .
 #
-# Both images share 100% of their dependency tree (worker/ has no
-# separate package.json — see CLAUDE.md) and differ only in which tsc
-# project compiles and which dist/*.js file runs. See Notes.md,
-# "Phase 15a: Containerization & CI" for the full reasoning.
+# Mirrors Dockerfile.api's structure exactly except for the build stage and
+# final COPY/CMD. See Notes.md, "Phase 15a: Containerization & CI" and its
+# "One repo, two deployable images" addendum for why this is two files
+# instead of one multi-stage file with --target.
 
-# ---- deps: install once, shared by both build targets ----
+# ---- deps: install once ----
 FROM node:24-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
-
-# ---- build-api: compile src/ only (tsc -p tsconfig.json -> dist/server.js etc.) ----
-FROM deps AS build-api
-COPY tsconfig.json ./
-COPY src ./src
-RUN npm run build
 
 # ---- build-worker: compile worker/ + the two src/ files it imports.
 # worker/tsconfig.json sets rootDir to the repo root, so this mirrors the
@@ -30,7 +24,7 @@ COPY src ./src
 COPY worker ./worker
 RUN npm run worker:build
 
-# ---- runtime-base: prod-only deps, non-root, shared by both final images.
+# ---- runtime-base: prod-only deps, non-root.
 # A second `npm ci --omit=dev` against the same lockfile (not a copy of the
 # build stage's node_modules) so devDependencies like typescript, vitest,
 # and tsx never end up in the shipped image. ----
@@ -41,16 +35,6 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 # node:24-alpine already ships a non-root `node` user (uid 1000).
 USER node
-
-# ---- api: final image ----
-FROM runtime-base AS api
-COPY --from=build-api --chown=node:node /app/dist ./dist
-# src/routes/docs.ts reads this file synchronously at import time, not
-# per-request — omitting it crashes the container on startup, not just on
-# a /docs request.
-COPY --chown=node:node openapi.json ./openapi.json
-EXPOSE 3000
-CMD ["node", "dist/server.js"]
 
 # ---- worker: final image ----
 FROM runtime-base AS worker
